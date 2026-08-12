@@ -1,0 +1,8 @@
+# 生产视觉适配器中用于人物跟踪的 ByteTrack 设置。
+tracker_type: bytetrack
+track_high_thresh: 0.45
+track_low_thresh: 0.10
+new_track_thresh: 0.55
+track_buffer: 45
+match_thresh: 0.82
+fuse_score: true

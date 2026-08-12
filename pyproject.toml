@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cross-event-prototype-verifier"
+version = "0.1.0"
+description = "Gait-confirmed, appearance-absorbing open-set identification with quarantined prototype memory."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+gui = [
+  "opencv-python>=4.8,<5",
+]
+production = [
+  "opencv-python>=4.8,<5",
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "ultralytics==8.3.163",
+  "lap==0.5.13",
+  "onnxruntime-gpu>=1.27,<1.28; platform_system == 'Windows'",
+  "onnxruntime-gpu>=1.20; platform_system != 'Windows'",
+]
+
+[project.scripts]
+cross-event-verifier = "cross_event_verifier.participant_c.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cross_event_verifier*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

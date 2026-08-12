@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "models": {
+    "yolo11x.pt": {
+      "bytes": 114636239,
+      "sha256": "7bc158aa95c0ebfdd87f70f01653c1131b93e92522dbe15c228bcd742e773a24",
+      "download": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11x.pt"
+      }
+    },
+    "rtmpose-s.onnx": {
+      "bytes": 21916796,
+      "sha256": "92e0240dff8c0c5b22701bbd5d71910f57c5c987584f4b8d73ac6747f3c7b25e",
+      "download": {
+        "url": "https://huggingface.co/ziq/rtm/resolve/main/rtmpose-s.onnx?download=true"
+      }
+    },
+    "osnet_ain_x1_0_dg.pth": {
+      "bytes": null,
+      "sha256": null,
+      "tensor_sha256": "eaa875b012d88e61ccea31958dcd7deb063620f68bff859c6983b202067dff40",
+      "download": {
+        "url": "https://drive.google.com/uc?export=download&id=1nIrszJVYSHf3Ej8-j6DTFdWz8EnO42PB",
+        "source_bytes": 55926164,
+        "source_sha256": "2f38acc25e28cb29407635db2be315edc08d5457a904b72a9a11e427f41f3242",
+        "postprocess": "strip_state_dict"
+      }
+    },
+    "gaitgraph2_grew_state.pt": {
+      "bytes": null,
+      "sha256": null,
+      "tensor_sha256": "c064cac39c8de89bb4f39d78a8dac92a79485faa7a5cef18bd2013d06576ee25",
+      "download": {
+        "url": "https://huggingface.co/opengait/OpenGait/resolve/main/GREW/GaitGraph2/GaitGraph2/checkpoints/GaitGraph2-00034.pt?download=true",
+        "source_bytes": 19161770,
+        "source_sha256": "a3e495ed886681e27119a723fe110e84d381b073f25b9bffd32c1608075aca12",
+        "postprocess": "extract_model"
+      }
+    }
+  }
+}

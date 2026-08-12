@@ -1,0 +1,25 @@
+# 独立项目的单一部署依赖文件。
+# 本项目不导入、不安装也不要求相邻的 videotracker。
+# 模型二进制文件通过以下命令单独下载：
+#   python -m cross_event_verifier download-models
+
+# RTX 5060 / CUDA 13.2 生产运行时。固定版本可避免 pip 选择纯 CPU 或不相关
+# CUDA 构建。
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.12.1+cu132
+torchvision==0.27.1+cu132
+
+numpy>=1.24
+
+# 桌面 GUI 和摄像头/视频输入：
+opencv-python>=4.8,<5
+
+# 生产视觉栈：
+ultralytics==8.3.163
+lap==0.5.13
+onnxruntime-gpu>=1.27,<1.28; platform_system == "Windows"
+onnxruntime-gpu>=1.20; platform_system != "Windows"
+
+# 可选加速器：
+# scipy>=1.10       # 超大批量数据的精确匈牙利指派
+# faiss-cpu>=1.7.4  # 持久化大规模向量搜索
