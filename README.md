@@ -2,13 +2,12 @@
 
 一个独立运行的跨事件人物验证系统：以步态作为身份确认锚点，外观作为由强步态授权后才能吸收的证据，并提供摄像头/视频 GUI、自动建号、开放集拒识、隔离图库和可回滚持久化。
 
-
 ```text
 摄像头 / 视频
       ↓
 低照度检测与 CLAHE（按需）
       ↓
-YOLO11x 人物检测 → ByteTrack 多目标轨迹
+YOLO11L 人物检测 → ByteTrack 多目标轨迹
       ├──────────────→ OSNet-AIN 512 维外观特征
       └→ RTMPose 17 点姿态 → GaitGraph2 384 维时序步态特征
                                   ↓
@@ -18,7 +17,15 @@ YOLO11x 人物检测 → ByteTrack 多目标轨迹
                                   ↓
                   quarantine / formal 多原型 SQLite 图库
 ```
-V1:生产视觉链路已在 Windows + RTX 5060 Laptop GPU + CUDA 13.2 环境完成冷启动和摄像头冒烟；完整回归测试为 38/38 通过。
+## 更新日志
+- V1.00
+  - 基础框架，效果差，好在已跑通技术栈
+- V1.05
+  - 修复了GUI的小BUG
+  - 取消项目分工设计
+  - 优化视频流逻辑，流畅度大幅提升！
+  - 重构算法，一定程度解决了强步态Pg得分过低，导致自动注册功能失效的问题(但还是不好用！)
+  - 试着用轮廓识别方案替换GaitGraphic2，但是效果很差，又换回来了（
 
 ## 先运行起来
 
@@ -38,6 +45,12 @@ python -m cross_event_verifier gui
 - 请求仍有效且当前外观通过强质量门时，外观响应直接放行对应身份，并吸收 OSNet 外观原型。
 - 没有步态授权令牌的强外观不能创建或确认正式身份，只能作为隔离证据。
 - 高质量步态若明确低于“新人物步态上限”，即使衣着外观很像旧人物，也会拒绝全部旧 ID 并进入稳定步态采集，避免新人物永久卡在“疑似旧 ID”。
+- `DEFERRED` 只表示“尚未判定”，不会携带或显示正式身份；自动路径在图库只有一个步态身份时，必须有强外观佐证才能确认，否则继续采集或拒绝注册。
+- 自动建号还要通过开放集新颖性门：如果稳定步态仍落在已有 formal gait 原型的相似区间，不会复制成新的 `P` 身份；这类证据会停留在隔离区，清空当前窗口后重新采集/复核，不会永久终止该候选人。
+- 只有两个分支都达到质量门、概率门和 Top-2 间隔门时才算“证据冲突”。单帧冲突会丢弃当前步态窗口并重采集，不会直接终止候选人；明确挂起仍需人工复核。
+- 步态质量 `Q_gait` 与身份相似度 `S_gait` 分开处理：质量分为 `INVALID`、`PARTIAL`、`STRONG`。`PARTIAL` 只进入等待/隔离区，不能作为“不是该身份”的负证据；严重 ID switch、腿部完全不可见、框截断或序列不足才会硬拒绝。
+- 多个 formal gait 原型的 Top-1/Top-2 间隔不足时返回 `AMBIGUOUS`，不强行选择旧 ID，也不立即创建新 ID；自动建号必须由至少两个独立采集事件相互确认。
+- 正式图库只有一个步态身份或步态 Top-2 过近时，不自动更新该身份的 gait 原型，避免把陌生人的错误向量反馈污染 `P1`。
 - 触碰画面边界、人体框异常、下肢关键点不足、遮挡严重或轨迹跳变时，不允许产生强步态/强外观证据。
 - 多人同框使用全局一对一身份指派，一个正式身份不会在同一帧分配给多个 Track。
 
@@ -48,12 +61,14 @@ T 临时 Track
   → ByteTrack 稳定跟踪
   → 至少 25 个有效全身姿态帧并检测到行走周期
   → 连续 8 个强步态样本通过稳定性门
+  → 记录第一个独立步态事件并进入等待
+  → 第二个独立采集事件再次通过稳定性门
   → 自动创建 P 身份（仅 gait）
   → 自动签发一次性外观请求
   → 强外观响应直接放行并吸收 appearance
 ```
 
-## Windows + RTX 5060 + CUDA 13.2 安装
+## Windows下环境安装
 #这里可以根据自身GPU型号适当改变CUDA版本喵
 
 建议使用 Python 3.12：
@@ -66,8 +81,6 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 python -m cross_event_verifier download-models
 ```
-
-`requirements.txt` 是本项目唯一的 Python 依赖文件，固定 `torch==2.12.1+cu132`、`torchvision==0.27.1+cu132`，并安装 Ultralytics、ByteTrack 所需的 LAP、OpenCV 4.x 与 CUDA 版 ONNX Runtime。生产模式下 YOLO、OSNet-AIN、GaitGraph2 和 RTMPose 都必须使用 NVIDIA GPU；缺少 CUDA 时会明确报错，不会静默退回 CPU。
 
 安装依赖并下载模型后，再执行环境与模型自检：
 
@@ -123,7 +136,32 @@ GUI 操作要点：
 | 强步态确认概率 | `0.90` | 步态达到此值且通过质量、Top2 间隔后，才确认已有 ID |
 | 强步态 Top2 间隔 | `0.08` | 防止两个已有 ID 分数过近时强行确认 |
 | 强步态质量 | `0.70` | 新人物拒识、旧人物确认和自动建号共同使用的质量门 |
+| 部分步态质量下限 | `0.35` | `Q_gait` 低于此值为 `INVALID`；达到此值但未到强门时为 `PARTIAL` |
 | 稳定步态样本数 | `8` | 新人物自动建号前需要连续收集的稳定嵌入数量 |
+| 独立步态事件数 | `2` | 新人物自动建号前需要来自不同采集会话/挑战的稳定事件数 |
+| 单图库步态近重复上限 | `0.985` | 只有步态余弦相似度低于此值、且强质量外观明确拒绝唯一旧 ID 时，才允许从单身份图库引入新号 |
+| 单图库外观拒识阈值 | `0.30` | 单身份图库中，强质量外观低于此概率才可作为新人物的负证据；没有可靠外观时保持保守等待 |
+
+生产视觉页还提供三项吞吐量参数：
+
+- “检测推理间隔”默认值为 `2`。YOLO/ByteTrack 每两帧刷新一次，中间帧复用
+  最近轨迹框；缓存为空时仍会逐帧检测，以便新人物及时进入管线。
+- “外观提取间隔”默认值为 `6`。OSNet 首次取得外观后每六个 Track 帧刷新，
+  没有需要刷新的目标时不会发起空推理调用。周期性刷新会优先安排在不执行
+  YOLO 和 GaitGraph2 的帧，减少多个重模型同帧运行造成的卡顿。
+- “步态推理间隔”默认值为 `3`。RTMPose 姿态仍逐帧采集，但 GaitGraph2 只在
+  轨迹首次成熟或距离上次推理达到该间隔时刷新；同一帧到期的所有 Track 会合并
+  为一个 GPU 批次。周期性刷新同样优先避开 YOLO 帧；首次成熟特征不会延迟。
+
+生产 GaitGraph2 输入使用 RTMPose 的原始全帧坐标，并采用与 OpenGait GREW
+检查点一致的 COCO 图归一化；检测框只用于质量和行走指标，不再把姿态缩放到框内。
+因此更换模型输入格式或继续使用旧库时，必须先清空旧的 gait 原型。
+
+错峰只是短暂顺延周期性刷新，并设置了最大延迟。如果把检测间隔调为 `1`，系统
+仍会在达到延迟上限后执行外观和步态刷新，不会因为每帧检测而饿死特征分支。
+
+检测和外观间隔调大可以提升吞吐量，但快速运动时复用框的滞后会增加，外观更新
+也会变慢。步态间隔调大则会延长自动注册收集足够稳定步态样本所需的时间。
 
 建议先观察默认值。若陌生人仍长时间显示“疑似 P…”，可小幅提高“新人物步态上限”；若同一人容易重复建号，则应降低该值，并先用目标摄像头数据检查步态概率分布后再考虑小幅降低“强步态确认概率”。校准中点和斜率会改变概率含义，不应只凭单段视频随意修改。
 
@@ -166,7 +204,7 @@ python -m cross_event_verifier gui --vision-backend demo
 
 | 文件 | 用途 | 输出/说明 |
 |---|---|---|
-| `yolo11x.pt` | 人物检测 | YOLO11x，仅保留 person 类 |
+| `yolo11l.pt` | 人物检测 | YOLO11L，仅保留 person 类 |
 | `bytetrack-cross-event.yaml` | 多目标跟踪 | 为跨事件场景设置的 ByteTrack 门限 |
 | `rtmpose-s.onnx` | 17 点人体姿态 | ONNX Runtime CUDAExecutionProvider 批量 top-down 推理 |
 | `osnet_ain_x1_0_dg.pth` | 外观 ReID | 512 维 L2 归一化向量 |
@@ -180,7 +218,7 @@ python -m cross_event_verifier gui --vision-backend demo
 
 四个二进制模型合计约 154 MB，默认保存在项目的 `models/` 目录，并被 `.gitignore` 忽略；`models/manifest.json` 保存直接文件的字节数/SHA-256、转换 checkpoint 的 tensor 指纹和下载源。这样代码仓库不会被大文件和模型版本变更拖慢，但部署机器仍需要在启动前取得模型。
 
-模型下载不写进 `requirements.txt`：`requirements` 负责 Python 包依赖，模型属于外部大文件和许可资产。克隆项目后的标准部署顺序就是：
+`requirements` 负责 Python 包依赖，模型属于外部大文件和许可资产，需要单独下载。所以克隆项目后的标准部署顺序就是：
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -194,7 +232,7 @@ python -m cross_event_verifier doctor
 也可以只下载某一个文件或强制重新下载：
 
 ```powershell
-python -m cross_event_verifier download-models --model yolo11x.pt
+python -m cross_event_verifier download-models --model yolo11l.pt
 python -m cross_event_verifier download-models --model rtmpose-s.onnx --force
 ```
 
@@ -220,7 +258,7 @@ python -m cross_event_verifier doctor
 
 | 模型 | 默认来源 |
 |---|---|
-| YOLO11x | Ultralytics 官方 assets release |
+| YOLO11L | Ultralytics 官方 assets release |
 | RTMPose-s ONNX | Hugging Face `ziq/rtm` 仓库中的 ONNX 导出 |
 | OSNet-AIN DG | deep-person-reid 使用的官方 Google Drive checkpoint |
 | GaitGraph2 GREW | OpenGait 官方 Hugging Face checkpoint，下载后提取 model state |
@@ -231,7 +269,7 @@ python -m cross_event_verifier doctor
 git lfs install
 git lfs track "models/*.pt" "models/*.pth" "models/*.onnx"
 git add .gitattributes models/manifest.json models/README.md
-git add -f models/yolo11x.pt models/rtmpose-s.onnx `
+git add -f models/yolo11l.pt models/rtmpose-s.onnx `
     models/osnet_ain_x1_0_dg.pth models/gaitgraph2_grew_state.pt
 git commit -m "Store production model assets with Git LFS"
 git lfs push --all origin main
@@ -289,7 +327,7 @@ print(decision.kind, decision.identity_id, decision.score)
 
 ## 目录结构
 
-源码现在按参与者拆分到三个子包；包根目录只保留公共值对象、公开门面和 Python 包入口。这样组内成员可以直接在自己的目录中工作。完整的职责、依赖方向和稳定接口见：
+源码现在按职责组织在同一个 Python 包中；模块之间通过公开值对象、视觉适配器、验证器和帧管线的稳定 seam 协作。完整的职责、依赖方向和稳定接口见：
 
 - [模块地图](docs/architecture/module-map.md)
 - [组内协作约定](docs/architecture/contributor-guide.md)
@@ -297,22 +335,17 @@ print(decision.kind, decision.identity_id, decision.score)
 
 ```text
 cross_event_verifier/
-├── participant_a/       # 参与者 A：ReID、GaitGraph2 与身份证据决策
-│   ├── osnet_ain.py
-│   ├── gait_graph.py
-│   ├── engine.py
-│   ├── calibration.py、fusion.py、assignment.py
-│   └── memory.py、state.py、stability.py 等
-├── participant_b/       # 参与者 B：YOLO、ByteTrack、RTMPose 与视觉质量
-│   ├── production_vision.py
-│   ├── vision.py
-│   ├── vision_factory.py
-│   └── adapters.py
-├── participant_c/       # 参与者 C：在线编排、GUI、存储与交付
-│   ├── pipeline.py、automation.py、runtime_parameters.py
-│   ├── media.py、gui.py、cli.py
-│   └── storage.py、vector_index.py、model_assets.py
-├── types.py             # A/B/C 共用的公开值对象与接口契约
+├── engine.py、config.py、calibration.py、fusion.py、assignment.py
+│                         # 身份验证、开放集决策与分数校准
+├── gait_graph.py、osnet_ain.py、memory.py、stability.py
+│                         # 步态/外观表征与正式原型记忆
+├── production_vision.py、vision.py、vision_factory.py、adapters.py
+│                         # YOLO、ByteTrack、RTMPose 与视觉适配器
+├── pipeline.py、automation.py、runtime_parameters.py、media.py
+│                         # 在线帧编排、自动建号与线程/参数管理
+├── gui.py、cli.py、storage.py、vector_index.py、model_assets.py
+│                         # GUI、CLI、SQLite、向量索引与模型资产
+├── types.py             # 公开值对象和模块间接口契约
 ├── __init__.py          # 公开 Python 门面
 └── __main__.py          # python -m cross_event_verifier 入口
 docs/architecture/
@@ -336,7 +369,7 @@ python -m cross_event_verifier demo
 python -m cross_event_verifier doctor
 ```
 
-测试覆盖质量门控、校准与动态融合、开放集拒识、全局指派、新人物不粘连旧 ID、运行时参数事务、GUI 参数页、人工登记的短暂质量回落、自动建号、一次性外观吸收、防污染图库、SQLite 回滚、混合特征维度迁移，以及生产适配器的时序特征输出。
+测试覆盖质量门控、校准与动态融合、开放集拒识、全局指派、新人物不粘连旧 ID、运行时参数事务、GUI 参数页、人工登记的短暂质量回落、自动建号、一次性外观吸收、防污染图库、SQLite 回滚、混合特征维度迁移，以及生产适配器的批量步态编码、推理间隔和时序特征输出。
 
 ## 常见问题
 
@@ -345,18 +378,23 @@ python -m cross_event_verifier doctor
 - 首次启动较慢：YOLO、RTMPose、OSNet-AIN 和 GaitGraph2 会在采集线程首次使用时加载；RTX 5060 冷启动通常需要数秒，之后才进入稳定帧率。
 - 仍看到 CPU 占用：摄像头读取、OpenCV 预处理、ByteTrack/SQLite/Tk 以及 RTMPose 少量 shape 辅助节点会使用 CPU；用 `doctor` 查看 `cuda_available`、`onnx_providers`，并确认生产后端不是 `demo` 或 `auto`。
 - 画面能显示但自动注册没有进展：检查人物是否完整入镜、是否实际行走、是否持续跟踪至少 25 个有效姿态帧，并观察 GUI 中的步态质量提示；若一直显示“疑似旧 ID”，到“实时参数”页查看“新人物步态上限”，不要先大幅降低质量门。
+- 自动注册提示“开放集不新颖”：这表示当前步态与已有 formal gait 原型过近，系统已选择拒绝复制身份；应先检查 GaitGraph2 的输入/权重和目标摄像头采集质量，再调整校准阈值，不要强行降低质量门。
+- 自动注册提示“步态 Top-2 歧义”：表示最佳和次佳 formal gait 原型没有足够间隔，系统会等待新的独立事件；这不是质量失败，也不会把当前样本当作身份负证据。
 - 需要只排查摄像头或 GUI：使用 `--vision-backend demo`；该模式强制禁止自动注册，不应拿来建立正式图库。
 
 ## 精度与许可边界
 
 - 默认阈值只能作为可运行起点。部署前应使用目标摄像头数据按 FAR/FPIR 拟合分支校准器，并评估换衣、遮挡、逆光、拥挤和跨镜头条件。
+- P2 的模型域差异暂不通过替换模型解决。`cross_event_verifier.evaluation` 提供 `compare_encoder_embeddings()`，可将同一批标注序列的 `HRNet`/`RTMPose` embedding 分别送入，记录 genuine/impostor similarity、max-impostor、d-prime 和 FNIR@FPIR；当前生产模型不会因此自动改变。
 - 自动注册要求完整人体和有效行走序列；只看到上半身时没有可靠步态，系统会选择等待，而不是自动建错号。
 - Ultralytics 代码/模型涉及 AGPL-3.0 或企业许可；OpenGait 官方资源声明限学术用途。商业部署前必须完成对应授权或替换模型。完整第三方归属与许可提示见 `THIRD_PARTY_NOTICES.md`。
 
-## V1当前存在问题：
-- 难以通过步态识别人物，似乎可以通过提高OSNet权重解决(?)
-- GUI存在BUG，以及美观性欠佳
-- 识别帧率偏低，同时GPU占有率极低
+##当前存在问题：
+- 难以通过步态识别人物，不过这似乎和我的数据集有关系
+- 自动注册功能≈摆设
+- GUI丑死了!
+- 遮挡场景仍需继续评估吞吐量与轨迹精度的平衡
+- ***电脑涨价太猛，我买不起新显卡了***
 
 ## 写在最后
 - 本项目已在华硕天选Air2025 H350版本上运行成功，该机型性能低于其他同配置机型，故加载时间稍长

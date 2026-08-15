@@ -14,14 +14,15 @@ from cross_event_verifier import (
     CrossEventVerifier,
     DecisionKind,
     FeatureBundle,
+    GaitQualityBand,
     Observation,
     TrackQuality,
     VerificationState,
 )
-from cross_event_verifier.participant_a.assignment import gated_global_assignment
-from cross_event_verifier.participant_a.config import VerifierConfig
-from cross_event_verifier.participant_a.fusion import fuse_calibrated_scores
-from cross_event_verifier.participant_c.storage import SqliteStore
+from cross_event_verifier.assignment import gated_global_assignment
+from cross_event_verifier.config import VerifierConfig
+from cross_event_verifier.fusion import fuse_calibrated_scores
+from cross_event_verifier.storage import SqliteStore
 
 
 def good_quality() -> TrackQuality:
@@ -39,8 +40,94 @@ def good_quality() -> TrackQuality:
 
 
 class CoreTests(unittest.TestCase):
+    def test_verify_batch_commits_one_sqlite_transaction(self) -> None:
+        store = SqliteStore(":memory:")
+        verifier = CrossEventVerifier(store=store)
+        statements: list[str] = []
+        store.connection.set_trace_callback(statements.append)
+
+        def observation(track_id: str) -> Observation:
+            return Observation(
+                event_id=f"event-{track_id}",
+                camera_id="camera-a",
+                capture_session_id="session-a",
+                track_id=track_id,
+                features=FeatureBundle(
+                    appearance=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                    gait=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+                ),
+                quality=good_quality(),
+            )
+
+        try:
+            verifier.verify_batch(
+                [observation("1"), observation("2")],
+                candidate_ids=["candidate-1", "candidate-2"],
+            )
+        finally:
+            verifier.close()
+
+        commits = [item for item in statements if item.strip().upper() == "COMMIT"]
+        self.assertEqual(commits, ["COMMIT"])
+
+    def test_partial_gait_quality_is_not_invalidated_by_low_walking_ratio(self) -> None:
+        quality = TrackQuality(
+            box_height=200,
+            frame_count=30,
+            gait_cycles=1,
+            walking_ratio=0.12,
+            gait_branch_quality=0.55,
+            leg_visibility=0.82,
+        )
+
+        self.assertEqual(
+            quality.gait_quality_band(
+                minimum_frames=8,
+                minimum_gait_cycles=1,
+                partial_threshold=0.35,
+                strong_threshold=0.70,
+            ),
+            GaitQualityBand.PARTIAL,
+        )
+        self.assertEqual(quality.gait_hard_veto_reasons(), ())
+
+    def test_gait_quality_hard_veto_covers_track_integrity_and_missing_legs(self) -> None:
+        quality = TrackQuality(
+            frame_count=30,
+            gait_cycles=2,
+            gait_branch_quality=0.95,
+            leg_visibility=0.0,
+            id_switches=1,
+        )
+
+        self.assertEqual(
+            quality.gait_quality_band(
+                minimum_frames=8,
+                minimum_gait_cycles=1,
+                partial_threshold=0.35,
+                strong_threshold=0.70,
+            ),
+            GaitQualityBand.INVALID,
+        )
+        self.assertIn("track_id_switch", quality.gait_hard_veto_reasons())
+        self.assertIn("legs_invisible", quality.gait_hard_veto_reasons())
+
+    def test_gait_quality_does_not_apply_walking_penalty_twice(self) -> None:
+        quality = TrackQuality(
+            frame_count=30,
+            gait_cycles=1,
+            walking_ratio=0.20,
+            gait_branch_quality=0.80,
+        )
+
+        self.assertAlmostEqual(
+            quality.gait_availability(minimum_frames=8, minimum_gait_cycles=1),
+            0.80,
+            places=6,
+        )
+
     def test_gait_weight_is_bounded_when_both_modalities_exist(self) -> None:
-        from cross_event_verifier.participant_a.calibration import ScoreCalibrator
+        from cross_event_verifier.calibration import ScoreCalibrator
 
         result = fuse_calibrated_scores(
             appearance_similarity=0.70,

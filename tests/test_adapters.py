@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from cross_event_verifier.participant_b.adapters import occlusion_scores, pose_feature
+from cross_event_verifier.adapters import occlusion_scores, pose_feature
 
 
 class AdapterTests(unittest.TestCase):

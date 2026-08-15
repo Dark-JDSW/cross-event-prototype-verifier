@@ -16,14 +16,14 @@ from .automation import (
     AutomationStatus,
     AutomaticVerificationController,
 )
-from ..participant_a.engine import CrossEventVerifier
+from .engine import CrossEventVerifier
 from .runtime_parameters import (
     RuntimeParameterController,
     RuntimeParameterSpec,
     RuntimeParameterState,
 )
-from ..types import Decision, FeatureBundle, Observation, TrackQuality
-from ..participant_b.vision import Box, VisionAdapter, VisionTrack
+from .types import Decision, FeatureBundle, Observation, TrackQuality
+from .vision import Box, VisionAdapter, VisionTrack
 
 
 @dataclass(frozen=True)
@@ -185,8 +185,18 @@ class VideoVerifierPipeline:
         """选择反映决策状态的 BGR 叠加颜色。"""
         if decision.kind.value == "conflict":
             return 0, 0, 255
-        if decision.identity_id is not None:
+        if decision.kind.value in {
+            "formal_match",
+            "appearance_requested",
+            "appearance_response_accepted",
+        }:
             return 0, 190, 0
+        if decision.kind.value == "deferred":
+            # deferred 不是确认身份；使用黄色避免把“疑似 P1”误显示成已识别。
+            return 0, 190, 255
+        if decision.kind.value == "ambiguous":
+            # Top-2 步态过近时明确显示歧义，不把它伪装成普通未知或旧身份。
+            return 0, 120, 255
         if decision.kind.value in {"candidate_created", "candidate_updated"}:
             return 0, 190, 255
         return 150, 150, 150

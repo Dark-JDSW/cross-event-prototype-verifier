@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from .adapters import occlusion_scores
-from ..types import FeatureBundle, TrackQuality
+from .types import FeatureBundle, TrackQuality
 
 
 Box = tuple[int, int, int, int]

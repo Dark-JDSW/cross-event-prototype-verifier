@@ -2,7 +2,7 @@
 
 import unittest
 
-from cross_event_verifier.participant_c.model_assets import (
+from cross_event_verifier.model_assets import (
     MODEL_MANIFEST,
     _assets,
     _read_manifest,
@@ -16,7 +16,7 @@ class ModelAssetTests(unittest.TestCase):
         self.assertEqual(
             {asset.name for asset in assets},
             {
-                "yolo11x.pt",
+                "yolo11l.pt",
                 "rtmpose-s.onnx",
                 "osnet_ain_x1_0_dg.pth",
                 "gaitgraph2_grew_state.pt",

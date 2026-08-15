@@ -14,15 +14,25 @@ from typing import Sequence
 
 import numpy as np
 
-from ..participant_a.engine import CrossEventVerifier
-from ..types import Decision, DecisionKind, FeatureBundle, Observation, VerificationState
+from .engine import CrossEventVerifier
+from .types import (
+    Decision,
+    DecisionKind,
+    FeatureBundle,
+    GaitQualityBand,
+    Observation,
+    VerificationState,
+)
 
 
 class AutomationStage(str, Enum):
     """一条轨迹自动建号状态的用户可见阶段。"""
     DISABLED = "disabled"
+    WAIT_MORE_DATA = "wait_more_data"
     WAITING_STRONG_GAIT = "waiting_strong_gait"
     COLLECTING_GAIT = "collecting_gait"
+    WAITING_INDEPENDENT_EVENT = "waiting_independent_event"
+    AMBIGUOUS = "ambiguous"
     GAIT_UNSTABLE = "gait_unstable"
     APPEARANCE_PENDING = "appearance_pending"
     APPEARANCE_ABSORBED = "appearance_absorbed"
@@ -42,6 +52,7 @@ class AutomationPolicy:
     minimum_track_frames: int = 16
     minimum_stable_gait_samples: int = 8
     gait_sample_window: int = 16
+    minimum_independent_gait_events: int = 2
     minimum_sample_similarity: float = 0.86
     minimum_gait_stability: float = 0.94
 
@@ -55,6 +66,8 @@ class AutomationPolicy:
             raise ValueError(
                 "gait_sample_window cannot be smaller than minimum_stable_gait_samples"
             )
+        if self.minimum_independent_gait_events < 1:
+            raise ValueError("minimum_independent_gait_events must be positive")
         for name, value in {
             "minimum_sample_similarity": self.minimum_sample_similarity,
             "minimum_gait_stability": self.minimum_gait_stability,
@@ -72,6 +85,7 @@ class AutomationStatus:
     identity_id: str | None = None
     request_id: str | None = None
     auto_registered: bool = False
+    gait_quality_band: str | None = None
 
 
 @dataclass
@@ -80,6 +94,7 @@ class _TrackAutomationState:
     gait_samples: deque[np.ndarray] = field(default_factory=deque)
     pending_request_id: str | None = None
     identity_id: str | None = None
+    gait_event_proposals: dict[str, "_GaitProposal"] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -137,11 +152,22 @@ class AutomaticVerificationController:
 
         for state in self._states.values():
             state.gait_samples.clear()
+            state.gait_event_proposals.clear()
 
     def reset_tracks(self) -> None:
         """清除输入源本地的 Track 状态，同时保留持久请求。"""
 
         self._states.clear()
+
+    @staticmethod
+    def _gait_event_key(observation: Observation) -> str:
+        """选择独立步态事件的来源键。"""
+
+        if observation.challenge_id:
+            return f"challenge:{observation.challenge_id}"
+        if observation.capture_session_id and observation.capture_session_id != "unknown-session":
+            return f"session:{observation.capture_session_id}"
+        return f"event:{observation.event_id}"
 
     def bind_request(
         self,
@@ -219,6 +245,12 @@ class AutomaticVerificationController:
             self.verifier.config.minimum_frames,
             self.verifier.config.minimum_gait_cycles,
         )
+        quality_band = quality.gait_quality_band(
+            minimum_frames=self.verifier.config.minimum_frames,
+            minimum_gait_cycles=self.verifier.config.minimum_gait_cycles,
+            partial_threshold=self.verifier.config.partial_gait_quality,
+            strong_threshold=self.verifier.config.strong_gait_quality,
+        )
         required_frames = max(
             self.policy.minimum_track_frames,
             self.verifier.config.minimum_frames,
@@ -227,25 +259,48 @@ class AutomaticVerificationController:
             return None, AutomationStatus(
                 AutomationStage.WAITING_STRONG_GAIT,
                 "等待步态序列",
+                gait_quality_band=GaitQualityBand.INVALID.value,
             )
         if quality.frame_count < required_frames:
             return None, AutomationStatus(
                 AutomationStage.WAITING_STRONG_GAIT,
                 f"步态预热 {quality.frame_count}/{required_frames} 帧",
                 progress=quality.frame_count / required_frames,
+                gait_quality_band=quality_band.value,
             )
-        if gait_quality < self.verifier.config.strong_gait_quality:
+        if quality_band == GaitQualityBand.INVALID:
             return None, AutomationStatus(
-                AutomationStage.WAITING_STRONG_GAIT,
-                (
-                    f"等待强步态 Pg={gait_quality:.2f}/"
-                    f"{self.verifier.config.strong_gait_quality:.2f}"
-                ),
+                AutomationStage.WAIT_MORE_DATA,
+                f"步态质量 INVALID（Q={gait_quality:.2f}），等待更多完整序列",
+                progress=float(np.clip(gait_quality / max(self.verifier.config.strong_gait_quality, 1e-8), 0.0, 1.0)),
+                gait_quality_band=quality_band.value,
+            )
+        if quality_band == GaitQualityBand.PARTIAL:
+            return None, AutomationStatus(
+                AutomationStage.WAIT_MORE_DATA,
+                f"步态质量 PARTIAL（Q={gait_quality:.2f}），仅保留候选证据",
                 progress=(
                     gait_quality / self.verifier.config.strong_gait_quality
                     if self.verifier.config.strong_gait_quality > 0
                     else 0.0
                 ),
+                gait_quality_band=quality_band.value,
+            )
+
+        event_key = self._gait_event_key(observation)
+        if event_key in state.gait_event_proposals:
+            return None, AutomationStatus(
+                AutomationStage.WAITING_INDEPENDENT_EVENT,
+                (
+                    f"已记录独立步态事件 {len(state.gait_event_proposals)}/"
+                    f"{self.policy.minimum_independent_gait_events}，等待新采集事件"
+                ),
+                progress=min(
+                    1.0,
+                    len(state.gait_event_proposals)
+                    / self.policy.minimum_independent_gait_events,
+                ),
+                gait_quality_band=quality_band.value,
             )
 
         vector = np.asarray(features.gait, dtype=np.float32).reshape(-1)
@@ -262,6 +317,7 @@ class AutomaticVerificationController:
                         AutomationStage.GAIT_UNSTABLE,
                         f"步态波动，重新采集（相似度 {similarity:.2f}）",
                         progress=1.0 / self.policy.minimum_stable_gait_samples,
+                        gait_quality_band=quality_band.value,
                     )
 
         state.gait_samples.append(vector.copy())
@@ -277,6 +333,7 @@ class AutomaticVerificationController:
                     f"{self.policy.minimum_stable_gait_samples}"
                 ),
                 progress=progress,
+                gait_quality_band=quality_band.value,
             )
 
         centroid = self._unit_mean(state.gait_samples)
@@ -297,6 +354,7 @@ class AutomaticVerificationController:
                 AutomationStage.GAIT_UNSTABLE,
                 f"步态稳定度 {stability:.2f}/{required_stability:.2f}",
                 progress=float(np.clip(stability / required_stability, 0.0, 1.0)),
+                gait_quality_band=quality_band.value,
             )
         return (
             _GaitProposal(centroid, stability),
@@ -304,7 +362,33 @@ class AutomaticVerificationController:
                 AutomationStage.COLLECTING_GAIT,
                 f"强步态已确认（稳定度 {stability:.2f}）",
                 progress=1.0,
+                gait_quality_band=quality_band.value,
             ),
+        )
+
+    def _record_gait_event_proposal(
+        self,
+        state: _TrackAutomationState,
+        observation: Observation,
+        proposal: _GaitProposal,
+    ) -> _GaitProposal | None:
+        """记录一个独立事件，并在事件数足够时聚合跨事件步态。"""
+
+        event_key = self._gait_event_key(observation)
+        state.gait_event_proposals.setdefault(event_key, proposal)
+        if len(state.gait_event_proposals) < self.policy.minimum_independent_gait_events:
+            return None
+        vectors = np.stack(
+            [item.vector for item in state.gait_event_proposals.values()],
+            axis=0,
+        )
+        centroid = np.mean(vectors, axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm <= 1e-8:
+            return None
+        return _GaitProposal(
+            (centroid / norm).astype(np.float32),
+            min(item.stability for item in state.gait_event_proposals.values()),
         )
 
     def verify(
@@ -325,6 +409,9 @@ class AutomaticVerificationController:
         decision = self.verifier.verify(
             effective_observation,
             candidate_id=candidate_id,
+            # 在线自动路径必须额外防范“单一身份图库吸附陌生人”。人工/直接
+            # API 调用仍可使用兼容的 gait 锚点语义。
+            open_set_guard=True,
         )
         return self._advance(
             effective_observation,
@@ -359,6 +446,7 @@ class AutomaticVerificationController:
         decisions = self.verifier.verify_batch(
             [item[0] for item in prepared],
             candidate_ids=[item[1] for item in prepared],
+            open_set_guard=True,
         )
         return tuple(
             self._advance(
@@ -442,13 +530,20 @@ class AutomaticVerificationController:
                 AutomationStage.DISABLED,
                 "自动注册已关闭",
             )
-        if decision.state == VerificationState.SUSPENDED or any(
-            "conflict" in reason for reason in decision.reasons
-        ):
+        if decision.state == VerificationState.SUSPENDED:
             state.gait_samples.clear()
             return decision, AutomationStatus(
                 AutomationStage.BLOCKED,
-                "证据冲突，已阻止自动注册",
+                "候选人已挂起，自动注册已暂停",
+            )
+        if any("conflict" in reason for reason in decision.reasons):
+            # 冲突帧只代表当前证据不可判定，不应把整条轨迹永久终止。清掉
+            # 可能混入不同分支/身份的窗口，从下一帧重新建立干净序列。
+            state.gait_samples.clear()
+            return decision, AutomationStatus(
+                AutomationStage.GAIT_UNSTABLE,
+                "当前证据冲突，已丢弃本窗口并重新采集",
+                progress=0.0,
             )
         if decision.identity_id is not None:
             # 延迟匹配可能对应一个步态尚未足够强的已有人员。等待比创建重复 ID 更安全。
@@ -458,13 +553,53 @@ class AutomaticVerificationController:
                 identity_id=decision.identity_id,
             )
 
+        ambiguous = decision.kind == DecisionKind.AMBIGUOUS
         proposal, status = self._collect_gait(state, effective_observation)
         if proposal is None:
+            if ambiguous and status.stage not in {
+                AutomationStage.WAIT_MORE_DATA,
+                AutomationStage.WAITING_INDEPENDENT_EVENT,
+            }:
+                return decision, replace(
+                    status,
+                    stage=AutomationStage.AMBIGUOUS,
+                    message=f"步态 Top-2 歧义：{status.message}",
+                )
             return decision, status
+
+        event_proposal = self._record_gait_event_proposal(
+            state,
+            effective_observation,
+            proposal,
+        )
+        state.gait_samples.clear()
+        if event_proposal is None:
+            return decision, AutomationStatus(
+                AutomationStage.WAITING_INDEPENDENT_EVENT,
+                (
+                    f"已记录独立步态事件 {len(state.gait_event_proposals)}/"
+                    f"{self.policy.minimum_independent_gait_events}，等待下一独立事件"
+                ),
+                progress=min(
+                    1.0,
+                    len(state.gait_event_proposals)
+                    / self.policy.minimum_independent_gait_events,
+                ),
+                gait_quality_band=status.gait_quality_band,
+            )
+        proposal = event_proposal
 
         enrollment_observation = replace(
             effective_observation,
-            features=FeatureBundle(gait=proposal.vector),
+            # The appearance vector is used only as a negative open-set signal
+            # while deciding whether a second identity may be enrolled. The
+            # enrollment API still writes gait only and issues a fresh,
+            # one-shot appearance request, so this does not absorb appearance
+            # into the new formal identity.
+            features=FeatureBundle(
+                gait=proposal.vector,
+                appearance=effective_observation.features.appearance,
+            ),
             appearance_request_id=None,
             metadata={
                 **dict(effective_observation.metadata),
@@ -480,12 +615,39 @@ class AutomaticVerificationController:
                 gait_confidence=proposal.stability,
             )
         except ValueError as error:
+            # 开放集拒绝是可恢复的证据结果，不是候选人生命周期终止。清掉
+            # 本窗口后让轨迹重新收集，避免下一帧反复拿同一批向量重试，也不
+            # 把 GUI 永久留在 BLOCKED。真正不可恢复的候选状态（例如挂起）
+            # 仍保留 BLOCKED 语义。
+            state.gait_samples.clear()
+            if "open-set novel" in str(error):
+                state.gait_event_proposals.clear()
+                reason = str(error).split(";", 1)[-1].strip()
+                stage = (
+                    AutomationStage.AMBIGUOUS
+                    if "gait_top2_ambiguous" in reason
+                    else AutomationStage.GAIT_UNSTABLE
+                )
+                if "gait_near_duplicate" in reason:
+                    message = "步态与已有图库过近（formal 原型近重复），已清空窗口并重新采集"
+                elif "missing_appearance_negative_evidence" in reason:
+                    message = "缺少可靠外观负证据，已清空窗口并重新采集"
+                elif stage == AutomationStage.AMBIGUOUS:
+                    message = "步态 Top-2 歧义，已清空窗口并等待新的独立事件"
+                else:
+                    message = "步态与已有图库过近，已清空窗口并重新采集"
+                return decision, AutomationStatus(
+                    stage,
+                    message,
+                    progress=0.0,
+                )
             return decision, AutomationStatus(
                 AutomationStage.BLOCKED,
                 f"自动注册暂缓：{error}",
             )
 
         state.gait_samples.clear()
+        state.gait_event_proposals.clear()
         state.identity_id = enrolled.identity_id
         state.pending_request_id = enrolled.appearance_request_id
         return enrolled, AutomationStatus(

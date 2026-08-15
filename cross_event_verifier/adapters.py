@@ -11,7 +11,7 @@ from typing import Protocol, Sequence
 
 import numpy as np
 
-from ..types import FeatureBundle, Observation, TrackQuality
+from .types import FeatureBundle, Observation, TrackQuality
 
 
 class FeatureExtractor(Protocol):
@@ -128,6 +128,7 @@ def observation_from_tracker(
     gait_cycles: float,
     walking_ratio: float,
     keypoint_visibility: float = 0.0,
+    leg_visibility: float | None = None,
     gait_branch_quality: float | None = None,
     occlusion: float = 0.0,
     sharpness: float = 1.0,
@@ -152,6 +153,7 @@ def observation_from_tracker(
         sharpness=sharpness,
         occlusion=occlusion,
         keypoint_visibility=keypoint_visibility,
+        leg_visibility=leg_visibility,
         gait_branch_quality=gait_branch_quality,
         contour_area=contour_area,
         contour_jitter=contour_jitter,

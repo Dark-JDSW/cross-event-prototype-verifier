@@ -4,7 +4,7 @@ The GUI production backend expects these local files:
 
 | File | Purpose |
 |---|---|
-| `yolo11x.pt` | YOLO11 person detector used with ByteTrack |
+| `yolo11l.pt` | YOLO11L person detector used with ByteTrack |
 | `rtmpose-s.onnx` | top-down COCO-17 RTMPose model |
 | `osnet_ain_x1_0_dg.pth` | domain-generalized OSNet-AIN appearance encoder |
 | `gaitgraph2_grew_state.pt` | tensor-only GaitGraph2 GREW state dictionary |

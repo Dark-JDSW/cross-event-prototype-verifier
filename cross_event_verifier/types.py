@@ -54,12 +54,21 @@ class DecisionKind(str, Enum):
     FORMAL_MATCH = "formal_match"
     UNKNOWN = "unknown"
     DEFERRED = "deferred"
+    AMBIGUOUS = "ambiguous"
     NEED_MORE_DATA = "need_more_data"
     CONFLICT = "conflict"
     CANDIDATE_CREATED = "candidate_created"
     CANDIDATE_UPDATED = "candidate_updated"
     APPEARANCE_REQUESTED = "appearance_requested"
     APPEARANCE_RESPONSE_ACCEPTED = "appearance_response_accepted"
+
+
+class GaitQualityBand(str, Enum):
+    """步态证据质量，不表示它属于哪个身份。"""
+
+    INVALID = "invalid"
+    PARTIAL = "partial"
+    STRONG = "strong"
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,7 @@ class TrackQuality:
     sharpness: float = 1.0
     occlusion: float = 0.0
     keypoint_visibility: float = 0.0
+    leg_visibility: float | None = None
     # OpenGait 轮廓/深度分支质量可以独立于关键点可见度提供；只有骨架的调用方
     # 可以将其保留为 None。
     gait_branch_quality: float | None = None
@@ -152,10 +162,12 @@ class TrackQuality:
         minimum_frames: int = 8,
         minimum_gait_cycles: float = 1.0,
     ) -> float:
-        """返回 ``[0, 1]`` 范围内的步态可用度 ``P_g``。
+        """返回 ``[0, 1]`` 范围内的步态质量 ``Q_gait``。
 
-        序列成熟度、检测到的行走周期、腿部可见度、运动比例、遮挡和轨迹切换
-        会相乘，使任一缺失前提都能抑制看似相似的步态嵌入。
+        序列成熟度、检测到的行走周期、步态分支质量、遮挡和轨迹切换会相乘。
+        生产视觉适配器已经把 ``walking_ratio`` 纳入 ``gait_branch_quality``；
+        因此这里不再重复乘一次 walking ratio，避免低运动指标被二次放大惩罚。
+        当调用方没有提供分支质量时，才保留 walking ratio 作为兼容性回退因子。
         """
 
         if self.frame_count <= 0:
@@ -173,19 +185,63 @@ class TrackQuality:
             if self.gait_branch_quality is not None
             else np.sqrt(keypoints)
         )
+        walking_factor = (
+            1.0
+            if self.gait_branch_quality is not None
+            else max(walking, 0.25 if cycles > 0 else 0.0)
+        )
         switch_penalty = float(np.clip(1.0 - 0.20 * self.id_switches, 0.0, 1.0))
         return float(
             np.clip(
                 gait_signal
                 * np.sqrt(sequence)
                 * np.sqrt(max(cycles, 0.0))
-                * max(walking, 0.25 if cycles > 0 else 0.0)
+                * walking_factor
                 * (1.0 - np.clip(self.occlusion, 0.0, 1.0))
                 * switch_penalty,
                 0.0,
                 1.0,
             )
         )
+
+    def gait_hard_veto_reasons(self, minimum_frames: int = 8) -> tuple[str, ...]:
+        """返回足以使步态证据失效的硬门控原因。
+
+        低 walking ratio 不在这里；它只能降低质量分级，不能单独构成身份
+        反证。硬门仅保留轨迹完整性、序列长度和腿部完全不可见等确定性失败。
+        """
+
+        reasons: list[str] = []
+        if not self.box_valid or self.box_height <= 0:
+            reasons.append("invalid_box")
+        if self.frame_count < minimum_frames:
+            reasons.append("too_short")
+        if self.id_switches > 0:
+            reasons.append("track_id_switch")
+        if self.leg_visibility is not None and self.leg_visibility <= 0.05:
+            reasons.append("legs_invisible")
+        if "box_truncated" in self.reasons:
+            reasons.append("box_truncated")
+        return tuple(dict.fromkeys(reasons))
+
+    def gait_quality_band(
+        self,
+        *,
+        minimum_frames: int = 8,
+        minimum_gait_cycles: float = 1.0,
+        partial_threshold: float = 0.35,
+        strong_threshold: float = 0.70,
+    ) -> GaitQualityBand:
+        """将 ``Q_gait`` 分为 ``INVALID/PARTIAL/STRONG``。"""
+
+        if self.gait_hard_veto_reasons(minimum_frames):
+            return GaitQualityBand.INVALID
+        quality = self.gait_availability(minimum_frames, minimum_gait_cycles)
+        if quality >= strong_threshold:
+            return GaitQualityBand.STRONG
+        if quality >= partial_threshold:
+            return GaitQualityBand.PARTIAL
+        return GaitQualityBand.INVALID
 
     def overall(self, detection_floor: float = 0.35) -> float:
         """返回可用分支中最强的质量，用于早期门控。

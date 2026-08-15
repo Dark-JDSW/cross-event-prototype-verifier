@@ -18,7 +18,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from ..types import (
+from .types import (
     AppearanceAbsorptionRequest,
     CandidateRecord,
     FeatureBundle,
@@ -68,6 +68,7 @@ class SqliteStore:
         self._lock = threading.RLock()
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._transaction_depth = 0
         self.connection.execute("PRAGMA foreign_keys = ON")
         self._create_schema()
 
@@ -195,15 +196,36 @@ class SqliteStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """在出错回滚的事务中提供一个连接。"""
+        """在出错回滚的事务中提供一个连接。
+
+        写入方法可以嵌套在这个上下文中。只有最外层事务负责提交或回滚，
+        避免 ``verify_batch`` 内部的每次 ``save_*`` 调用都触发一次磁盘提交。
+        """
         with self._lock:
-            try:
+            outermost = self._transaction_depth == 0
+            if outermost:
                 self.connection.execute("BEGIN")
+            self._transaction_depth += 1
+            try:
                 yield self.connection
-                self.connection.commit()
+                if outermost:
+                    self.connection.commit()
             except Exception:
-                self.connection.rollback()
+                if outermost:
+                    self.connection.rollback()
                 raise
+            finally:
+                self._transaction_depth -= 1
+
+    @contextmanager
+    def _write_scope(self) -> Iterator[sqlite3.Connection]:
+        """为单次写入或外层批量事务提供统一的提交边界。"""
+        with self._lock:
+            if self._transaction_depth > 0:
+                yield self.connection
+            else:
+                with self.connection:
+                    yield self.connection
 
     def close(self) -> None:
         """所有工作线程停止后关闭 SQLite 连接。"""
@@ -219,7 +241,7 @@ class SqliteStore:
         """创建或更新身份行，但不修改其原型。"""
         now = time.time()
         metadata_json = json.dumps(metadata or {}, ensure_ascii=False, default=_json_default)
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO identities(identity_id,state,metadata_json,created_at,updated_at)
@@ -234,7 +256,7 @@ class SqliteStore:
 
     def set_identity_state(self, identity_id: str, state: VerificationState) -> None:
         """只更新已有身份的生命周期状态。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 "UPDATE identities SET state=?, updated_at=? WHERE identity_id=?",
                 (state.value, time.time(), identity_id),
@@ -248,7 +270,7 @@ class SqliteStore:
 
     def save_candidate(self, candidate: CandidateRecord) -> None:
         """插入或更新隔离/正式候选及其序列化证据链接。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO candidates(
@@ -323,7 +345,7 @@ class SqliteStore:
 
     def save_prototypes(self, prototypes: list[Prototype], *, replace_identity: str | None = None, zone: str | None = None) -> None:
         """持久化归一化原型，可选替换某个身份区域。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             if replace_identity is not None:
                 if zone is None:
                     self.connection.execute("DELETE FROM prototypes WHERE identity_id=?", (replace_identity,))
@@ -391,7 +413,7 @@ class SqliteStore:
         appearance, appearance_dimension = _pack_vector(normalized.features.appearance)
         gait, gait_dimension = _pack_vector(normalized.features.gait)
         quality_json = json.dumps(asdict(normalized.quality), ensure_ascii=False, default=_json_default)
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT OR REPLACE INTO observations(
@@ -426,7 +448,7 @@ class SqliteStore:
 
     def save_appearance_request(self, request: AppearanceAbsorptionRequest) -> None:
         """持久化一次性外观授权令牌。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT OR REPLACE INTO appearance_requests(
@@ -489,7 +511,7 @@ class SqliteStore:
         payload: dict[str, Any] | None = None,
     ) -> None:
         """记录一个带分数、间隔和独立性标记的证据项。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT OR REPLACE INTO evidence(
@@ -583,7 +605,7 @@ class SqliteStore:
                     "created_at": prototype.created_at,
                 }
             )
-        with self._lock, self.connection:
+        with self._write_scope():
             cursor = self.connection.execute(
                 "INSERT INTO snapshots(identity_id,reason,payload_json,created_at) VALUES(?,?,?,?)",
                 (identity_id, reason, json.dumps(payload, ensure_ascii=False), time.time()),
@@ -620,14 +642,14 @@ class SqliteStore:
                     created_at=float(value["created_at"]),
                 )
             )
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute("DELETE FROM prototypes WHERE identity_id=? AND zone='formal'", (row["identity_id"],))
         self.save_prototypes(restored)
         return restored
 
     def audit(self, action: str, entity_id: str | None, payload: dict[str, Any] | None = None) -> None:
         """向只追加审计表写入结构化操作记录。"""
-        with self._lock, self.connection:
+        with self._write_scope():
             self.connection.execute(
                 "INSERT INTO audit_log(action,entity_id,payload_json,created_at) VALUES(?,?,?,?)",
                 (action, entity_id, json.dumps(payload or {}, ensure_ascii=False, default=_json_default), time.time()),

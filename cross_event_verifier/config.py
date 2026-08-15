@@ -22,6 +22,7 @@ class VerifierConfig:
     minimum_frames: int = 8
     minimum_gait_cycles: float = 1.0
     minimum_matching_quality: float = 0.38
+    partial_gait_quality: float = 0.35
     maximum_write_occlusion: float = 0.40
 
     # 开放集决策策略。这些是校准概率而不是原始余弦相似度，应使用部署验证
@@ -40,6 +41,11 @@ class VerifierConfig:
     # 轨迹继续粘连到最接近的旧身份。此时自动控制器可以采集稳定序列并创建
     # 真正的新身份。
     gait_novelty_threshold: float = 0.35
+    # 单一 formal gait 身份时，校准概率本身没有真正的负类。允许第二个
+    # 身份进入的条件因此更严格：原始步态相似度不能接近重复，且外观必须
+    # 以强质量明确拒绝当前唯一身份。
+    single_gallery_gait_similarity_limit: float = 0.985
+    single_gallery_appearance_novelty_threshold: float = 0.30
     strong_gait_probability: float = 0.90
     strong_gait_quality: float = 0.70
     strong_gait_margin: float = 0.08
@@ -81,6 +87,7 @@ class VerifierConfig:
             "detection_confidence_floor": self.detection_confidence_floor,
             "keypoint_confidence_floor": self.keypoint_confidence_floor,
             "minimum_matching_quality": self.minimum_matching_quality,
+            "partial_gait_quality": self.partial_gait_quality,
             "maximum_write_occlusion": self.maximum_write_occlusion,
             "accept_threshold": self.accept_threshold,
             "defer_threshold": self.defer_threshold,
@@ -89,6 +96,8 @@ class VerifierConfig:
             "gait_floor": self.gait_floor,
             "conflict_probability": self.conflict_probability,
             "gait_novelty_threshold": self.gait_novelty_threshold,
+            "single_gallery_gait_similarity_limit": self.single_gallery_gait_similarity_limit,
+            "single_gallery_appearance_novelty_threshold": self.single_gallery_appearance_novelty_threshold,
             "strong_gait_probability": self.strong_gait_probability,
             "strong_gait_quality": self.strong_gait_quality,
             "strong_gait_margin": self.strong_gait_margin,
@@ -111,6 +120,10 @@ class VerifierConfig:
         if self.gait_novelty_threshold >= self.strong_gait_probability:
             raise ValueError(
                 "gait_novelty_threshold must be lower than strong_gait_probability"
+            )
+        if self.partial_gait_quality >= self.strong_gait_quality:
+            raise ValueError(
+                "partial_gait_quality must be lower than strong_gait_quality"
             )
         if self.minimum_frames < 1:
             raise ValueError("minimum_frames must be positive")

@@ -22,14 +22,14 @@ import cv2
 import numpy as np
 
 from .adapters import occlusion_scores
-from ..participant_a.gait_graph import TemporalGaitEncoder
-from ..participant_c.model_assets import tensor_state_fingerprint
-from ..participant_a.osnet_ain import load_osnet_ain
-from ..types import FeatureBundle, TrackQuality
+from .gait_graph import TemporalGaitEncoder
+from .model_assets import tensor_state_fingerprint
+from .osnet_ain import load_osnet_ain
+from .types import FeatureBundle, TrackQuality
 from .vision import Box, VisionTrack
 
 
-MODEL_DIRECTORY = Path(__file__).resolve().parents[2] / "models"
+MODEL_DIRECTORY = Path(__file__).resolve().parents[1] / "models"
 MODEL_MANIFEST = MODEL_DIRECTORY / "manifest.json"
 
 
@@ -53,7 +53,7 @@ class ProductionVisionConfig:
     ``require_cuda`` 默认采用失败即关闭策略：缺少 GPU provider 时，不能把
     已校准的生产运行悄悄变成较慢的 CPU 运行。
     """
-    detector_path: Path = MODEL_DIRECTORY / "yolo11x.pt"
+    detector_path: Path = MODEL_DIRECTORY / "yolo11l.pt"
     tracker_path: Path = MODEL_DIRECTORY / "bytetrack-cross-event.yaml"
     pose_path: Path = MODEL_DIRECTORY / "rtmpose-s.onnx"
     appearance_path: Path = MODEL_DIRECTORY / "osnet_ain_x1_0_dg.pth"
@@ -66,7 +66,9 @@ class ProductionVisionConfig:
     keypoint_confidence: float = 0.45
     minimum_pose_frames: int = 25
     gait_sequence_length: int = 60
-    appearance_stride: int = 3
+    detector_inference_stride: int = 2
+    appearance_stride: int = 6
+    gait_inference_stride: int = 3
     low_light_threshold: float = 100.0
     low_light_check_interval: int = 12
     state_retention_frames: int = 90
@@ -92,6 +94,12 @@ class ProductionVisionConfig:
             raise ValueError("minimum_pose_frames must be at least 8")
         if self.gait_sequence_length < self.minimum_pose_frames:
             raise ValueError("gait_sequence_length cannot be shorter than minimum_pose_frames")
+        if self.detector_inference_stride < 1:
+            raise ValueError("detector_inference_stride must be at least 1")
+        if self.appearance_stride < 1:
+            raise ValueError("appearance_stride must be at least 1")
+        if self.gait_inference_stride < 1:
+            raise ValueError("gait_inference_stride must be at least 1")
         if self.require_cuda and self.torch_device.lower().startswith("cpu"):
             raise ValueError("生产视觉链路 require_cuda=True 时不能把 device 设为 CPU")
 
@@ -108,7 +116,7 @@ class ProductionVisionConfig:
 
     @property
     def torch_device(self) -> str:
-        """返回参与者 A 的编码器使用的规范化 Torch 设备。"""
+        """返回身份表征编码器使用的规范化 Torch 设备。"""
 
         if self.device is None:
             return "cuda:0"
@@ -521,7 +529,9 @@ class _TrackState:
     poses: deque[np.ndarray] = field(default_factory=deque)
     boxes: deque[Box] = field(default_factory=lambda: deque(maxlen=20))
     appearance: np.ndarray | None = None
+    last_appearance_frame: int | None = None
     gait: np.ndarray | None = None
+    last_gait_frame: int | None = None
     id_switches: int = 0
 
 
@@ -537,18 +547,21 @@ def _canonical_pose(
     box: Box,
     confidence_floor: float,
 ) -> np.ndarray | None:
-    """将 RTMPose 坐标归一化到固定的 128x256 框坐标系。"""
+    """清理 RTMPose 点位并保留其原始全帧坐标。
+
+    GaitGraph2 的 GREW 检查点是在原图坐标上训练的。这里如果再按检测框
+    归一化，会把同一个人的全局位置和尺度改成一个与训练数据不兼容的分布，
+    最终表现为不同人物的 gait embedding 几乎完全重合。``box`` 保留在签名
+    中是为了让调用方继续显式传递检测上下文；它不应该参与模型输入变换。
+    """
     if keypoints is None or np.asarray(keypoints).shape != (17, 3):
         return None
     points = np.asarray(keypoints, dtype=np.float32).copy()
-    x1, y1, x2, y2 = box
-    width, height = max(x2 - x1, 1), max(y2 - y1, 1)
     valid = np.isfinite(points).all(axis=1) & (points[:, 2] >= confidence_floor)
     points[~valid] = 0.0
-    points[valid, 0] = (points[valid, 0] - x1) / width * 128.0
-    points[valid, 1] = (points[valid, 1] - y1) / height * 256.0
-    points[valid, 0] = np.clip(points[valid, 0], -32.0, 160.0)
-    points[valid, 1] = np.clip(points[valid, 1], -64.0, 320.0)
+    # Do not clip valid coordinates to the box. GREW stores raw image-space
+    # coordinates, and a detector/pose mismatch should be handled by quality
+    # gates rather than silently changing the model's coordinate distribution.
     return points
 
 
@@ -568,7 +581,10 @@ def _pose_visibility(points: np.ndarray | None, floor: float) -> tuple[float, fl
     return all_visibility, leg_visibility
 
 
-def _walking_metrics(poses: Sequence[np.ndarray]) -> tuple[float, float]:
+def _walking_metrics(
+    poses: Sequence[np.ndarray],
+    box: Box | None = None,
+) -> tuple[float, float]:
     """根据下肢相位估计运动能量和步态周期数。"""
     if len(poses) < 8:
         return 0.0, 0.0
@@ -579,7 +595,15 @@ def _walking_metrics(poses: Sequence[np.ndarray]) -> tuple[float, float]:
         return 0.0, 0.0
     hip_center = (values[:, 11, :2] + values[:, 12, :2]) * 0.5
     lower = values[:, [13, 14, 15, 16], :2] - hip_center[:, None, :]
-    lower /= np.asarray([128.0, 256.0], dtype=np.float32)
+    if box is None:
+        metric_scale = np.asarray([128.0, 256.0], dtype=np.float32)
+    else:
+        x1, y1, x2, y2 = box
+        metric_scale = np.asarray(
+            [max(float(x2 - x1), 1.0), max(float(y2 - y1), 1.0)],
+            dtype=np.float32,
+        )
+    lower /= metric_scale
     valid_lower = confidence[:, [13, 14, 15, 16]] > 0
     deltas = np.linalg.norm(np.diff(lower, axis=0), axis=2)
     delta_valid = valid_lower[1:] & valid_lower[:-1]
@@ -590,7 +614,7 @@ def _walking_metrics(poses: Sequence[np.ndarray]) -> tuple[float, float]:
         values[:, 15, 1]
         - values[:, 16, 1]
         + 0.5 * (values[:, 13, 1] - values[:, 14, 1])
-    ) / 256.0
+    ) / metric_scale[1]
     phase_valid = (
         (confidence[:, 13] > 0)
         & (confidence[:, 14] > 0)
@@ -662,14 +686,20 @@ class ProductionVisionAdapter:
     """
 
     supports_automatic_registration = True
-    model_version = "yolo11x-bytetrack+rtmpose-s+osnet-ain+gaitgraph2-grew-v1"
+    # v2 records the checkpoint-compatible GREW input contract: raw full-frame
+    # RTMPose coordinates and OpenGait's partition-normalized COCO graph.  A
+    # database produced by the old bbox-normalized path must not be reused as
+    # if its gait prototypes were comparable to this stream.
+    model_version = "yolo11l-bytetrack+rtmpose-s+osnet-ain+gaitgraph2-grew-opengait-input-v2"
     _RUNTIME_PARAMETER_NAMES = (
         "detector_confidence",
         "output_confidence",
         "detector_iou",
+        "detector_inference_stride",
         "keypoint_confidence",
         "minimum_pose_frames",
         "appearance_stride",
+        "gait_inference_stride",
         "low_light_threshold",
     )
 
@@ -690,6 +720,9 @@ class ProductionVisionAdapter:
         self.states: dict[int, _TrackState] = {}
         self.latest: dict[int, VisionTrack] = {}
         self.frame_index = 0
+        self._cached_detections: tuple[_Detection, ...] = ()
+        self._last_detector_frame: int | None = None
+        self._detector_refreshed_this_frame = False
 
     def _load(self) -> None:
         """只加载一次检测、姿态、外观和步态模型。"""
@@ -748,12 +781,25 @@ class ProductionVisionAdapter:
         self.config = candidate
         if self.detector is not None:
             self.detector.config = candidate
+        if any(
+            name in changes
+            for name in (
+                "detector_confidence",
+                "output_confidence",
+                "detector_iou",
+                "detector_inference_stride",
+            )
+        ):
+            # 下一帧必须重新检测，不能让旧阈值产生的缓存框继续生效。
+            self._cached_detections = ()
+            self._last_detector_frame = None
         self.enhancer.threshold = candidate.low_light_threshold
         self.enhancer.interval = max(1, candidate.low_light_check_interval)
         if reset_gait:
             for state in self.states.values():
                 state.poses.clear()
                 state.gait = None
+                state.last_gait_frame = None
 
     def reset(self) -> None:
         """清除跟踪器状态、时序窗口和缓存的轨迹输出。"""
@@ -763,6 +809,30 @@ class ProductionVisionAdapter:
         self.states.clear()
         self.latest.clear()
         self.frame_index = 0
+        self._cached_detections = ()
+        self._last_detector_frame = None
+        self._detector_refreshed_this_frame = False
+
+    def _detections_for_frame(self, frame_bgr: np.ndarray) -> tuple[_Detection, ...]:
+        """按配置刷新检测，并在中间帧复用最近一次轨迹框。
+
+        缓存为空时始终执行真实检测，以便新人物能够立即进入管线。已有检测最多
+        只复用 ``detector_inference_stride - 1`` 帧；下一次 YOLO/ByteTrack
+        返回空结果时会立刻清空缓存，避免长期保留已经离场的人物。
+        """
+
+        due = (
+            not self._cached_detections
+            or self._last_detector_frame is None
+            or self.frame_index - self._last_detector_frame
+            >= self.config.detector_inference_stride
+        )
+        self._detector_refreshed_this_frame = due
+        if due:
+            assert self.detector is not None
+            self._cached_detections = self.detector.track(frame_bgr)
+            self._last_detector_frame = self.frame_index
+        return self._cached_detections
 
     def _expire_states(self, active_ids: set[int]) -> None:
         """删除缺席时间超过保留策略的时序状态。"""
@@ -789,7 +859,7 @@ class ProductionVisionAdapter:
         assert self.gait is not None
         self.frame_index += 1
         inference_frame = self.enhancer.apply(frame_bgr)
-        detections = self.detector.track(inference_frame)
+        detections = self._detections_for_frame(inference_frame)
         if not detections:
             self._expire_states(set())
             return ()
@@ -798,7 +868,10 @@ class ProductionVisionAdapter:
         poses = self.pose.extract(inference_frame, boxes)
         overlaps = occlusion_scores(np.asarray(boxes, dtype=np.float32))
 
-        appearance_indexes: list[int] = []
+        frame_metrics: list[
+            tuple[np.ndarray | None, float, float, float, float]
+        ] = []
+        gait_indexes: list[int] = []
         for index, detection in enumerate(detections):
             state = self.states.setdefault(
                 detection.track_id,
@@ -806,27 +879,13 @@ class ProductionVisionAdapter:
                     poses=deque(maxlen=self.config.gait_sequence_length),
                 ),
             )
-            if (
-                state.appearance is None
-                or state.frame_count % max(1, self.config.appearance_stride) == 0
-            ):
-                appearance_indexes.append(index)
-        appearance_boxes = [boxes[index] for index in appearance_indexes]
-        appearance_values = self.appearance.extract(frame_bgr, appearance_boxes)
-        for destination, value in zip(appearance_indexes, appearance_values):
-            if value is not None:
-                self.states[detections[destination].track_id].appearance = value
-
-        output: list[VisionTrack] = []
-        active_ids: set[int] = set()
-        frame_height, frame_width = frame_bgr.shape[:2]
-        for index, detection in enumerate(detections):
-            state = self.states[detection.track_id]
             if state.boxes and _abrupt_track_jump(state.boxes[-1], detection.box):
                 state.id_switches += 1
                 state.poses.clear()
                 state.gait = None
+                state.last_gait_frame = None
                 state.appearance = None
+                state.last_appearance_frame = None
             state.frame_count += 1
             state.last_seen_frame = self.frame_index
             state.boxes.append(detection.box)
@@ -841,12 +900,91 @@ class ProductionVisionAdapter:
             )
             if canonical is not None and leg_visibility >= 0.45:
                 state.poses.append(canonical)
-            walking_ratio, gait_cycles = _walking_metrics(state.poses)
-            if len(state.poses) >= self.config.minimum_pose_frames and gait_cycles >= 0.5:
-                encoded = self.gait.encode(state.poses)
-                if encoded is not None:
-                    state.gait = encoded
+            walking_ratio, gait_cycles = _walking_metrics(state.poses, detection.box)
+            gait_due = (
+                state.gait is None
+                or state.last_gait_frame is None
+                or state.frame_count - state.last_gait_frame
+                >= self.config.gait_inference_stride
+            )
+            first_gait = state.gait is None or state.last_gait_frame is None
+            gait_overdue = (
+                not first_gait
+                and state.frame_count - state.last_gait_frame
+                >= self.config.gait_inference_stride
+                + max(1, self.config.detector_inference_stride)
+            )
+            if (
+                len(state.poses) >= self.config.minimum_pose_frames
+                and gait_cycles >= 0.5
+                and gait_due
+                and (
+                    first_gait
+                    or not self._detector_refreshed_this_frame
+                    or gait_overdue
+                )
+            ):
+                gait_indexes.append(index)
+            frame_metrics.append(
+                (canonical, visibility, leg_visibility, walking_ratio, gait_cycles)
+            )
 
+        if gait_indexes:
+            gait_values = self.gait.encode_batch(
+                [
+                    tuple(self.states[detections[index].track_id].poses)
+                    for index in gait_indexes
+                ]
+            )
+            for destination, value in zip(gait_indexes, gait_values):
+                if value is None:
+                    continue
+                state = self.states[detections[destination].track_id]
+                state.gait = value
+                state.last_gait_frame = state.frame_count
+
+        # 周期性外观刷新放到没有执行检测和步态编码的帧。首次外观仍立即提取，
+        # 避免新 Track 因错峰策略延迟进入外观分支。
+        appearance_indexes: list[int] = []
+        gait_ran = bool(gait_indexes)
+        for index, detection in enumerate(detections):
+            state = self.states[detection.track_id]
+            first_appearance = state.last_appearance_frame is None
+            appearance_due = (
+                first_appearance
+                or state.frame_count - state.last_appearance_frame
+                >= self.config.appearance_stride
+            )
+            appearance_overdue = (
+                not first_appearance
+                and state.frame_count - state.last_appearance_frame
+                >= self.config.appearance_stride
+                + max(2, self.config.detector_inference_stride)
+            )
+            periodic_slot_available = (
+                not self._detector_refreshed_this_frame and not gait_ran
+            )
+            if appearance_due and (
+                first_appearance or periodic_slot_available or appearance_overdue
+            ):
+                appearance_indexes.append(index)
+        if appearance_indexes:
+            appearance_boxes = [boxes[index] for index in appearance_indexes]
+            appearance_values = self.appearance.extract(frame_bgr, appearance_boxes)
+            for destination, value in zip(appearance_indexes, appearance_values):
+                state = self.states[detections[destination].track_id]
+                state.last_appearance_frame = state.frame_count
+                if value is not None:
+                    state.appearance = value
+
+        output: list[VisionTrack] = []
+        active_ids: set[int] = set()
+        frame_height, frame_width = frame_bgr.shape[:2]
+        for index, detection in enumerate(detections):
+            state = self.states[detection.track_id]
+            canonical, visibility, leg_visibility, walking_ratio, gait_cycles = (
+                frame_metrics[index]
+            )
             x1, y1, x2, y2 = detection.box
             crop = frame_bgr[y1:y2, x1:x2]
             sharpness = 0.0
@@ -887,6 +1025,7 @@ class ProductionVisionAdapter:
                 sharpness=sharpness,
                 occlusion=float(overlaps[index]),
                 keypoint_visibility=visibility,
+                leg_visibility=leg_visibility,
                 gait_branch_quality=gait_quality,
                 contour_area=float((x2 - x1) * (y2 - y1)),
                 contour_jitter=_box_jitter(state.boxes),

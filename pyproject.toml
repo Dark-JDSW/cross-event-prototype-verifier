@@ -26,7 +26,7 @@ production = [
 ]
 
 [project.scripts]
-cross-event-verifier = "cross_event_verifier.participant_c.cli:main"
+cross-event-verifier = "cross_event_verifier.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cross_event_verifier*"]

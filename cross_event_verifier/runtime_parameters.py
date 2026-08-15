@@ -14,12 +14,12 @@ import math
 from typing import TYPE_CHECKING, Literal, Mapping
 
 from .automation import AutomationPolicy
-from ..participant_a.calibration import ScoreCalibrator
+from .calibration import ScoreCalibrator
 
 if TYPE_CHECKING:
     from .automation import AutomaticVerificationController
-    from ..participant_a.engine import CrossEventVerifier
-    from ..participant_b.vision import VisionAdapter
+    from .engine import CrossEventVerifier
+    from .vision import VisionAdapter
 
 
 RuntimeScalar = int | float
@@ -126,6 +126,24 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "高质量步态低于此概率时明确拒绝全部旧 ID；调高更易建新号。",
     ),
     _float_spec(
+        "verifier.single_gallery_gait_similarity_limit",
+        "开放集与步态锚点",
+        "单图库步态近重复上限",
+        0.90,
+        0.999,
+        0.985,
+        "单一 formal gait 原型与新轨迹达到此余弦相似度时，即使外观不同也不自动复制身份。",
+    ),
+    _float_spec(
+        "verifier.single_gallery_appearance_novelty_threshold",
+        "开放集与步态锚点",
+        "单图库外观拒识阈值",
+        0.0,
+        0.80,
+        0.30,
+        "只有强质量外观低于此概率且步态不是近重复时，才允许从单一图库引入新身份。",
+    ),
+    _float_spec(
         "verifier.strong_gait_probability",
         "开放集与步态锚点",
         "强步态确认概率",
@@ -216,6 +234,15 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "外观和步态质量都低于此值时继续等待。",
     ),
     _float_spec(
+        "verifier.partial_gait_quality",
+        "质量门控",
+        "部分步态质量下限",
+        0.0,
+        1.0,
+        0.35,
+        "低于此值视为 INVALID；达到强步态门之前只保留为 PARTIAL/等待证据。",
+    ),
+    _float_spec(
         "verifier.maximum_write_occlusion",
         "质量门控",
         "最大写入遮挡",
@@ -241,6 +268,15 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         64,
         8,
         "连续通过一致性门后才允许建号的嵌入数量。",
+    ),
+    _int_spec(
+        "automation.minimum_independent_gait_events",
+        "自动注册稳定性",
+        "独立步态事件数",
+        1,
+        8,
+        2,
+        "自动创建新身份前需要来自不同采集会话/挑战的稳定步态事件数。",
     ),
     _int_spec(
         "automation.gait_sample_window",
@@ -386,6 +422,15 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         0.50,
         "YOLO 非极大值抑制使用的 IoU 阈值。",
     ),
+    _int_spec(
+        "vision.detector_inference_stride",
+        "生产视觉前端",
+        "检测推理间隔",
+        1,
+        6,
+        2,
+        "YOLO/ByteTrack 每隔多少帧刷新一次；中间帧复用最近轨迹框。",
+    ),
     _float_spec(
         "vision.keypoint_confidence",
         "生产视觉前端",
@@ -410,8 +455,17 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "外观提取间隔",
         1,
         30,
-        3,
+        6,
         "每隔多少 Track 帧刷新一次 OSNet 外观嵌入。",
+    ),
+    _int_spec(
+        "vision.gait_inference_stride",
+        "生产视觉前端",
+        "步态推理间隔",
+        1,
+        30,
+        3,
+        "姿态仍逐帧采集，但每隔多少 Track 帧批量刷新一次 GaitGraph2 嵌入。",
     ),
     _float_spec(
         "vision.low_light_threshold",

@@ -8,11 +8,15 @@ from unittest.mock import patch
 import numpy as np
 
 from cross_event_verifier import AutomationPolicy, CrossEventVerifier, FeatureBundle
-from cross_event_verifier.participant_c.gui import VerifierWindow, _frame_to_photo
-from cross_event_verifier.participant_c.media import FrameWorker, ParameterUpdateMessage, SourceSpec
-from cross_event_verifier.participant_c.pipeline import VideoVerifierPipeline
+from cross_event_verifier.gui import (
+    GUI_POLL_INTERVAL_MS,
+    VerifierWindow,
+    _frame_to_photo,
+)
+from cross_event_verifier.media import FrameWorker, ParameterUpdateMessage, SourceSpec
+from cross_event_verifier.pipeline import VideoVerifierPipeline
 from cross_event_verifier.types import TrackQuality
-from cross_event_verifier.participant_b.vision import OpenCvDemoAdapter, VisionTrack
+from cross_event_verifier.vision import OpenCvDemoAdapter, VisionTrack
 
 
 def stable_quality() -> TrackQuality:
@@ -127,6 +131,9 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
+    def test_gui_poll_interval_supports_sixty_hertz_refresh(self) -> None:
+        self.assertEqual(GUI_POLL_INTERVAL_MS, 16)
+
     def test_camera_frame_converts_to_tk_photo(self) -> None:
         root = tk.Tk()
         root.withdraw()
@@ -139,7 +146,7 @@ class GuiPipelineTests(unittest.TestCase):
 
     def test_gui_has_a_realtime_parameter_page(self) -> None:
         with patch(
-            "cross_event_verifier.participant_c.gui.build_vision_adapter",
+            "cross_event_verifier.gui.build_vision_adapter",
             return_value=FakeVision(),
         ):
             window = VerifierWindow(":memory:", "demo")
@@ -154,6 +161,49 @@ class GuiPipelineTests(unittest.TestCase):
                 str(window.parameter_entries["vision.detector_confidence"].cget("state")),
                 "disabled",
             )
+        finally:
+            window.close()
+
+    def test_small_window_keeps_appearance_absorption_panel_reachable(self) -> None:
+        """最小窗口下外观吸收控件不能被右侧内容挤出可视区域。"""
+
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            return_value=FakeVision(),
+        ):
+            window = VerifierWindow(":memory:", "demo")
+        window.root.geometry("980x640")
+        window.root.update()
+
+        def find_by_text(widget: tk.Misc, text: str) -> tk.Misc | None:
+            for child in widget.winfo_children():
+                try:
+                    if child.cget("text") == text:
+                        return child
+                except tk.TclError:
+                    pass
+                found = find_by_text(child, text)
+                if found is not None:
+                    return found
+            return None
+
+        try:
+            request_box = find_by_text(
+                window.root,
+                "外观吸收（自动；此处为人工兜底）",
+            )
+            self.assertIsNotNone(request_box)
+            assert request_box is not None
+            self.assertTrue(request_box.winfo_ismapped())
+            self.assertEqual(request_box.winfo_height(), request_box.winfo_reqheight())
+            window.side_canvas.yview_moveto(1.0)
+            window.root.update()
+            canvas_top = window.side_canvas.winfo_rooty()
+            canvas_bottom = canvas_top + window.side_canvas.winfo_height()
+            box_top = request_box.winfo_rooty()
+            box_bottom = box_top + request_box.winfo_height()
+            self.assertGreater(box_bottom, canvas_top)
+            self.assertLess(box_top, canvas_bottom)
         finally:
             window.close()
 
@@ -215,6 +265,7 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
+                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
@@ -271,6 +322,7 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
+                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
@@ -305,6 +357,7 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
+                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 190, 3), dtype=np.uint8)
@@ -380,6 +433,7 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
+                minimum_independent_gait_events=1,
             ),
         )
         pipeline.update_runtime_parameters(
@@ -387,7 +441,9 @@ class GuiPipelineTests(unittest.TestCase):
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
         before = pipeline.process_frame(frame, timestamp=260.0)
-        self.assertEqual(before.tracks[0].decision.identity_id, "P1")
+        # 自动路径的开放集保护不会把单一身份图库中的陌生轨迹直接标成 P1，
+        # 即使运行时把 novelty threshold 调得过低。
+        self.assertIsNone(before.tracks[0].decision.identity_id)
 
         pipeline.update_runtime_parameters(
             {"verifier.gait_novelty_threshold": "0.35"}
@@ -410,6 +466,7 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
+                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)

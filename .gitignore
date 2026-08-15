@@ -15,3 +15,11 @@ models/*.pt
 models/*.pth
 models/*.onnx
 models/*.engine
+
+# 本地研究资料、测试视频和架构文档不上传远程仓库
+/docs/
+/gait_open_set_p0_p1_p2_industry_solutions.md
+/gaitgraph2_pg_low_score_analysis.md
+/MAN.mp4
+/P1.mp4
+/P2.mp4

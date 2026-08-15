@@ -30,20 +30,21 @@ from .config import VerifierConfig
 from .fusion import fuse_calibrated_scores
 from .memory import MemoryUpdate, PrototypeMemory
 from .state import check_independence, mark_evidence, transition
-from ..participant_c.storage import SqliteStore
+from .storage import SqliteStore
 from .stability import StabilityTracker
-from ..types import (
+from .types import (
     AppearanceAbsorptionRequest,
     CandidateRecord,
     Decision,
     DecisionKind,
     FeatureBundle,
+    GaitQualityBand,
     Observation,
     PromotionResult,
     ScoreBreakdown,
     VerificationState,
 )
-from ..participant_c.vector_index import DualModalityIndex, VectorHit
+from .vector_index import DualModalityIndex, VectorHit
 
 
 class CrossEventVerifier:
@@ -324,9 +325,16 @@ class CrossEventVerifier:
             self.config.minimum_frames,
             self.config.minimum_gait_cycles,
         )
-        if gait_quality < self.config.strong_gait_quality:
+        gait_band = normalized.quality.gait_quality_band(
+            minimum_frames=self.config.minimum_frames,
+            minimum_gait_cycles=self.config.minimum_gait_cycles,
+            partial_threshold=self.config.partial_gait_quality,
+            strong_threshold=self.config.strong_gait_quality,
+        )
+        if gait_band != GaitQualityBand.STRONG:
             raise ValueError(
-                "automatic enrollment gait quality is below the strong gate"
+                "automatic enrollment gait quality is not strong "
+                f"({gait_band.value})"
             )
         confidence = float(
             np.clip(
@@ -339,6 +347,52 @@ class CrossEventVerifier:
             raise ValueError(
                 "automatic enrollment gait confidence is below the strong gate"
             )
+
+        # 自动建号是开放集操作：强而稳定不等于“新人物”。如果当前 gait
+        # 已经落在 formal gallery 的有效相似度区间，继续创建 P2/P3 只会把
+        # 一个疑似旧身份复制成更多近重复原型。人工指定 identity_id 时保留
+        # 显式登记能力，但自动路径必须先通过 novelty gate。
+        if identity_id is None:
+            existing_ranking = self.rank(normalized)
+            nearest_gait = self._branch_winner(existing_ranking, "gait")
+            if (
+                nearest_gait is not None
+                and nearest_gait.gait_quality >= self.config.strong_gait_quality
+                and self._gait_novelty_is_blocked(normalized, existing_ranking, nearest_gait)
+            ):
+                reason = self._gait_novelty_block_reason(
+                    normalized,
+                    existing_ranking,
+                    nearest_gait,
+                ) or "open_set_uncertain"
+                gait_candidates = [
+                    item for item in existing_ranking if item.gait_similarity is not None
+                ]
+                gait_scores = sorted(
+                    (item.gait_similarity or 0.0 for item in gait_candidates),
+                    reverse=True,
+                )
+                gait_margin = (
+                    gait_scores[0] - gait_scores[1]
+                    if len(gait_scores) > 1
+                    else gait_scores[0] if gait_scores else None
+                )
+                self.store.audit(
+                    "gait_open_set_rejected",
+                    candidate_id,
+                    {
+                        "event_id": normalized.event_id,
+                        "reason": reason,
+                        "gait_quality": gait_quality,
+                        "top1_gait_similarity": gait_scores[0] if gait_scores else None,
+                        "top2_gait_similarity": gait_scores[1] if len(gait_scores) > 1 else None,
+                        "gait_margin": gait_margin,
+                    },
+                )
+                raise ValueError(
+                    "gait evidence is not open-set novel; "
+                    f"{reason}"
+                )
 
         candidate = self._candidates.get(candidate_id) if candidate_id else None
         if candidate is not None and candidate.state in {
@@ -437,6 +491,91 @@ class CrossEventVerifier:
             appearance_request_id=request.request_id,
         )
 
+    def _single_gallery_novelty_override(
+        self,
+        observation: Observation,
+        ranking: Sequence[ScoreBreakdown],
+        nearest_gait: ScoreBreakdown,
+    ) -> bool:
+        """判断单身份图库是否有足够的跨模态负证据允许建新号。
+
+        一条 gait 原型无法提供真正的 Top-2 竞争，因此不能把单条原型的
+        calibrated probability 当作开放集负类。只有在 gait 不是近重复、且
+        当前强质量外观明确排斥唯一身份时，自动路径才允许绕过单图库的概率
+        novelty gate。没有外观或外观质量不足时仍保持原来的保守拒绝。
+        """
+
+        gait_candidates = [
+            item for item in ranking if item.gait_probability is not None
+        ]
+        if len(gait_candidates) != 1:
+            return False
+        gait_similarity = nearest_gait.gait_similarity
+        if gait_similarity is None or gait_similarity >= self.config.single_gallery_gait_similarity_limit:
+            return False
+        features = observation.features.normalized()
+        if not features.has_appearance:
+            return False
+        if nearest_gait.appearance_probability is None:
+            return False
+        if nearest_gait.appearance_quality < self.config.strong_appearance_quality:
+            return False
+        return (
+            nearest_gait.appearance_probability
+            <= self.config.single_gallery_appearance_novelty_threshold
+        )
+
+    def _gait_novelty_is_blocked(
+        self,
+        observation: Observation,
+        ranking: Sequence[ScoreBreakdown],
+        nearest_gait: ScoreBreakdown,
+    ) -> bool:
+        """判断自动建号是否应因 gait 证据过近或不确定而暂缓。
+
+        ``gait_novelty_threshold`` 是分支校准概率，不是经过开放集负类标定的
+        阈值。若直接用它拦截自动建号，当前默认校准会把大量普通的高余弦样本
+        都解释成“已有身份”，从而放大 formal 原型碰撞问题。
+
+        单身份图库仍保持保守策略；多身份图库则使用原始余弦近重复上限和
+        Top-2 gait margin。这样“中等相似但明显胜出”的样本可以进入候选，
+        而近重复或身份间无法分开的样本会留在等待/隔离状态。
+        """
+
+        return self._gait_novelty_block_reason(observation, ranking, nearest_gait) is not None
+
+    def _gait_novelty_block_reason(
+        self,
+        observation: Observation,
+        ranking: Sequence[ScoreBreakdown],
+        nearest_gait: ScoreBreakdown,
+    ) -> str | None:
+        """返回自动建号被拒绝的可解释开放集原因。"""
+
+        gait_candidates = [
+            item for item in ranking if item.gait_probability is not None
+        ]
+        gait_similarity = nearest_gait.gait_similarity
+        if gait_similarity is not None and gait_similarity >= self.config.single_gallery_gait_similarity_limit:
+            return "gait_near_duplicate"
+        if len(gait_candidates) <= 1:
+            # 单身份图库仍允许明显低于 novelty threshold 的 gait 直接进入
+            # 新候选；中高相似样本需要强外观负证据。
+            if (nearest_gait.gait_probability or 0.0) < self.config.gait_novelty_threshold:
+                return None
+            if self._single_gallery_novelty_override(
+                observation,
+                ranking,
+                nearest_gait,
+            ):
+                return None
+            return "missing_appearance_negative_evidence"
+
+        gait_margin = self._branch_margin(ranking, nearest_gait, "gait")
+        if gait_margin < self.config.strong_gait_margin:
+            return "gait_top2_ambiguous"
+        return None
+
     def _spatial_probability(self, observation: Observation, identity_id: str) -> float:
         """返回某个身份的有界摄像头转场先验概率。"""
         previous = self._last_seen.get(identity_id)
@@ -525,12 +664,25 @@ class CrossEventVerifier:
             key=lambda item: item.gait_probability or 0.0,
             default=None,
         )
+        appearance_margin = self._branch_margin(
+            values,
+            appearance_winner,
+            "appearance",
+        )
+        gait_margin = self._branch_margin(values, gait_winner, "gait")
         conflict = bool(
             appearance_winner
             and gait_winner
             and appearance_winner.identity_id != gait_winner.identity_id
             and (appearance_winner.appearance_probability or 0.0) >= self.config.conflict_probability
             and (gait_winner.gait_probability or 0.0) >= self.config.conflict_probability
+            # 分支冲突只有在两个分支都达到强质量和可分离 margin 时才成立。
+            # 低质量/近似打平的分支应该进入 deferred，而不是清空新人物的
+            # 稳定采样窗口并永久挂起候选人。
+            and appearance_winner.appearance_quality >= self.config.strong_appearance_quality
+            and gait_winner.gait_quality >= self.config.strong_gait_quality
+            and appearance_margin >= self.config.margin_threshold
+            and gait_margin >= self.config.strong_gait_margin
         )
         if conflict:
             values = [replace(item, conflict=True) for item in values]
@@ -567,17 +719,40 @@ class CrossEventVerifier:
                 (item.appearance_probability or 0.0 for item in ranking if item.appearance_probability is not None),
                 reverse=True,
             )
+        if not values:
+            return 0.0
         return float(values[0] - values[1]) if len(values) > 1 else float(values[0])
 
     def _strong_gait_match(
         self,
         ranking: Sequence[ScoreBreakdown],
+        *,
+        open_set_guard: bool = False,
     ) -> tuple[ScoreBreakdown | None, float]:
-        """对步态排序应用概率、质量和 Top-2 间隔门控。"""
+        """对步态排序应用概率、质量和 Top-2 间隔门控。
+
+        ``open_set_guard`` 由在线自动控制器使用。图库只有一个 gait 身份时，
+        Top-2 margin 没有真正的竞争者，不能把单一候选的概率当作 margin；此时
+        自动路径还要求同一身份有强外观佐证。直接调用验证器的兼容路径保持原有
+        gait 锚点语义，便于人工复核和一次性外观授权。
+        """
         winner = self._branch_winner(ranking, "gait")
         margin = self._branch_margin(ranking, winner, "gait")
         if winner is None:
             return None, margin
+        gait_candidates = [item for item in ranking if item.gait_probability is not None]
+        if (
+            open_set_guard
+            and len(gait_candidates) < 2
+            and not (
+                winner.appearance_probability is not None
+                and winner.appearance_probability >= self.config.strong_appearance_probability
+                and winner.appearance_quality >= self.config.strong_appearance_quality
+            )
+        ):
+            # 单身份图库无法从排名本身证明“不是陌生人”。让自动控制器保持
+            # unknown/deferred，避免把所有陌生人都吸附到首个 P1。
+            return None, 0.0
         if (
             (winner.gait_probability or 0.0) >= self.config.strong_gait_probability
             and winner.gait_quality >= self.config.strong_gait_quality
@@ -592,11 +767,15 @@ class CrossEventVerifier:
         features = observation.features.normalized()
         if not features.has_gait:
             return False
-        quality = observation.quality.gait_availability(
-            self.config.minimum_frames,
-            self.config.minimum_gait_cycles,
+        return (
+            observation.quality.gait_quality_band(
+                minimum_frames=self.config.minimum_frames,
+                minimum_gait_cycles=self.config.minimum_gait_cycles,
+                partial_threshold=self.config.partial_gait_quality,
+                strong_threshold=self.config.strong_gait_quality,
+            )
+            == GaitQualityBand.STRONG
         )
-        return quality >= self.config.strong_gait_quality
 
     def _appearance_response(
         self,
@@ -761,6 +940,10 @@ class CrossEventVerifier:
             if features.has_gait
             else 0.0
         )
+        if features.has_gait:
+            reasons.extend(
+                quality.gait_hard_veto_reasons(self.config.minimum_frames)
+            )
         if not features.has_appearance and not features.has_gait:
             reasons.append("no_feature_signal")
         if max(app_quality, gait_quality) < self.config.minimum_matching_quality:
@@ -773,6 +956,7 @@ class CrossEventVerifier:
         ranking: Sequence[ScoreBreakdown],
         *,
         forced_identity: str | None = None,
+        open_set_guard: bool = False,
     ) -> Decision:
         """将图库排名转换为可审计的开放集决策。"""
         quality_reasons = self._quality_block_reasons(observation)
@@ -815,7 +999,10 @@ class CrossEventVerifier:
                 reasons=tuple(reasons),
                 ranking=tuple(ranking),
             )
-        strong_gait, gait_margin = self._strong_gait_match(ranking)
+        strong_gait, gait_margin = self._strong_gait_match(
+            ranking,
+            open_set_guard=open_set_guard,
+        )
         if strong_gait is not None:
             if forced_identity is not None and forced_identity != strong_gait.identity_id:
                 return Decision(
@@ -840,13 +1027,34 @@ class CrossEventVerifier:
                 reasons=("strong_gait_confirmation",),
                 ranking=tuple(ranking),
             )
-        if self.config.require_gait_for_formal_match:
-            gait_candidate = self._branch_winner(ranking, "gait")
-            gait_candidate_margin = self._branch_margin(
-                ranking,
-                gait_candidate,
-                "gait",
+        gait_candidate = self._branch_winner(ranking, "gait")
+        gait_candidates = [
+            item for item in ranking if item.gait_probability is not None
+        ]
+        gait_candidate_margin = self._branch_margin(
+            ranking,
+            gait_candidate,
+            "gait",
+        )
+        if (
+            gait_candidate is not None
+            and len(gait_candidates) >= 2
+            and gait_candidate.gait_quality >= self.config.partial_gait_quality
+            and gait_candidate_margin < self.config.strong_gait_margin
+        ):
+            return Decision(
+                kind=DecisionKind.AMBIGUOUS,
+                state=VerificationState.ISOLATED_CANDIDATE,
+                identity_id=None,
+                score=gait_candidate.gait_probability,
+                margin=gait_candidate_margin,
+                reasons=(
+                    "gait_top2_ambiguous",
+                    "await_independent_event",
+                ),
+                ranking=tuple(ranking),
             )
+        if self.config.require_gait_for_formal_match:
             if (
                 gait_candidate is not None
                 and gait_candidate.gait_quality >= self.config.strong_gait_quality
@@ -873,13 +1081,16 @@ class CrossEventVerifier:
                 # 迹标为另一个仅由外观选出的胜者。
                 selected = gait_candidate
                 margin = gait_candidate_margin
+                reasons.append("gait_not_strong_enough_for_confirmation")
             reasons.append("appearance_requires_gait_authorization")
             if selected.appearance_probability is not None:
                 reasons.append("appearance_is_absorbable_only")
             return Decision(
                 kind=DecisionKind.DEFERRED,
                 state=VerificationState.ISOLATED_CANDIDATE,
-                identity_id=selected.identity_id,
+                # deferred 只表示待判定，不对外承诺身份。这样自动控制器可以
+                # 继续收集稳定序列，也不会把陌生人显示为 P1。
+                identity_id=None,
                 score=selected.fused_probability,
                 margin=margin,
                 reasons=tuple(reasons),
@@ -891,7 +1102,7 @@ class CrossEventVerifier:
             return Decision(
                 kind=DecisionKind.DEFERRED,
                 state=VerificationState.ISOLATED_CANDIDATE,
-                identity_id=selected.identity_id,
+                identity_id=None,
                 score=selected.fused_probability,
                 margin=margin,
                 reasons=tuple(reasons),
@@ -917,7 +1128,10 @@ class CrossEventVerifier:
             return Decision(
                 kind=DecisionKind.DEFERRED,
                 state=VerificationState.ISOLATED_CANDIDATE,
-                identity_id=selected.identity_id,
+                # 无论是否启用 gait-required 策略，DEFERRED 都只表示
+                # “尚未判定”。不携带候选身份，避免调用方把疑似匹配当成
+                # 已确认身份并据此停止开放集采样。
+                identity_id=None,
                 score=selected.fused_probability,
                 margin=margin,
                 reasons=tuple(reasons),
@@ -980,6 +1194,8 @@ class CrossEventVerifier:
         *,
         absorb_appearance: bool = False,
         absorb_gait: bool = True,
+        gait_gallery_size: int | None = None,
+        gait_margin: float | None = None,
     ) -> tuple[MemoryUpdate, ...]:
         """将通过门控的样本写入正式记忆，并持久化审计轨迹。"""
         source_features = observation.features.normalized()
@@ -1005,6 +1221,15 @@ class CrossEventVerifier:
             return ()
         if breakdown.conflict or observation.quality.occlusion > self.config.maximum_write_occlusion:
             return ()
+        if absorb_gait:
+            # 单一 gait 身份没有真正的 Top-2 竞争者，不能把每个“强相似”帧
+            # 反复写回同一个模板。等到图库至少有两个 gait 身份且 margin
+            # 达标后再允许自适应更新；外观授权响应仍走独立的 appearance
+            # 分支，不受此保护影响。
+            if gait_gallery_size is not None and gait_gallery_size < 2:
+                return ()
+            if gait_margin is not None and gait_margin < self.config.strong_gait_margin:
+                return ()
         branch_quality = appearance_quality if absorb_appearance else gait_quality
         if branch_quality < self.config.minimum_formal_write_quality:
             return ()
@@ -1063,6 +1288,7 @@ class CrossEventVerifier:
         candidate_id: str | None = None,
         ranking: Sequence[ScoreBreakdown] | None = None,
         forced_identity: str | None = None,
+        open_set_guard: bool = False,
     ) -> Decision:
         """运行完整的单观测协议。
 
@@ -1092,6 +1318,7 @@ class CrossEventVerifier:
                 observation,
                 ranking,
                 forced_identity=forced_identity,
+                open_set_guard=open_set_guard,
             )
             if response_error:
                 decision = replace(
@@ -1118,6 +1345,10 @@ class CrossEventVerifier:
                 selected,
                 absorb_appearance=is_appearance_response,
                 absorb_gait=not is_appearance_response,
+                gait_gallery_size=sum(
+                    item.gait_probability is not None for item in ranking
+                ),
+                gait_margin=self._branch_margin(ranking, selected, "gait"),
             )
             request_id = decision.appearance_request_id
             if is_appearance_response and response_request is not None:
@@ -1135,33 +1366,37 @@ class CrossEventVerifier:
                         "event_id": observation.event_id,
                     },
                 )
-            elif self._strong_gait_match(ranking)[0] is not None:
-                gait_anchor = self._strong_gait_match(ranking)[0]
-                assert gait_anchor is not None
-                request, issued = self._issue_appearance_request(
-                    identity_id=decision.identity_id,
-                    observation=observation,
-                    gait_probability=float(gait_anchor.gait_probability or 0.0),
-                    gait_quality=gait_anchor.gait_quality,
-                    candidate_id=candidate_id,
-                    reason="strong_gait_confirmation",
+            else:
+                gait_anchor, _ = self._strong_gait_match(
+                    ranking,
+                    open_set_guard=open_set_guard,
                 )
-                if request is not None and not issued:
-                    decision = replace(
-                        decision,
-                        reasons=tuple(
-                            (*decision.reasons, "appearance_absorption_request_pending")
-                        ),
+                if gait_anchor is not None:
+                    assert gait_anchor.identity_id == decision.identity_id
+                    request, issued = self._issue_appearance_request(
+                        identity_id=decision.identity_id,
+                        observation=observation,
+                        gait_probability=float(gait_anchor.gait_probability or 0.0),
+                        gait_quality=gait_anchor.gait_quality,
+                        candidate_id=candidate_id,
+                        reason="strong_gait_confirmation",
                     )
-                request_id = request.request_id if request is not None else None
-                if (
-                    request is not None
-                    and "appearance_absorption_requested" not in decision.reasons
-                ):
-                    decision = replace(
-                        decision,
-                        reasons=tuple((*decision.reasons, "appearance_absorption_requested")),
-                    )
+                    if request is not None and not issued:
+                        decision = replace(
+                            decision,
+                            reasons=tuple(
+                                (*decision.reasons, "appearance_absorption_request_pending")
+                            ),
+                        )
+                    request_id = request.request_id if request is not None else None
+                    if (
+                        request is not None
+                        and "appearance_absorption_requested" not in decision.reasons
+                    ):
+                        decision = replace(
+                            decision,
+                            reasons=tuple((*decision.reasons, "appearance_absorption_requested")),
+                        )
             self.store.audit(
                 "formal_match",
                 decision.identity_id,
@@ -1301,9 +1536,13 @@ class CrossEventVerifier:
                 # 隔离区且可见。
                 pass
         final_kind = (
-            DecisionKind.CANDIDATE_CREATED
-            if not previous
-            else DecisionKind.CANDIDATE_UPDATED
+            decision.kind
+            if decision.kind == DecisionKind.AMBIGUOUS
+            else (
+                DecisionKind.CANDIDATE_CREATED
+                if not previous
+                else DecisionKind.CANDIDATE_UPDATED
+            )
         )
         return replace(
             decision,
@@ -1314,16 +1553,43 @@ class CrossEventVerifier:
             evidence_id=evidence_id,
         )
 
-    def verify(self, observation: Observation, *, candidate_id: str | None = None) -> Decision:
+    def verify(
+        self,
+        observation: Observation,
+        *,
+        candidate_id: str | None = None,
+        open_set_guard: bool = False,
+    ) -> Decision:
         """处理一条轨迹/事件，并返回安全、可审计的决策。"""
 
-        return self._process(observation, candidate_id=candidate_id)
+        return self._process(
+            observation,
+            candidate_id=candidate_id,
+            open_set_guard=open_set_guard,
+        )
 
     def verify_batch(
         self,
         observations: Sequence[Observation],
         *,
         candidate_ids: Sequence[str | None] | None = None,
+        open_set_guard: bool = False,
+    ) -> list[Decision]:
+        """使用一个 SQLite 事务完成一帧的批量验证和证据写入。"""
+
+        with self.store.transaction():
+            return self._verify_batch(
+                observations,
+                candidate_ids=candidate_ids,
+                open_set_guard=open_set_guard,
+            )
+
+    def _verify_batch(
+        self,
+        observations: Sequence[Observation],
+        *,
+        candidate_ids: Sequence[str | None] | None = None,
+        open_set_guard: bool = False,
     ) -> list[Decision]:
         """使用全局一对一身份指派验证一帧。
 
@@ -1343,6 +1609,7 @@ class CrossEventVerifier:
                     item,
                     candidate_id=candidate_ids[index] if candidate_ids else None,
                     ranking=(),
+                    open_set_guard=open_set_guard,
                 )
                 for index, item in enumerate(normalized)
             ]
@@ -1351,7 +1618,13 @@ class CrossEventVerifier:
             # 全局指派必须使用与最终决策相同的步态锚点可行性。过去融合后的
             # 外观分数会让陌生人先占用旧身份列，步态随后才拒绝，导致识别和
             # 新身份注册都被挤饿。
-            strong_gait_winners = [self._strong_gait_match(ranking)[0] for ranking in rankings]
+            strong_gait_winners = [
+                self._strong_gait_match(
+                    ranking,
+                    open_set_guard=open_set_guard,
+                )[0]
+                for ranking in rankings
+            ]
             score_matrix = np.asarray(
                 [
                     [
@@ -1431,6 +1704,7 @@ class CrossEventVerifier:
                         candidate_id=candidate_id,
                         ranking=rankings[index],
                         forced_identity=forced,
+                        open_set_guard=open_set_guard,
                     )
                 )
             else:
@@ -1444,6 +1718,7 @@ class CrossEventVerifier:
                         item,
                         candidate_id=candidate_id,
                         ranking=filtered,
+                        open_set_guard=open_set_guard,
                     )
                 )
         return decisions

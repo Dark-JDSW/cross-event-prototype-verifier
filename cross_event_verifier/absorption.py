@@ -10,13 +10,13 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
-from ..types import AppearanceAbsorptionRequest
+from .types import AppearanceAbsorptionRequest
 
 
 class AppearanceAbsorptionManager:
     """签发、校验、消费和恢复一次性授权。
 
-    管理器有意只保存在内存中。参与者 C 通过 SQLite 持久化数据类字段，并在
+    管理器有意只保存在内存中。在线编排层通过 SQLite 持久化数据类字段，并在
     验证器启动时恢复它们，使该策略类不依赖具体的存储实现。
     """
 

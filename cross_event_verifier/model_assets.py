@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from urllib.request import Request, urlopen
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIRECTORY = PROJECT_ROOT / "models"
 MODEL_MANIFEST = MODEL_DIRECTORY / "manifest.json"
 

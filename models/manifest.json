@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
   "models": {
-    "yolo11x.pt": {
-      "bytes": 114636239,
-      "sha256": "7bc158aa95c0ebfdd87f70f01653c1131b93e92522dbe15c228bcd742e773a24",
+    "yolo11l.pt": {
+      "bytes": 51387343,
+      "sha256": "9ebd0e09d59811db4b1d61e2bc6730649608b1ac47f8dd01e2da6bca7c20023f",
       "download": {
-        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11x.pt"
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11l.pt"
       }
     },
     "rtmpose-s.onnx": {

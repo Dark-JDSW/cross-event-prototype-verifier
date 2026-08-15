@@ -50,12 +50,16 @@ def _coco_adjacency(max_hop: int = 3) -> np.ndarray:
     for distance in range(max_hop, -1, -1):
         hop_distance[reachable[distance]] = distance
 
-    degree = adjacency.sum(axis=0)
+    # OpenGait normalizes the *union* of all nodes reachable within
+    # ``max_hop`` and only then partitions that normalized matrix by hop. It
+    # is not the one-hop degree normalization used by a vanilla ST-GCN.
+    reachable_within_hops = np.isfinite(hop_distance)
+    degree = reachable_within_hops.sum(axis=0)
     inverse_degree = np.zeros((nodes, nodes), dtype=np.float32)
     for index, value in enumerate(degree):
         if value > 0:
-            inverse_degree[index, index] = value ** -1
-    normalized = adjacency @ inverse_degree
+            inverse_degree[index, index] = float(value) ** -1
+    normalized = reachable_within_hops.astype(np.float32) @ inverse_degree
     result = np.zeros((max_hop + 1, nodes, nodes), dtype=np.float32)
     for hop in range(max_hop + 1):
         result[hop][hop_distance == hop] = normalized[hop_distance == hop]
@@ -392,17 +396,19 @@ class GaitGraph2Encoder(nn.Module):
 
 
 def _fill_missing(sequence: np.ndarray) -> np.ndarray:
-    """使用该帧可见关节中心填补缺失关节坐标。"""
+    """按 OpenGait ``NormalizeEmpty`` 规则填补空关节。"""
     result = np.asarray(sequence, dtype=np.float32).copy()
     for frame in result:
-        valid = (frame[:, 2] > 0) & np.isfinite(frame).all(axis=1)
-        if valid.any():
-            center = frame[valid, :2].mean(axis=0)
-        else:
-            center = np.zeros(2, dtype=np.float32)
-        invalid = ~valid
-        frame[invalid, :2] = center
-        frame[invalid, 2] = 0.0
+        empty = frame[:, 0] == 0.0
+        if not empty.any():
+            continue
+        # OpenGait computes the frame center over all 17 rows (including the
+        # zero rows) and only then replaces the empty coordinates. Matching
+        # that detail keeps missing-joint handling checkpoint-compatible.
+        center = frame.mean(axis=0)
+        frame[empty, 0] = center[0]
+        frame[empty, 1] = center[1]
+        frame[empty, 2] = 0.0
     return result
 
 
@@ -443,7 +449,7 @@ class TemporalGaitEncoder:
     """加载 GREW 检查点并编码滚动姿态序列。
 
     ``encode`` 将时序重采样、缺失关键点处理、可选测试时增强、设备放置和
-    L2 归一化隐藏在一个小接口后，该接口由参与者 B 的生产适配器使用。
+    L2 归一化隐藏在一个小接口后，该接口由生产视觉适配器使用。
     """
 
     def __init__(
@@ -476,15 +482,45 @@ class TemporalGaitEncoder:
         return 384 if self.use_tta else 128
 
     def encode(self, poses: Sequence[np.ndarray] | np.ndarray) -> np.ndarray | None:
-        """编码姿态窗口；窗口不可用时返回 ``None``。"""
-        sequence = np.asarray(poses, dtype=np.float32)
-        if sequence.ndim != 3 or sequence.shape[1:] != (17, 3) or len(sequence) < 25:
-            return None
-        sequence = _fixed_length(sequence, self.sequence_length)
-        variants = [gait_graph_multi_input(sequence)]
-        if self.use_tta:
-            variants.append(gait_graph_multi_input(sequence[::-1].copy()))
-            variants.append(gait_graph_multi_input(sequence[:, _COCO_FLIP].copy()))
+        """编码一个姿态窗口；窗口不可用时返回 ``None``。"""
+        return self.encode_batch([poses])[0]
+
+    def encode_batch(
+        self,
+        pose_sequences: Sequence[Sequence[np.ndarray] | np.ndarray],
+    ) -> list[np.ndarray | None]:
+        """一次编码多个姿态窗口，并保持结果与输入顺序对齐。
+
+        无效窗口在对应位置返回 ``None``，其余窗口的原始、时间反转和水平翻转
+        变体会合并为一个模型批次。这样生产适配器无需了解 TTA 分组、设备传输
+        和输出归一化细节，也不会为每个 Track 单独启动一次 GPU 前向。
+        """
+
+        output: list[np.ndarray | None] = [None] * len(pose_sequences)
+        variants: list[np.ndarray] = []
+        valid_indexes: list[int] = []
+        for index, poses in enumerate(pose_sequences):
+            try:
+                sequence = np.asarray(poses, dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+            if (
+                sequence.ndim != 3
+                or sequence.shape[1:] != (17, 3)
+                or len(sequence) < 25
+            ):
+                continue
+            sequence = _fixed_length(sequence, self.sequence_length)
+            variants.append(gait_graph_multi_input(sequence))
+            if self.use_tta:
+                variants.append(gait_graph_multi_input(sequence[::-1].copy()))
+                variants.append(
+                    gait_graph_multi_input(sequence[:, _COCO_FLIP].copy())
+                )
+            valid_indexes.append(index)
+        if not variants:
+            return output
+
         batch = torch.from_numpy(np.stack(variants)).to(self.device)
         with torch.inference_mode():
             if self.device.type == "cuda":
@@ -492,9 +528,12 @@ class TemporalGaitEncoder:
                     embeddings = self.model(batch)
             else:
                 embeddings = self.model(batch)
-        vector = embeddings.float().cpu().numpy().reshape(-1)
-        norm = float(np.linalg.norm(vector))
-        return (vector / norm).astype(np.float32) if norm > 1e-8 else None
+        grouped = embeddings.float().cpu().numpy().reshape(len(valid_indexes), -1)
+        for destination, vector in zip(valid_indexes, grouped):
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-8:
+                output[destination] = (vector / norm).astype(np.float32)
+        return output
 
 
 __all__ = [

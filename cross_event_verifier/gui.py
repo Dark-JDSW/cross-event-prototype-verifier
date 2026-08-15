@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import cv2
 
-from ..participant_a.engine import CrossEventVerifier
+from .engine import CrossEventVerifier
 from .media import (
     FrameMessage,
     FrameWorker,
@@ -26,7 +26,10 @@ from .automation import AutomationPolicy
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterState
 from .storage import SqliteStore
-from ..participant_b.vision_factory import build_vision_adapter
+from .vision_factory import build_vision_adapter
+
+
+GUI_POLL_INTERVAL_MS = 16
 
 
 def _frame_to_photo(
@@ -117,7 +120,7 @@ class VerifierWindow:
 
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(50, self._poll_messages)
+        self.root.after(GUI_POLL_INTERVAL_MS, self._poll_messages)
 
     def _build_layout(self) -> None:
         """构造输入源控件、监控页、登记面板和状态栏。"""
@@ -179,9 +182,54 @@ class VerifierWindow:
         )
         self.video_label.grid(row=0, column=0, sticky="nsew")
 
-        side = ttk.Frame(body, width=520)
-        side.grid(row=0, column=1, padx=(10, 0), sticky="ns")
-        side.grid_propagate(False)
+        # 右侧控件总高度会随 Track 列表和状态文案变化，不能直接把它放进
+        # 固定高度的监控页。使用一个独立的画布视口承载右栏，窗口较矮时仍
+        # 可以通过滚动条访问“外观吸收”和图库区域，而不会被父 Frame 裁掉。
+        side_content_width = 520
+        side_viewport = ttk.Frame(body, width=side_content_width + 18)
+        side_viewport.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+        side_viewport.grid_propagate(False)
+        side_viewport.columnconfigure(0, weight=1)
+        side_viewport.rowconfigure(0, weight=1)
+        side_canvas = tk.Canvas(
+            side_viewport,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        side_canvas.grid(row=0, column=0, sticky="nsew")
+        side_scrollbar = ttk.Scrollbar(
+            side_viewport,
+            orient="vertical",
+            command=side_canvas.yview,
+        )
+        side_scrollbar.grid(row=0, column=1, sticky="ns")
+        side_canvas.configure(yscrollcommand=side_scrollbar.set)
+        side = ttk.Frame(side_canvas, width=side_content_width)
+        side_window = side_canvas.create_window(
+            (0, 0),
+            window=side,
+            anchor="nw",
+            width=side_content_width,
+        )
+
+        def update_side_scrollregion(_event: tk.Event[tk.Misc] | None = None) -> None:
+            """根据右栏实际内容更新画布可滚动范围。"""
+
+            side_canvas.configure(scrollregion=side_canvas.bbox("all"))
+
+        def resize_side_window(event: tk.Event[tk.Misc]) -> None:
+            """让右栏内容保持固定设计宽度，不因滚动条出现而水平溢出。"""
+
+            side_canvas.itemconfigure(
+                side_window,
+                width=max(side_content_width, int(event.width)),
+            )
+
+        side.bind("<Configure>", update_side_scrollregion)
+        side_canvas.bind("<Configure>", resize_side_window)
+        # 将画布和滚动条保留为属性，便于后续主题或无障碍交互扩展。
+        self.side_canvas = side_canvas
+        self.side_scrollbar = side_scrollbar
         ttk.Label(side, text="当前目标", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
         self.track_tree = ttk.Treeview(
             side,
@@ -228,6 +276,7 @@ class VerifierWindow:
 
         request_box = ttk.LabelFrame(side, text="外观吸收（自动；此处为人工兜底）")
         request_box.pack(fill="x", pady=(14, 0))
+        self.appearance_request_box = request_box
         ttk.Label(request_box, text="请求令牌").grid(row=0, column=0, padx=6, pady=8)
         ttk.Entry(request_box, textvariable=self.appearance_request_id, width=22).grid(
             row=0,
@@ -568,13 +617,17 @@ class VerifierWindow:
 
     def _poll_messages(self) -> None:
         """取出工作线程消息，并安排下一次 Tk 轮询。"""
+        latest_frame: FrameMessage | None = None
         while True:
             try:
                 message = self.worker.messages.get_nowait()
             except queue.Empty:
                 break
             if isinstance(message, FrameMessage):
-                self._update_frame(message.result)
+                # 工作线程在高负载时会丢弃旧帧，但轮询开始前仍可能积压多条
+                # FrameMessage。只渲染最新帧，避免 Tk 连续转换/绘制已经过时的
+                # 画面，造成额外背压和可见延迟。
+                latest_frame = message
             elif isinstance(message, RegistrationMessage):
                 self.status.set(message.text)
                 if message.success:
@@ -590,7 +643,9 @@ class VerifierWindow:
                     messagebox.showerror("参数应用失败", message.text)
             elif isinstance(message, StatusMessage):
                 self.status.set(message.text)
-        self.root.after(50, self._poll_messages)
+        if latest_frame is not None:
+            self._update_frame(latest_frame.result)
+        self.root.after(GUI_POLL_INTERVAL_MS, self._poll_messages)
 
     def close(self) -> None:
         """停止后台工作、关闭 SQLite，并销毁 Tk 根窗口。"""
