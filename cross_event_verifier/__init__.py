@@ -6,8 +6,10 @@
 """
 
 from .automation import AutomationPolicy, AutomationStage, AutomationStatus
+from .appearance_first import AppearanceFirstGaitEnrollmentController
 from .config import VerifierConfig
 from .engine import CrossEventVerifier
+from .gait_readiness import GaitReadinessEvaluator
 from .evaluation import (
     EncoderEvaluation,
     VerificationMetrics,
@@ -25,8 +27,13 @@ from .types import (
     CandidateRecord,
     Decision,
     DecisionKind,
+    EmbeddingContract,
     FeatureBundle,
+    AppearanceIdentityBinding,
+    GaitEnrollmentEvent,
     GaitQualityBand,
+    GaitReadinessReport,
+    GaitReadinessState,
     Observation,
     Prototype,
     TrackQuality,
@@ -39,11 +46,18 @@ __all__ = [
     "AutomationPolicy",
     "AutomationStage",
     "AutomationStatus",
+    "AppearanceFirstGaitEnrollmentController",
+    "AppearanceIdentityBinding",
     "CrossEventVerifier",
+    "GaitReadinessEvaluator",
     "Decision",
     "DecisionKind",
+    "EmbeddingContract",
     "FeatureBundle",
+    "GaitEnrollmentEvent",
     "GaitQualityBand",
+    "GaitReadinessReport",
+    "GaitReadinessState",
     "Observation",
     "Prototype",
     "TrackQuality",

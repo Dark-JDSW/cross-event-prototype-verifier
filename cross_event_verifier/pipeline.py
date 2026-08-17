@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 from typing import Sequence
 from uuid import uuid4
@@ -16,6 +16,7 @@ from .automation import (
     AutomationStatus,
     AutomaticVerificationController,
 )
+from .appearance_first import AppearanceFirstGaitEnrollmentController
 from .engine import CrossEventVerifier
 from .runtime_parameters import (
     RuntimeParameterController,
@@ -58,7 +59,8 @@ class VideoVerifierPipeline:
 
     * :meth:`set_source` 开始新的来源会话，同时保留正式身份图库；
     * :meth:`process_frame` 接收一帧 BGR 图像并返回可渲染结果；
-    * :meth:`register_current_track` 将所选轨迹的最新特征快照登记到正式记忆。
+    * :meth:`register_current_track` 在兼容模式下登记步态，在 OSNet-first 模式
+      下登记视觉身份并让后续帧学习步态原型。
 
     GUI 无需知道轨迹 ID、事件 ID、质量元数据或候选 ID 是如何构造的。
     """
@@ -70,14 +72,107 @@ class VideoVerifierPipeline:
         *,
         camera_id: str = "camera-1",
         automation_policy: AutomationPolicy | None = None,
+        appearance_first: bool = False,
     ) -> None:
-        """连接验证器、可替换视觉适配器和自动化策略。"""
+        """连接验证器、可替换视觉适配器和自动化策略。
+
+        ``appearance_first=True`` 是生产 GUI 使用的流程开关；默认保留旧版
+        步态优先模式以兼容已有的非 GUI API 调用方。
+        """
         self.verifier = verifier
         self.vision = vision
-        self.automation = AutomaticVerificationController(
-            verifier,
-            automation_policy,
+        vision_model_version = getattr(vision, "model_version", None)
+        vision_feature_schema = getattr(vision, "feature_schema", None)
+        vision_artifact_sha256 = getattr(vision, "artifact_sha256", None)
+        vision_preprocess_version = getattr(vision, "preprocess_version", None)
+        vision_joint_format = getattr(vision, "joint_format", None)
+        vision_sequence_length = getattr(vision, "sequence_length", None)
+        vision_tta_mode = getattr(vision, "tta_mode", None)
+        vision_coordinate_contract = getattr(vision, "coordinate_contract", None)
+        vision_embedding_dimensions = getattr(vision, "embedding_dimensions", None)
+        bound_model_version = (
+            str(vision_model_version)
+            if verifier.config.model_version == "unconfigured" and vision_model_version
+            else verifier.config.model_version
         )
+        bound_feature_schema = (
+            str(vision_feature_schema)
+            if verifier.config.feature_schema == "unconfigured-v1" and vision_feature_schema
+            else verifier.config.feature_schema
+        )
+        bound_artifact_sha256 = (
+            str(vision_artifact_sha256)
+            if verifier.config.artifact_sha256 == "unverified" and vision_artifact_sha256
+            else verifier.config.artifact_sha256
+        )
+        bound_preprocess_version = (
+            str(vision_preprocess_version)
+            if verifier.config.preprocess_version == "unversioned-v1" and vision_preprocess_version
+            else verifier.config.preprocess_version
+        )
+        bound_joint_format = (
+            str(vision_joint_format)
+            if verifier.config.joint_format == "unknown" and vision_joint_format
+            else verifier.config.joint_format
+        )
+        bound_tta_mode = (
+            str(vision_tta_mode)
+            if verifier.config.tta_mode == "unknown" and vision_tta_mode
+            else verifier.config.tta_mode
+        )
+        bound_coordinate_contract = (
+            str(vision_coordinate_contract)
+            if verifier.config.coordinate_contract == "unknown" and vision_coordinate_contract
+            else verifier.config.coordinate_contract
+        )
+        bound_sequence_length = (
+            int(vision_sequence_length)
+            if verifier.config.sequence_length is None and vision_sequence_length is not None
+            else verifier.config.sequence_length
+        )
+        bound_embedding_dimensions = (
+            dict(vision_embedding_dimensions)
+            if not verifier.config.embedding_dimensions and vision_embedding_dimensions
+            else dict(verifier.config.embedding_dimensions)
+        )
+        if (
+            bound_model_version != verifier.config.model_version
+            or bound_feature_schema != verifier.config.feature_schema
+            or bound_artifact_sha256 != verifier.config.artifact_sha256
+            or bound_preprocess_version != verifier.config.preprocess_version
+            or bound_joint_format != verifier.config.joint_format
+            or bound_sequence_length != verifier.config.sequence_length
+            or bound_tta_mode != verifier.config.tta_mode
+            or bound_coordinate_contract != verifier.config.coordinate_contract
+            or bound_embedding_dimensions != dict(verifier.config.embedding_dimensions)
+        ):
+            # Bind a fresh verifier to the actual adapter contract. Existing
+            # legacy prototypes remain non-matching instead of being silently
+            # compared with a different encoder/pre-processing protocol.
+            verifier.config = replace(
+                verifier.config,
+                model_version=bound_model_version,
+                feature_schema=bound_feature_schema,
+                artifact_sha256=bound_artifact_sha256,
+                preprocess_version=bound_preprocess_version,
+                joint_format=bound_joint_format,
+                sequence_length=bound_sequence_length,
+                tta_mode=bound_tta_mode,
+                coordinate_contract=bound_coordinate_contract,
+                embedding_dimensions=bound_embedding_dimensions,
+            )
+            verifier.reconcile_gallery_contract()
+        self.appearance_first = bool(appearance_first)
+        if self.appearance_first:
+            self.automation = AppearanceFirstGaitEnrollmentController(
+                verifier,
+                automation_policy,
+            )
+        else:
+            self.automation = AutomaticVerificationController(
+                verifier,
+                automation_policy,
+            )
         self._runtime_parameters = RuntimeParameterController(
             verifier,
             self.automation,
@@ -85,6 +180,16 @@ class VideoVerifierPipeline:
         )
         self.camera_id = camera_id
         self.capture_session_id = f"capture-{uuid4().hex}"
+        # A stable candidate is an explicit enrollment correlation supplied by
+        # the caller.  It is never inferred from a short-lived Track ID, which
+        # would merge unrelated people after a source switch.
+        self._enrollment_candidate_id: str | None = None
+        self._enrollment_track_id: int | None = None
+        # Once a Track receives a source-local candidate key, keep that key
+        # while the Track remains in this source.  Otherwise an entering or
+        # leaving person could change ``active_count`` and silently discard the
+        # Track's visual-identity must-link state.
+        self._track_candidate_ids: dict[int, str] = {}
         self.frame_index = 0
         self._latest: dict[int, VisionTrack] = {}
         # 保留一段输入源本地的短期历史供操作员登记使用。生产环境中的单帧可能
@@ -129,21 +234,62 @@ class VideoVerifierPipeline:
             self._track_history.clear()
         return state
 
-    def set_source(self, camera_id: str, *, capture_session_id: str | None = None) -> None:
-        """开始新的摄像头/文件会话，但不删除正式身份。"""
+    def set_source(
+        self,
+        camera_id: str,
+        *,
+        capture_session_id: str | None = None,
+        candidate_id: str | None = None,
+    ) -> None:
+        """开始新的会话，并可显式继续一个跨会话候选人。
+
+        ``candidate_id`` 是外部采集任务/操作员提供的稳定关联键。OSNet-first
+        模式下，已有视觉身份通常可以跨源重新绑定；该键只用于视觉身份尚未
+        完成时延续同一个临时 Track 的采集任务。缺省时仍使用 session-scoped
+        candidate，避免把两个陌生人自动合并。
+        稳定候选模式只在当前会话恰好有一条 Track 时生效；多人画面会回退到
+        每个 Track 的 session-scoped 键。
+        """
 
         self.camera_id = camera_id.strip() or "camera-1"
         self.capture_session_id = capture_session_id or f"capture-{uuid4().hex}"
+        normalized_candidate = candidate_id.strip() if candidate_id else None
+        if candidate_id is not None and not normalized_candidate:
+            raise ValueError("candidate_id cannot be empty")
+        self._enrollment_candidate_id = normalized_candidate
+        self._enrollment_track_id = None
+        self._track_candidate_ids.clear()
         self.frame_index = 0
         self._latest.clear()
         self._track_history.clear()
-        self.automation.reset_tracks()
+        self.automation.reset_tracks(
+            preserve_candidate_ids=(normalized_candidate,)
+            if normalized_candidate is not None
+            else (),
+            # Candidates without an explicit cross-session enrollment key are
+            # source-local by design.  Drop their short-lived windows and
+            # persisted event proposals at the boundary so a later source
+            # cannot accidentally retain anonymous evidence indefinitely.
+            discard_unpreserved=True,
+        )
         self.vision.reset()
 
     def set_automatic_registration(self, enabled: bool) -> None:
-        """启用或禁用根据稳定步态创建新 ID。"""
+        """启用或禁用根据稳定 OSNet 外观创建新的视觉身份 ID。"""
 
         self.automation.set_registration_enabled(enabled)
+
+    def clear_gallery(self) -> None:
+        """清空持久化身份，并丢弃当前帧管线中的短期状态。"""
+
+        self.verifier.clear_gallery()
+        self.automation.reset_tracks(discard_unpreserved=True)
+        self._latest.clear()
+        self._track_history.clear()
+        self._track_candidate_ids.clear()
+        self._enrollment_track_id = None
+        self.frame_index = 0
+        self.vision.reset()
 
     def set_appearance_request(
         self,
@@ -162,11 +308,7 @@ class VideoVerifierPipeline:
                 ) * (self._latest[item].box[3] - self._latest[item].box[1]),
             )
         candidate_id = (
-            self._candidate_id(
-                self.camera_id,
-                self.capture_session_id,
-                int(track_id),
-            )
+            self._candidate_id_for_track(int(track_id), active_count=len(self._latest))
             if track_id is not None
             else None
         )
@@ -180,6 +322,23 @@ class VideoVerifierPipeline:
         """构造在连续帧之间保持稳定的输入源本地候选键。"""
         return f"{camera_id}:{session_id}:track-{track_id}"
 
+    def _candidate_id_for_track(self, track_id: int, *, active_count: int) -> str:
+        """为当前 Track 选择显式跨会话键或安全的会话键。"""
+
+        existing = self._track_candidate_ids.get(track_id)
+        if existing is not None:
+            return existing
+        if self._enrollment_candidate_id is not None and active_count == 1:
+            if self._enrollment_track_id is None:
+                self._enrollment_track_id = track_id
+            if self._enrollment_track_id == track_id:
+                candidate_id = self._enrollment_candidate_id
+                self._track_candidate_ids[track_id] = candidate_id
+                return candidate_id
+        candidate_id = self._candidate_id(self.camera_id, self.capture_session_id, track_id)
+        self._track_candidate_ids[track_id] = candidate_id
+        return candidate_id
+
     @staticmethod
     def _color(decision: Decision) -> tuple[int, int, int]:
         """选择反映决策状态的 BGR 叠加颜色。"""
@@ -187,6 +346,7 @@ class VideoVerifierPipeline:
             return 0, 0, 255
         if decision.kind.value in {
             "formal_match",
+            "visual_identity_created",
             "appearance_requested",
             "appearance_response_accepted",
         }:
@@ -248,16 +408,20 @@ class VideoVerifierPipeline:
         started = time.perf_counter()
         now = time.time() if timestamp is None else float(timestamp)
         self.frame_index += 1
-        vision_tracks = self.vision.process(frame_bgr)
+        process_at = getattr(self.vision, "process_at", None)
+        vision_tracks = (
+            process_at(frame_bgr, timestamp=now)
+            if callable(process_at)
+            else self.vision.process(frame_bgr)
+        )
         prepared: list[tuple[VisionTrack, str, Observation]] = []
         for item in vision_tracks:
             event_id = (
                 f"{self.capture_session_id}:frame-{self.frame_index}:track-{item.track_id}"
             )
-            candidate_id = self._candidate_id(
-                self.camera_id,
-                self.capture_session_id,
+            candidate_id = self._candidate_id_for_track(
                 item.track_id,
+                active_count=len(vision_tracks),
             )
             prepared.append(
                 (
@@ -279,12 +443,70 @@ class VideoVerifierPipeline:
                             )
                         ),
                         threshold_version=self.verifier.config.threshold_version,
+                        feature_schema=str(
+                            getattr(
+                                self.vision,
+                                "feature_schema",
+                                self.verifier.config.feature_schema,
+                            )
+                        ),
+                        artifact_sha256=str(
+                            getattr(
+                                self.vision,
+                                "artifact_sha256",
+                                self.verifier.config.artifact_sha256,
+                            )
+                        ),
+                        preprocess_version=str(
+                            getattr(
+                                self.vision,
+                                "preprocess_version",
+                                self.verifier.config.preprocess_version,
+                            )
+                        ),
+                        joint_format=str(
+                            getattr(
+                                self.vision,
+                                "joint_format",
+                                self.verifier.config.joint_format,
+                            )
+                        ),
+                        sequence_length=(
+                            int(getattr(self.vision, "sequence_length"))
+                            if getattr(self.vision, "sequence_length", None) is not None
+                            else self.verifier.config.sequence_length
+                        ),
+                        tta_mode=str(
+                            getattr(
+                                self.vision,
+                                "tta_mode",
+                                self.verifier.config.tta_mode,
+                            )
+                        ),
+                        coordinate_contract=str(
+                            getattr(
+                                self.vision,
+                                "coordinate_contract",
+                                self.verifier.config.coordinate_contract,
+                            )
+                        ),
+                        embedding_dimensions=dict(
+                            getattr(
+                                self.vision,
+                                "embedding_dimensions",
+                                self.verifier.config.embedding_dimensions,
+                            )
+                        ),
+                        calibration_version=self.verifier.config.calibration_version,
                         metadata={
                             "source": "standalone-gui",
                             "vision_adapter": type(self.vision).__name__,
                             "vision_backend": str(
                                 getattr(self.vision, "backend_status", "unknown")
                             ),
+                            "track_box": tuple(item.box),
+                            "active_track_count": len(vision_tracks),
+                            "candidate_key": candidate_id,
                         },
                     ),
                 )
@@ -395,6 +617,8 @@ class VideoVerifierPipeline:
                     self._latest[item].box[2] - self._latest[item].box[0]
                 ) * (self._latest[item].box[3] - self._latest[item].box[1]),
             )
+        if self.appearance_first:
+            return self._register_current_visual_identity(identity_id, int(track_id))
         snapshot = self._best_manual_gait_snapshot(int(track_id))
         gait_quality = snapshot.quality.gait_availability(
             self.verifier.config.minimum_frames,
@@ -407,10 +631,9 @@ class VideoVerifierPipeline:
                 f"{self.verifier.config.strong_gait_quality:.2f}；"
                 "请让目标完整入镜并连续行走后重试"
             )
-        candidate_id = self._candidate_id(
-            self.camera_id,
-            self.capture_session_id,
+        candidate_id = self._candidate_id_for_track(
             snapshot.track_id,
+            active_count=1,
         )
         observation = Observation(
             event_id=f"{self.capture_session_id}:enrollment:track-{snapshot.track_id}",
@@ -419,6 +642,36 @@ class VideoVerifierPipeline:
             track_id=str(snapshot.track_id),
             features=FeatureBundle(gait=snapshot.features.normalized().gait),
             quality=snapshot.quality,
+            model_version=str(
+                getattr(self.vision, "model_version", self.verifier.config.model_version)
+            ),
+            feature_schema=str(
+                getattr(self.vision, "feature_schema", self.verifier.config.feature_schema)
+            ),
+            artifact_sha256=str(
+                getattr(self.vision, "artifact_sha256", self.verifier.config.artifact_sha256)
+            ),
+            preprocess_version=str(
+                getattr(self.vision, "preprocess_version", self.verifier.config.preprocess_version)
+            ),
+            joint_format=str(
+                getattr(self.vision, "joint_format", self.verifier.config.joint_format)
+            ),
+            sequence_length=(
+                int(getattr(self.vision, "sequence_length"))
+                if getattr(self.vision, "sequence_length", None) is not None
+                else self.verifier.config.sequence_length
+            ),
+            tta_mode=str(
+                getattr(self.vision, "tta_mode", self.verifier.config.tta_mode)
+            ),
+            coordinate_contract=str(
+                getattr(self.vision, "coordinate_contract", self.verifier.config.coordinate_contract)
+            ),
+            embedding_dimensions=dict(
+                getattr(self.vision, "embedding_dimensions", self.verifier.config.embedding_dimensions)
+            ),
+            calibration_version=self.verifier.config.calibration_version,
             metadata={
                 "source": "standalone-gui-manual-gait-enrollment",
                 "vision_adapter": type(self.vision).__name__,
@@ -439,6 +692,73 @@ class VideoVerifierPipeline:
                 decision.appearance_request_id,
                 identity_id=decision.identity_id,
             )
+        return snapshot.track_id
+
+    def _register_current_visual_identity(self, identity_id: str, track_id: int) -> int:
+        """在 OSNet-first 模式下登记视觉身份，步态只作为后续学习数据。"""
+
+        history = tuple(self._track_history.get(track_id, ()))
+        latest = self._latest.get(track_id)
+        if not history and latest is not None:
+            history = (latest,)
+        appearance_snapshots = [item for item in history if item.features.has_appearance]
+        if not appearance_snapshots:
+            raise ValueError("视觉身份登记需要可用的 OSNet 外观特征")
+        snapshot = max(
+            appearance_snapshots,
+            key=lambda item: item.quality.appearance_availability(
+                self.verifier.config.detection_confidence_floor
+            ),
+        )
+        observation = Observation(
+            event_id=f"{self.capture_session_id}:visual-enrollment:track-{snapshot.track_id}",
+            camera_id=self.camera_id,
+            capture_session_id=self.capture_session_id,
+            track_id=str(snapshot.track_id),
+            features=FeatureBundle(appearance=snapshot.features.normalized().appearance),
+            quality=snapshot.quality,
+            model_version=str(
+                getattr(self.vision, "model_version", self.verifier.config.model_version)
+            ),
+            feature_schema=str(
+                getattr(self.vision, "feature_schema", self.verifier.config.feature_schema)
+            ),
+            artifact_sha256=str(
+                getattr(self.vision, "artifact_sha256", self.verifier.config.artifact_sha256)
+            ),
+            preprocess_version=str(
+                getattr(self.vision, "preprocess_version", self.verifier.config.preprocess_version)
+            ),
+            joint_format=str(
+                getattr(self.vision, "joint_format", self.verifier.config.joint_format)
+            ),
+            sequence_length=(
+                int(getattr(self.vision, "sequence_length"))
+                if getattr(self.vision, "sequence_length", None) is not None
+                else self.verifier.config.sequence_length
+            ),
+            tta_mode=str(getattr(self.vision, "tta_mode", self.verifier.config.tta_mode)),
+            coordinate_contract=str(
+                getattr(self.vision, "coordinate_contract", self.verifier.config.coordinate_contract)
+            ),
+            embedding_dimensions=dict(
+                getattr(
+                    self.vision,
+                    "embedding_dimensions",
+                    self.verifier.config.embedding_dimensions,
+                )
+            ),
+            calibration_version=self.verifier.config.calibration_version,
+            metadata={
+                "source": "standalone-gui-manual-visual-enrollment",
+                "vision_adapter": type(self.vision).__name__,
+            },
+        )
+        state_key = self._candidate_id_for_track(snapshot.track_id, active_count=1)
+        register_visual = getattr(self.automation, "register_visual_identity", None)
+        if not callable(register_visual):
+            raise RuntimeError("current automation controller does not support visual identity enrollment")
+        register_visual(identity_id, observation, state_key=state_key)
         return snapshot.track_id
 
 

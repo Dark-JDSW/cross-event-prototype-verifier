@@ -5,12 +5,14 @@
 持久化和审计记录。调用方应提供 :class:`Observation` 并消费 :class:`Decision`，
 不应复制这些检查的内部顺序。
 
-重要安全规则是：高外观分数不能单独创建或确认身份。强步态可以确认已有
-身份，或创建仅含步态的身份；之后，一次性外观请求才可以授权更新外观。
+兼容的步态优先验证路径仍遵守“高外观分数不能替代步态确认”的规则；生产
+OSNet-first 路径则有一条明确的视觉身份登记边界：连续、稳定且通过开放集门
+的 OSNet 外观样本可以创建“视觉身份”标签，但该标签不会被误称为步态已就绪。
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import time
 from typing import Any, Iterable, Sequence
@@ -28,6 +30,7 @@ from .calibration import (
 from .challenge import ChallengeManager
 from .config import VerifierConfig
 from .fusion import fuse_calibrated_scores
+from .gait_readiness import GaitReadinessEvaluator
 from .memory import MemoryUpdate, PrototypeMemory
 from .state import check_independence, mark_evidence, transition
 from .storage import SqliteStore
@@ -38,7 +41,9 @@ from .types import (
     Decision,
     DecisionKind,
     FeatureBundle,
+    GaitEnrollmentEvent,
     GaitQualityBand,
+    GaitReadinessReport,
     Observation,
     PromotionResult,
     ScoreBreakdown,
@@ -86,9 +91,23 @@ class CrossEventVerifier:
             appearance_max_learning_rate=self.config.appearance_max_learning_rate,
             gait_max_learning_rate=self.config.gait_max_learning_rate,
             minimum_append_quality=self.config.minimum_append_quality,
+            maximum_quarantine_prototypes=self.config.quarantine_max_prototypes,
         )
         self.appearance_calibrator = appearance_calibrator or DEFAULT_APPEARANCE_CALIBRATOR
         self.gait_calibrator = gait_calibrator or DEFAULT_GAIT_CALIBRATOR
+        calibration_versions_match = (
+            self.appearance_calibrator.version == self.config.calibration_version
+            and self.gait_calibrator.version == self.config.calibration_version
+        )
+        if self.config.require_calibrated_scores and not (
+            calibration_versions_match
+            and self.appearance_calibrator.is_target_calibrated
+            and self.gait_calibrator.is_target_calibrated
+        ):
+            raise ValueError(
+                "target-domain calibration is required; provide fitted "
+                "appearance and gait ScoreCalibrator instances"
+            )
         self.challenge_manager = challenge_manager or ChallengeManager()
         self.appearance_absorption = AppearanceAbsorptionManager(
             self.config.appearance_request_ttl_seconds
@@ -102,6 +121,126 @@ class CrossEventVerifier:
         self._hydrate()
         self.rebuild_index()
 
+    @property
+    def calibration_status(self) -> dict[str, object]:
+        """返回可审计的校准状态，而不是把启发式值伪装成部署概率。"""
+
+        appearance_ready = self.appearance_calibrator.is_target_calibrated
+        gait_ready = self.gait_calibrator.is_target_calibrated
+        versions_match = (
+            self.appearance_calibrator.version == self.config.calibration_version
+            and self.gait_calibrator.version == self.config.calibration_version
+        )
+        return {
+            "version": self.config.calibration_version,
+            "required": self.config.require_calibrated_scores,
+            "ready": versions_match and appearance_ready and gait_ready,
+            "version_match": versions_match,
+            "appearance": self.appearance_calibrator.to_dict(),
+            "gait": self.gait_calibrator.to_dict(),
+        }
+
+    def load_gait_event_proposals(self) -> list[dict[str, Any]]:
+        """加载自动控制器需要恢复的跨会话步态事件。"""
+
+        return self.store.load_gait_event_proposals()
+
+    def save_gait_event_proposal(
+        self,
+        *,
+        candidate_id: str,
+        event_key: str,
+        vector: np.ndarray,
+        stability: float,
+        observation: Observation,
+        start_timestamp: float | None = None,
+    ) -> None:
+        """保存一个带模型协议的自动建号事件提案。"""
+
+        self.store.save_gait_event_proposal(
+            candidate_id=candidate_id,
+            event_key=event_key,
+            vector=vector,
+            stability=stability,
+            model_version=observation.model_version,
+            feature_schema=observation.feature_schema,
+            calibration_version=observation.calibration_version,
+            artifact_sha256=observation.artifact_sha256,
+            preprocess_version=observation.preprocess_version,
+            joint_format=observation.joint_format,
+            sequence_length=observation.sequence_length,
+            tta_mode=observation.tta_mode,
+            coordinate_contract=observation.coordinate_contract,
+            embedding_dimensions=dict(observation.embedding_dimensions),
+            camera_id=observation.camera_id,
+            capture_session_id=observation.capture_session_id,
+            start_timestamp=(
+                observation.timestamp
+                if start_timestamp is None
+                else float(start_timestamp)
+            ),
+            end_timestamp=(
+                observation.end_timestamp
+                if observation.end_timestamp is not None
+                else observation.timestamp
+            ),
+            created_at=observation.timestamp,
+        )
+
+    def delete_gait_event_proposals(self, candidate_id: str) -> None:
+        """删除一个候选人的持久化自动建号事件。"""
+
+        self.store.delete_gait_event_proposals(candidate_id)
+
+    def load_gait_enrollment_events(
+        self,
+        identity_id: str | None = None,
+    ) -> list[GaitEnrollmentEvent]:
+        """加载视觉身份已经接受的独立步态事件。"""
+
+        events = self.store.load_gait_enrollment_events(identity_id)
+        if self.config.model_version == "unconfigured":
+            return events
+        expected_dimensions = dict(self.config.embedding_dimensions)
+        return [
+            event
+            for event in events
+            if all(
+                (
+                    event.model_version == self.config.model_version,
+                    event.feature_schema == self.config.feature_schema,
+                    event.calibration_version == self.config.calibration_version,
+                    event.artifact_sha256 == self.config.artifact_sha256,
+                    event.preprocess_version == self.config.preprocess_version,
+                    event.joint_format == self.config.joint_format,
+                    event.sequence_length == self.config.sequence_length,
+                    event.tta_mode == self.config.tta_mode,
+                    event.coordinate_contract == self.config.coordinate_contract,
+                    not expected_dimensions
+                    or dict(event.embedding_dimensions) == expected_dimensions,
+                )
+            )
+        ]
+
+    def evaluate_gait_readiness(self, identity_id: str) -> GaitReadinessReport:
+        """根据当前事实库重新计算一个视觉身份的步态就绪状态。"""
+
+        events = self.load_gait_enrollment_events(identity_id)
+        all_events = self.load_gait_enrollment_events()
+        prototypes = self.memory.formal_prototypes(identity_id, "gait")
+        all_prototypes = tuple(
+            prototype
+            for current_identity in self.formal_identities
+            for prototype in self.memory.formal_prototypes(current_identity, "gait")
+        )
+        return GaitReadinessEvaluator(self.config).evaluate(
+            identity_id,
+            events,
+            prototypes,
+            all_events=all_events,
+            all_gait_prototypes=all_prototypes,
+        )
+
     def _hydrate(self) -> None:
         """加载持久化原型、候选人、请求和状态。
 
@@ -109,7 +248,24 @@ class CrossEventVerifier:
         结构，在这里重新构建。
         """
 
+        rejected_identity_ids: set[str] = set()
         for prototype in self.store.load_prototypes():
+            if prototype.zone == "formal" and self._configured_contract_mismatch(prototype):
+                # Keep the row for migration/audit, but do not expose it to the
+                # active in-memory gallery.  A tensor-compatible legacy model
+                # must never become a silent formal match.
+                self.store.audit(
+                    "formal_prototype_contract_rejected",
+                    prototype.identity_id,
+                    {
+                        "prototype_id": prototype.prototype_id,
+                        "model_version": prototype.model_version,
+                        "feature_schema": prototype.feature_schema,
+                        "artifact_sha256": prototype.artifact_sha256,
+                    },
+                )
+                rejected_identity_ids.add(prototype.identity_id)
+                continue
             target = (
                 self.memory.formal
                 if prototype.zone == "formal"
@@ -118,6 +274,18 @@ class CrossEventVerifier:
             target.setdefault(prototype.identity_id, {}).setdefault(
                 prototype.modality, []
             ).append(prototype)
+        # A single identity must never remain partially active when its SQLite
+        # row contains a mixed model/preprocess contract.  Remove all loaded
+        # siblings and make the suspension durable for operators to review.
+        for identity_id in rejected_identity_ids:
+            self.memory.remove_formal(identity_id)
+            self._identity_states[identity_id] = VerificationState.SUSPENDED
+            self.store.set_identity_state(identity_id, VerificationState.SUSPENDED)
+            self.store.audit(
+                "formal_identity_contract_suspended",
+                identity_id,
+                {"reason": "mixed_embedding_contract"},
+            )
         for candidate in self.store.list_candidates():
             self._candidates[candidate.candidate_id] = candidate
             self._candidate_observations[candidate.candidate_id] = self.store.observations_for_candidate(
@@ -129,6 +297,53 @@ class CrossEventVerifier:
             self._identity_states.setdefault(
                 identity_id, VerificationState.CONFIRMED_IDENTITY
             )
+
+    def _configured_contract_mismatch(self, prototype: Any) -> bool:
+        """判断正式原型是否与当前部署协议冲突。"""
+
+        config = self.config
+        if config.model_version == "unconfigured":
+            return False
+        expected_dimensions = dict(config.embedding_dimensions)
+        return any(
+            (
+                prototype.model_version != config.model_version,
+                prototype.feature_schema != config.feature_schema,
+                prototype.artifact_sha256 != config.artifact_sha256,
+                prototype.preprocess_version != config.preprocess_version,
+                prototype.joint_format != config.joint_format,
+                prototype.sequence_length != config.sequence_length,
+                prototype.tta_mode != config.tta_mode,
+                prototype.coordinate_contract != config.coordinate_contract,
+                expected_dimensions
+                and dict(prototype.embedding_dimensions) != expected_dimensions,
+            )
+        )
+
+    def reconcile_gallery_contract(self) -> tuple[str, ...]:
+        """在视觉适配器绑定后隔离不兼容的正式身份。"""
+
+        rejected: list[str] = []
+        for identity_id, groups in list(self.memory.formal.items()):
+            incompatible = any(
+                self._configured_contract_mismatch(prototype)
+                for prototypes in groups.values()
+                for prototype in prototypes
+            )
+            if not incompatible:
+                continue
+            rejected.append(identity_id)
+            self.memory.remove_formal(identity_id)
+            self._identity_states[identity_id] = VerificationState.SUSPENDED
+            self.store.set_identity_state(identity_id, VerificationState.SUSPENDED)
+            self.store.audit(
+                "formal_identity_contract_suspended",
+                identity_id,
+                {"reason": "embedding_contract_mismatch"},
+            )
+        if rejected:
+            self.rebuild_index()
+        return tuple(rejected)
 
     @property
     def formal_identities(self) -> tuple[str, ...]:
@@ -156,6 +371,15 @@ class CrossEventVerifier:
         clothing_tag: str | None = None,
         quality: float = 1.0,
         source_event_id: str | None = None,
+        model_version: str | None = None,
+        feature_schema: str | None = None,
+        artifact_sha256: str | None = None,
+        preprocess_version: str | None = None,
+        joint_format: str | None = None,
+        sequence_length: int | None = None,
+        tta_mode: str | None = None,
+        coordinate_contract: str | None = None,
+        embedding_dimensions: dict[str, int] | None = None,
     ) -> tuple[MemoryUpdate, ...]:
         """使用可信建号证据创建正式身份。
 
@@ -168,37 +392,152 @@ class CrossEventVerifier:
         normalized = features.normalized()
         if not normalized.has_appearance and not normalized.has_gait:
             raise ValueError("an identity needs at least one non-empty feature branch")
-        updates = self.memory.add_formal(
+        try:
+            with self.store.transaction():
+                updates = self.memory.add_formal(
+                    identity_id,
+                    normalized,
+                    appearance_quality=quality,
+                    gait_quality=quality,
+                    camera_id=camera_id,
+                    view_angle=view_angle,
+                    clothing_tag=clothing_tag,
+                    source_event_id=source_event_id,
+                    model_version=model_version or self.config.model_version,
+                    feature_schema=feature_schema or self.config.feature_schema,
+                    artifact_sha256=artifact_sha256 or self.config.artifact_sha256,
+                    preprocess_version=preprocess_version or self.config.preprocess_version,
+                    joint_format=joint_format or self.config.joint_format,
+                    sequence_length=(
+                        sequence_length
+                        if sequence_length is not None
+                        else self.config.sequence_length
+                    ),
+                    tta_mode=tta_mode or self.config.tta_mode,
+                    coordinate_contract=coordinate_contract or self.config.coordinate_contract,
+                    embedding_dimensions=embedding_dimensions or dict(self.config.embedding_dimensions),
+                    enforce_append_gate=False,
+                )
+                if not self.memory.formal_prototypes(identity_id):
+                    raise ValueError("enrollment produced no prototype")
+                self.store.upsert_identity(
+                    identity_id,
+                    VerificationState.CONFIRMED_IDENTITY,
+                    metadata=metadata,
+                )
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                self.store.audit(
+                    "identity_registered",
+                    identity_id,
+                    {"modalities": [item.modality for item in self.memory.formal_prototypes(identity_id)]},
+                )
+            self._identity_states[identity_id] = VerificationState.CONFIRMED_IDENTITY
+            self.rebuild_index()
+            return updates
+        except Exception:
+            # Database failure must not leave an in-memory identity that will
+            # be matched before the process is restarted.
+            self.memory.remove_formal(identity_id)
+            self._identity_states.pop(identity_id, None)
+            self.rebuild_index()
+            raise
+
+    def enroll_appearance_prototype(
+        self,
+        identity_id: str,
+        observation: Observation,
+        *,
+        stability: float,
+        sample_count: int,
+    ) -> Decision:
+        """把可靠新视角外观吸收到已有视觉身份的多原型集合。
+
+        该写入边界只接受 appearance，不会把同一观察中的 gait 顺带写入。
+        因此连续 Track 的新视角可以扩展一个视觉身份，而不能通过再次建号
+        或跨模态写入改变身份语义。
+        """
+
+        normalized = observation.normalized()
+        if identity_id not in self.formal_identities:
+            raise ValueError(f"unknown visual identity: {identity_id}")
+        if not normalized.features.has_appearance:
+            raise ValueError("appearance prototype enrollment requires an appearance feature")
+        appearance_quality = normalized.quality.appearance_availability(
+            self.config.detection_confidence_floor
+        )
+        if appearance_quality < self.config.strong_appearance_quality:
+            raise ValueError(
+                "appearance prototype enrollment requires STRONG appearance quality"
+            )
+        if int(sample_count) < 1:
+            raise ValueError("appearance sample_count must be positive")
+        stability = float(np.clip(stability, 0.0, 1.0))
+        if stability < self.config.appearance_identity_min_stability:
+            raise ValueError("appearance prototype stability is below the enrollment gate")
+
+        memory_snapshot = self.memory.snapshot(identity_id)
+        db_snapshot = self.store.snapshot_identity(
             identity_id,
-            normalized,
-            appearance_quality=quality,
-            gait_quality=quality,
-            camera_id=camera_id,
-            view_angle=view_angle,
-            clothing_tag=clothing_tag,
-            source_event_id=source_event_id,
-            enforce_append_gate=False,
+            reason="before-appearance-prototype-enrollment",
         )
-        if not self.memory.formal_prototypes(identity_id):
-            raise ValueError("enrollment produced no prototype")
-        self.store.upsert_identity(
-            identity_id,
-            VerificationState.CONFIRMED_IDENTITY,
-            metadata=metadata,
-        )
-        self.store.save_prototypes(
-            list(self.memory.formal_prototypes(identity_id)),
-            replace_identity=identity_id,
-            zone="formal",
-        )
-        self.store.audit(
-            "identity_registered",
-            identity_id,
-            {"modalities": [item.modality for item in self.memory.formal_prototypes(identity_id)]},
-        )
-        self._identity_states[identity_id] = VerificationState.CONFIRMED_IDENTITY
-        self.rebuild_index()
-        return updates
+        try:
+            with self.store.transaction():
+                updates = self.memory.add_formal(
+                    identity_id,
+                    FeatureBundle(appearance=normalized.features.appearance),
+                    appearance_quality=appearance_quality,
+                    camera_id=normalized.camera_id,
+                    view_angle=normalized.quality.view_angle,
+                    source_event_id=normalized.event_id,
+                    model_version=normalized.model_version,
+                    feature_schema=normalized.feature_schema,
+                    artifact_sha256=normalized.artifact_sha256,
+                    preprocess_version=normalized.preprocess_version,
+                    joint_format=normalized.joint_format,
+                    sequence_length=normalized.sequence_length,
+                    tta_mode=normalized.tta_mode,
+                    coordinate_contract=normalized.coordinate_contract,
+                    embedding_dimensions=dict(normalized.embedding_dimensions),
+                    enforce_append_gate=True,
+                )
+                if not any(item.modality == "appearance" for item in updates):
+                    raise ValueError("appearance prototype update produced no appearance memory update")
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                self.store.save_observation(normalized, candidate_id=None)
+                self.store.audit(
+                    "appearance_prototype_absorbed",
+                    identity_id,
+                    {
+                        "event_id": normalized.event_id,
+                        "sample_count": int(sample_count),
+                        "stability": stability,
+                        "quality": appearance_quality,
+                        "camera_id": normalized.camera_id,
+                        "view_angle": normalized.quality.view_angle,
+                        "actions": [item.action for item in updates],
+                    },
+                )
+            self.rebuild_index()
+            return Decision(
+                kind=DecisionKind.FORMAL_MATCH,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=identity_id,
+                score=appearance_quality,
+                reasons=("appearance_prototype_absorbed",),
+            )
+        except Exception:
+            self.memory.restore(identity_id, memory_snapshot)
+            self.store.restore_snapshot(db_snapshot)
+            self.rebuild_index()
+            raise
 
     def rebuild_index(self, *, prefer_faiss: bool = False) -> None:
         """在记忆变化后重建外观和步态检索索引。"""
@@ -281,7 +620,9 @@ class CrossEventVerifier:
             gait_quality=float(np.clip(gait_quality, 0.0, 1.0)),
             # 令牌是跨事件授权边界。它必须跨越跟踪器/摄像头交接继续有效，
             # 因此有意不绑定到短生命周期的候选人 ID。
-            candidate_id=None,
+            candidate_id=candidate_id,
+            camera_id=observation.camera_id,
+            track_id=observation.track_id,
             now=observation.timestamp,
             metadata={
                 "reason": reason,
@@ -405,91 +746,332 @@ class CrossEventVerifier:
             )
 
         target = identity_id or self._next_identity_id()
-        gait_only = FeatureBundle(gait=features.gait)
-        self.register_identity(
-            target,
-            gait_only,
-            metadata={
-                **dict(normalized.metadata),
-                "enrollment": "strong_gait_automatic",
-            },
-            camera_id=normalized.camera_id,
-            view_angle=normalized.quality.view_angle,
-            quality=gait_quality,
-            source_event_id=normalized.event_id,
+        target_was_present = target in self.memory.formal
+        formal_snapshot = self.memory.snapshot(target)
+        previous_identity_state = self._identity_states.get(target)
+        had_identity_state = target in self._identity_states
+        previous_last_seen = self._last_seen.get(target)
+        candidate_snapshot = (
+            {
+                modality: list(values)
+                for modality, values in self.memory.quarantine.get(candidate_id, {}).items()
+            }
+            if candidate_id is not None and candidate_id in self.memory.quarantine
+            else None
         )
-        self.store.save_observation(normalized, candidate_id=candidate_id)
-        self._last_seen[target] = (normalized.camera_id, normalized.timestamp)
+        candidate_record_snapshot = deepcopy(candidate) if candidate is not None else None
+        request_ids_before = {item.request_id for item in self.appearance_absorption.all()}
+        request: AppearanceAbsorptionRequest | None = None
+        try:
+            # Keep identity, observation, candidate transition, request and audit
+            # writes in one SQLite transaction. Nested register_identity() calls
+            # participate in this outer boundary.
+            with self.store.transaction():
+                gait_only = FeatureBundle(gait=features.gait)
+                self.register_identity(
+                    target,
+                    gait_only,
+                    metadata={
+                        **dict(normalized.metadata),
+                        "enrollment": "strong_gait_automatic",
+                    },
+                    camera_id=normalized.camera_id,
+                    view_angle=normalized.quality.view_angle,
+                    quality=gait_quality,
+                    source_event_id=normalized.event_id,
+                    model_version=normalized.model_version,
+                    feature_schema=normalized.feature_schema,
+                    artifact_sha256=normalized.artifact_sha256,
+                    preprocess_version=normalized.preprocess_version,
+                    joint_format=normalized.joint_format,
+                    sequence_length=normalized.sequence_length,
+                    tta_mode=normalized.tta_mode,
+                    coordinate_contract=normalized.coordinate_contract,
+                    embedding_dimensions=dict(normalized.embedding_dimensions),
+                )
+                self.store.save_observation(normalized, candidate_id=candidate_id)
+                self._last_seen[target] = (normalized.camera_id, normalized.timestamp)
 
-        if candidate is not None:
-            if candidate.state == VerificationState.UNKNOWN:
-                transition(candidate, VerificationState.ISOLATED_CANDIDATE)
-            if candidate.state == VerificationState.ISOLATED_CANDIDATE:
-                transition(candidate, VerificationState.PROVISIONAL_IDENTITY)
-            if candidate.state == VerificationState.PROVISIONAL_IDENTITY:
-                transition(candidate, VerificationState.CONFIRMED_IDENTITY)
-            if candidate.state == VerificationState.CONFIRMED_IDENTITY:
-                transition(candidate, VerificationState.MERGED)
-            candidate.proposed_identity = target
-            candidate.confirmed_identity = target
-            candidate.updated_at = normalized.timestamp
-            candidate.metadata["enrollment"] = "strong_gait_automatic"
-            self.memory.remove_candidate(candidate.candidate_id)
-            self.store.save_prototypes(
-                [],
-                replace_identity=candidate.candidate_id,
-                zone="quarantine",
+                if candidate is not None:
+                    if candidate.state == VerificationState.UNKNOWN:
+                        transition(candidate, VerificationState.ISOLATED_CANDIDATE)
+                    if candidate.state == VerificationState.ISOLATED_CANDIDATE:
+                        transition(candidate, VerificationState.PROVISIONAL_IDENTITY)
+                    if candidate.state == VerificationState.PROVISIONAL_IDENTITY:
+                        transition(candidate, VerificationState.CONFIRMED_IDENTITY)
+                    if candidate.state == VerificationState.CONFIRMED_IDENTITY:
+                        transition(candidate, VerificationState.MERGED)
+                    candidate.proposed_identity = target
+                    candidate.confirmed_identity = target
+                    candidate.updated_at = normalized.timestamp
+                    candidate.metadata["enrollment"] = "strong_gait_automatic"
+                    self.memory.remove_candidate(candidate.candidate_id)
+                    self.store.save_prototypes(
+                        [],
+                        replace_identity=candidate.candidate_id,
+                        zone="quarantine",
+                    )
+                    self.store.save_candidate(candidate)
+
+                # Event proposals are consumed by this successful enrollment.
+                # Keep their deletion in the same transaction as the formal
+                # identity, candidate transition, observation, and request so
+                # a crash cannot leave a replayable proposal after commit.
+                if candidate_id is not None:
+                    self.store.delete_gait_event_proposals(candidate_id)
+
+                ranking = self.rank(normalized)
+                target_score = next(
+                    (item for item in ranking if item.identity_id == target),
+                    None,
+                )
+                gait_probability = max(
+                    confidence,
+                    target_score.gait_probability or 0.0
+                    if target_score is not None
+                    else 0.0,
+                )
+                request, _ = self._issue_appearance_request(
+                    identity_id=target,
+                    observation=normalized,
+                    gait_probability=gait_probability,
+                    gait_quality=gait_quality,
+                    candidate_id=candidate_id,
+                    reason="automatic_gait_enrollment",
+                )
+                assert request is not None
+                self.store.audit(
+                    "gait_identity_enrolled",
+                    target,
+                    {
+                        "candidate_id": candidate_id,
+                        "event_id": normalized.event_id,
+                        "gait_confidence": confidence,
+                        "gait_quality": gait_quality,
+                        "appearance_request_id": request.request_id,
+                    },
+                )
+            return Decision(
+                kind=DecisionKind.APPEARANCE_REQUESTED,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=target,
+                candidate_id=candidate_id,
+                score=gait_probability,
+                margin=(
+                    self._branch_margin(ranking, target_score, "gait")
+                    if target_score is not None
+                    else None
+                ),
+                reasons=(
+                    "automatic_gait_enrollment",
+                    "strong_gait_confirmation",
+                    "appearance_absorption_requested",
+                ),
+                ranking=tuple(ranking),
+                appearance_request_id=request.request_id,
             )
-            self.store.save_candidate(candidate)
+        except Exception:
+            if request is not None and request.request_id not in request_ids_before:
+                self.appearance_absorption.discard(request.request_id)
+            if target_was_present:
+                self.memory.restore(target, formal_snapshot)
+            else:
+                self.memory.remove_formal(target)
+            if candidate_id is not None:
+                if candidate_snapshot is None:
+                    self.memory.remove_candidate(candidate_id)
+                else:
+                    self.memory.quarantine[candidate_id] = candidate_snapshot
+            if candidate is not None and candidate_record_snapshot is not None:
+                candidate.__dict__.clear()
+                candidate.__dict__.update(deepcopy(candidate_record_snapshot.__dict__))
+            if had_identity_state:
+                assert previous_identity_state is not None
+                self._identity_states[target] = previous_identity_state
+            else:
+                self._identity_states.pop(target, None)
+            if previous_last_seen is None:
+                self._last_seen.pop(target, None)
+            else:
+                self._last_seen[target] = previous_last_seen
+            self.rebuild_index()
+            raise
 
-        ranking = self.rank(normalized)
-        target_score = next(
-            (item for item in ranking if item.identity_id == target),
+    def enroll_gait_prototype(
+        self,
+        identity_id: str,
+        observation: Observation,
+        *,
+        event_key: str,
+        stability: float,
+        sample_count: int,
+        update_existing_event: bool = False,
+    ) -> Decision:
+        """把一个视觉身份下的独立步态事件写入其步态原型集合。
+
+        这是 OSNet-first 流程的写入边界：视觉身份必须已经存在，当前事件必须
+        通过强步态质量和稳定性门；该方法绝不会创建新身份，也不会签发旧的
+        一次性外观请求。GaitGraph2 权重保持只读，写入的只是其输出向量。
+        传入 ``update_existing_event=True`` 时，同一采集会话的后续稳定窗口
+        会更新该事件代表向量，但不会增加独立事件数量。
+        """
+
+        normalized = observation.normalized()
+        if identity_id not in self.formal_identities:
+            raise ValueError(f"unknown visual identity: {identity_id}")
+        if not normalized.features.has_gait:
+            raise ValueError("gait prototype enrollment requires a gait feature")
+        gait_quality = normalized.quality.gait_availability(
+            self.config.minimum_frames,
+            self.config.minimum_gait_cycles,
+        )
+        gait_band = normalized.quality.gait_quality_band(
+            minimum_frames=self.config.minimum_frames,
+            minimum_gait_cycles=self.config.minimum_gait_cycles,
+            partial_threshold=self.config.partial_gait_quality,
+            strong_threshold=self.config.strong_gait_quality,
+        )
+        if gait_band != GaitQualityBand.STRONG:
+            raise ValueError(
+                "gait prototype enrollment requires STRONG gait quality: "
+                f"{gait_band.value}"
+            )
+        stability = float(np.clip(stability, 0.0, 1.0))
+        if stability < self.config.gait_event_min_similarity:
+            raise ValueError("gait event stability is below the enrollment gate")
+        if int(sample_count) < 1:
+            raise ValueError("gait event sample_count must be positive")
+        existing_event = next(
+            (
+                event
+                for event in self.load_gait_enrollment_events(identity_id)
+                if event.identity_id == identity_id and event.event_key == event_key
+            ),
             None,
         )
-        gait_probability = max(
-            confidence,
-            target_score.gait_probability or 0.0 if target_score is not None else 0.0,
+        if existing_event is not None and not update_existing_event:
+            return Decision(
+                kind=DecisionKind.FORMAL_MATCH,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=identity_id,
+                score=stability,
+                reasons=("gait_event_already_enrolled",),
+            )
+
+        if existing_event is not None:
+            # Keep one event per session, while allowing later windows from that
+            # session to refine its representative gait vector.
+            alpha = float(
+                np.clip(self.config.gait_max_learning_rate * gait_quality, 0.0, 1.0)
+            )
+            merged = (1.0 - alpha) * existing_event.vector + alpha * np.asarray(
+                normalized.features.gait,
+                dtype=np.float32,
+            )
+            merged = merged / max(float(np.linalg.norm(merged)), 1e-8)
+            event = replace(
+                existing_event,
+                vector=merged.astype(np.float32),
+                stability=max(existing_event.stability, stability),
+                quality=max(existing_event.quality, gait_quality),
+                sample_count=existing_event.sample_count + int(sample_count),
+                view_angle=normalized.quality.view_angle or existing_event.view_angle,
+            )
+        else:
+            event = GaitEnrollmentEvent(
+                identity_id=identity_id,
+                event_key=event_key,
+                event_id=normalized.event_id,
+                camera_id=normalized.camera_id,
+                capture_session_id=normalized.capture_session_id,
+                track_id=normalized.track_id,
+                vector=np.asarray(normalized.features.gait, dtype=np.float32),
+                stability=stability,
+                quality=gait_quality,
+                sample_count=int(sample_count),
+                view_angle=normalized.quality.view_angle,
+                created_at=normalized.timestamp,
+                model_version=normalized.model_version,
+                feature_schema=normalized.feature_schema,
+                calibration_version=normalized.calibration_version,
+                artifact_sha256=normalized.artifact_sha256,
+                preprocess_version=normalized.preprocess_version,
+                joint_format=normalized.joint_format,
+                sequence_length=normalized.sequence_length,
+                tta_mode=normalized.tta_mode,
+                coordinate_contract=normalized.coordinate_contract,
+                embedding_dimensions=dict(normalized.embedding_dimensions),
+            )
+        memory_snapshot = self.memory.snapshot(identity_id)
+        db_snapshot = self.store.snapshot_identity(
+            identity_id,
+            reason="before-gait-prototype-enrollment",
         )
-        request, _ = self._issue_appearance_request(
-            identity_id=target,
-            observation=normalized,
-            gait_probability=gait_probability,
-            gait_quality=gait_quality,
-            candidate_id=candidate_id,
-            reason="automatic_gait_enrollment",
-        )
-        assert request is not None
-        self.store.audit(
-            "gait_identity_enrolled",
-            target,
-            {
-                "candidate_id": candidate_id,
-                "event_id": normalized.event_id,
-                "gait_confidence": confidence,
-                "gait_quality": gait_quality,
-                "appearance_request_id": request.request_id,
-            },
-        )
-        return Decision(
-            kind=DecisionKind.APPEARANCE_REQUESTED,
-            state=VerificationState.CONFIRMED_IDENTITY,
-            identity_id=target,
-            candidate_id=candidate_id,
-            score=gait_probability,
-            margin=(
-                self._branch_margin(ranking, target_score, "gait")
-                if target_score is not None
-                else None
-            ),
-            reasons=(
-                "automatic_gait_enrollment",
-                "strong_gait_confirmation",
-                "appearance_absorption_requested",
-            ),
-            ranking=tuple(ranking),
-            appearance_request_id=request.request_id,
-        )
+        try:
+            with self.store.transaction():
+                updates = self.memory.add_formal(
+                    identity_id,
+                    FeatureBundle(gait=event.vector),
+                    gait_quality=gait_quality,
+                    camera_id=normalized.camera_id,
+                    view_angle=normalized.quality.view_angle,
+                    source_event_id=normalized.event_id,
+                    model_version=normalized.model_version,
+                    feature_schema=normalized.feature_schema,
+                    artifact_sha256=normalized.artifact_sha256,
+                    preprocess_version=normalized.preprocess_version,
+                    joint_format=normalized.joint_format,
+                    sequence_length=normalized.sequence_length,
+                    tta_mode=normalized.tta_mode,
+                    coordinate_contract=normalized.coordinate_contract,
+                    embedding_dimensions=dict(normalized.embedding_dimensions),
+                    enforce_append_gate=False,
+                )
+                if not any(item.modality == "gait" for item in updates):
+                    raise ValueError("gait prototype update produced no gait memory update")
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                if not self.store.save_gait_enrollment_event(
+                    event,
+                    replace_existing=existing_event is not None,
+                ):
+                    raise ValueError("gait enrollment event already exists")
+                self.store.save_observation(normalized, candidate_id=None)
+                self.store.audit(
+                    (
+                        "gait_prototype_updated"
+                        if existing_event is not None
+                        else "gait_prototype_enrolled"
+                    ),
+                    identity_id,
+                    {
+                        "event_key": event_key,
+                        "event_id": normalized.event_id,
+                        "sample_count": int(event.sample_count),
+                        "stability": stability,
+                        "quality": gait_quality,
+                    },
+                )
+            self.rebuild_index()
+            return Decision(
+                kind=DecisionKind.FORMAL_MATCH,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=identity_id,
+                score=stability,
+                reasons=(
+                    "gait_prototype_updated"
+                    if existing_event is not None
+                    else "gait_prototype_enrolled",
+                ),
+            )
+        except Exception:
+            self.memory.restore(identity_id, memory_snapshot)
+            self.store.restore_snapshot(db_snapshot)
+            self.rebuild_index()
+            raise
 
     def _single_gallery_novelty_override(
         self,
@@ -556,6 +1138,15 @@ class CrossEventVerifier:
             item for item in ranking if item.gait_probability is not None
         ]
         gait_similarity = nearest_gait.gait_similarity
+        max_impostor = max(
+            (item.gait_similarity for item in gait_candidates if item.gait_similarity is not None),
+            default=None,
+        )
+        if (
+            max_impostor is not None
+            and max_impostor >= self.config.open_set_max_impostor_similarity
+        ):
+            return "gait_open_set_similarity_too_high"
         if gait_similarity is not None and gait_similarity >= self.config.single_gallery_gait_similarity_limit:
             return "gait_near_duplicate"
         if len(gait_candidates) <= 1:
@@ -599,10 +1190,32 @@ class CrossEventVerifier:
         """在两个生物特征分支上独立评估一个正式身份。"""
         features = observation.features.normalized()
         appearance_similarity, appearance_proto = self.memory.best_formal(
-            identity_id, "appearance", features.appearance
+            identity_id,
+            "appearance",
+            features.appearance,
+            model_version=observation.model_version,
+            feature_schema=observation.feature_schema,
+            artifact_sha256=observation.artifact_sha256,
+            preprocess_version=observation.preprocess_version,
+            joint_format=observation.joint_format,
+            sequence_length=observation.sequence_length,
+            tta_mode=observation.tta_mode,
+            coordinate_contract=observation.coordinate_contract,
+            embedding_dimensions=dict(observation.embedding_dimensions),
         ) if features.has_appearance else (None, None)
         gait_similarity, gait_proto = self.memory.best_formal(
-            identity_id, "gait", features.gait
+            identity_id,
+            "gait",
+            features.gait,
+            model_version=observation.model_version,
+            feature_schema=observation.feature_schema,
+            artifact_sha256=observation.artifact_sha256,
+            preprocess_version=observation.preprocess_version,
+            joint_format=observation.joint_format,
+            sequence_length=observation.sequence_length,
+            tta_mode=observation.tta_mode,
+            coordinate_contract=observation.coordinate_contract,
+            embedding_dimensions=dict(observation.embedding_dimensions),
         ) if features.has_gait else (None, None)
         appearance_quality = observation.quality.appearance_availability(
             self.config.detection_confidence_floor
@@ -650,7 +1263,40 @@ class CrossEventVerifier:
         """
 
         observation = observation.normalized()
-        values = [self._score_identity(observation, identity_id) for identity_id in self.formal_identities]
+        if observation.calibration_version != self.config.calibration_version:
+            return ()
+        features = observation.features.normalized()
+        retrieved: set[str] = set()
+        if features.has_appearance:
+            retrieved.update(
+                hit.identity_id
+                for hit in self.vector_index.search(
+                    "appearance",
+                    np.asarray(features.appearance, dtype=np.float32),
+                    k=self.config.vector_recall_k,
+                )
+            )
+        if features.has_gait:
+            retrieved.update(
+                hit.identity_id
+                for hit in self.vector_index.search(
+                    "gait",
+                    np.asarray(features.gait, dtype=np.float32),
+                    k=self.config.vector_recall_k,
+                )
+            )
+        # Empty retrieval means either an empty/migrating index or a query
+        # whose dimension is not represented.  Keep the full scan only for
+        # that safe fallback; normal large-gallery traffic is top-k first.
+        identity_scope = retrieved or set(self.formal_identities)
+        values = [
+            score
+            for identity_id in self.formal_identities
+            if identity_id in identity_scope
+            for score in (self._score_identity(observation, identity_id),)
+            if score.appearance_similarity is not None
+            or score.gait_similarity is not None
+        ]
         if not values:
             return ()
         values.sort(key=lambda item: item.fused_probability, reverse=True)
@@ -687,6 +1333,176 @@ class CrossEventVerifier:
         if conflict:
             values = [replace(item, conflict=True) for item in values]
         return tuple(values)
+
+    def rank_appearance(self, observation: Observation) -> tuple[ScoreBreakdown, ...]:
+        """只使用 OSNet 外观分支对正式视觉身份排序。"""
+
+        normalized = observation.normalized()
+        return self.rank(
+            replace(
+                normalized,
+                features=FeatureBundle(appearance=normalized.features.appearance),
+            )
+        )
+
+    def match_appearance_identity(
+        self,
+        observation: Observation,
+        *,
+        ranking: Sequence[ScoreBreakdown] | None = None,
+        forced_identity: str | None = None,
+    ) -> Decision:
+        """用 OSNet 独立确认视觉身份，不要求当前帧已有步态向量。"""
+
+        normalized = observation.normalized()
+        if not normalized.features.has_appearance:
+            return Decision(
+                kind=DecisionKind.NEED_MORE_DATA,
+                state=VerificationState.UNKNOWN,
+                reasons=("appearance_feature_missing",),
+            )
+        quality = normalized.quality.appearance_availability(
+            self.config.detection_confidence_floor
+        )
+        values = tuple(self.rank_appearance(normalized) if ranking is None else ranking)
+        winner = (
+            next((item for item in values if item.identity_id == forced_identity), None)
+            if forced_identity is not None
+            else self._branch_winner(values, "appearance")
+        )
+        if winner is None:
+            return Decision(
+                kind=DecisionKind.UNKNOWN,
+                state=VerificationState.UNKNOWN,
+                reasons=("no_formal_appearance_identity",),
+                ranking=values,
+            )
+        margin = self._branch_margin(values, winner, "appearance")
+        probability = float(winner.appearance_probability or 0.0)
+        if (
+            quality >= self.config.strong_appearance_quality
+            and probability >= self.config.strong_appearance_probability
+            and margin >= self.config.margin_threshold
+        ):
+            return Decision(
+                kind=DecisionKind.FORMAL_MATCH,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=winner.identity_id,
+                score=probability,
+                margin=margin,
+                reasons=("appearance_identity_confirmation",),
+                ranking=values,
+            )
+        reasons = ["appearance_identity_not_strong"]
+        if quality < self.config.strong_appearance_quality:
+            reasons.append("low_appearance_quality")
+        if probability < self.config.strong_appearance_probability:
+            reasons.append("appearance_probability_below_gate")
+        if margin < self.config.margin_threshold:
+            reasons.append("small_appearance_top2_margin")
+        return Decision(
+            kind=(
+                DecisionKind.DEFERRED
+                if probability >= self.config.defer_threshold
+                else DecisionKind.UNKNOWN
+            ),
+            state=VerificationState.ISOLATED_CANDIDATE,
+            identity_id=None,
+            score=probability,
+            margin=margin,
+            reasons=tuple(reasons),
+            ranking=values,
+        )
+
+    def match_gait_identity(
+        self,
+        observation: Observation,
+        *,
+        allowed_identity_ids: Sequence[str] | None = None,
+        require_identity_quality: bool = False,
+    ) -> Decision:
+        """只使用 GaitGraph2 分支检索视觉身份的步态原型。
+
+        ``require_identity_quality`` 是 OSNet-first 生产路径使用的严格模式。
+        它把“可以形成学习候选的步态样本”和“可以直接承担身份检索的步态
+        查询”分开，避免短窗口经固定长度重采样后越过身份门。
+        """
+
+        normalized = observation.normalized()
+        if not normalized.features.has_gait:
+            return Decision(
+                kind=DecisionKind.NEED_MORE_DATA,
+                state=VerificationState.UNKNOWN,
+                reasons=("gait_feature_missing",),
+            )
+        ranking = self.rank(
+            replace(
+                normalized,
+                features=FeatureBundle(gait=normalized.features.gait),
+            )
+        )
+        if require_identity_quality:
+            quality_reasons = normalized.quality.gait_identity_veto_reasons(
+                minimum_frames=self.config.gait_identity_min_frames,
+                minimum_gait_cycles=self.config.minimum_gait_cycles,
+                minimum_pose_coverage=self.config.gait_min_pose_coverage,
+            )
+            if quality_reasons:
+                return Decision(
+                    kind=DecisionKind.DEFERRED,
+                    state=VerificationState.ISOLATED_CANDIDATE,
+                    reasons=("gait_identity_quality_pending",) + quality_reasons,
+                    ranking=ranking,
+                )
+        allowed = (
+            set(self.formal_identities)
+            if allowed_identity_ids is None
+            else set(allowed_identity_ids)
+        )
+        ranking = tuple(item for item in ranking if item.identity_id in allowed)
+        winner = self._branch_winner(ranking, "gait")
+        if winner is None:
+            return Decision(
+                kind=DecisionKind.UNKNOWN,
+                state=VerificationState.UNKNOWN,
+                reasons=("no_gait_prototype",),
+                ranking=ranking,
+            )
+        quality = normalized.quality.gait_availability(
+            self.config.gait_identity_min_frames
+            if require_identity_quality
+            else self.config.minimum_frames,
+            self.config.minimum_gait_cycles,
+        )
+        margin = self._branch_margin(ranking, winner, "gait")
+        probability = float(winner.gait_probability or 0.0)
+        if (
+            quality >= self.config.strong_gait_quality
+            and probability >= self.config.strong_gait_probability
+            and margin >= self.config.strong_gait_margin
+        ):
+            return Decision(
+                kind=DecisionKind.FORMAL_MATCH,
+                state=VerificationState.CONFIRMED_IDENTITY,
+                identity_id=winner.identity_id,
+                score=probability,
+                margin=margin,
+                reasons=("gait_prototype_match",),
+                ranking=ranking,
+            )
+        return Decision(
+            kind=(
+                DecisionKind.DEFERRED
+                if probability >= self.config.defer_threshold
+                else DecisionKind.UNKNOWN
+            ),
+            state=VerificationState.ISOLATED_CANDIDATE,
+            identity_id=None,
+            score=probability,
+            margin=margin,
+            reasons=("gait_match_not_strong",),
+            ranking=ranking,
+        )
 
     @staticmethod
     def _branch_winner(
@@ -797,6 +1613,8 @@ class CrossEventVerifier:
             identity_id=request.identity_id,
             event_id=observation.event_id,
             candidate_id=str(effective_candidate) if effective_candidate is not None else None,
+            camera_id=observation.camera_id,
+            track_id=observation.track_id,
             now=observation.timestamp,
         )
         if not valid:
@@ -927,7 +1745,12 @@ class CrossEventVerifier:
             reasons.append("low_detection_confidence")
         if quality.occlusion > self.config.maximum_write_occlusion:
             reasons.append("occluded")
-        if quality.frame_count < self.config.minimum_frames:
+        gait_frames = (
+            quality.valid_pose_frames
+            if quality.valid_pose_frames is not None
+            else quality.frame_count
+        )
+        if gait_frames < self.config.minimum_frames:
             reasons.append("too_short")
         features = observation.features.normalized()
         app_quality = (
@@ -949,6 +1772,19 @@ class CrossEventVerifier:
         if max(app_quality, gait_quality) < self.config.minimum_matching_quality:
             reasons.append("low_track_quality")
         return tuple(dict.fromkeys(reasons))
+
+    def _formal_gallery_has_query_modality(self, observation: Observation) -> bool:
+        """判断正式图库是否已有当前查询模态的原型。"""
+
+        features = observation.features.normalized()
+        for identity_id in self.formal_identities:
+            if features.has_appearance and self.memory.formal_prototypes(
+                identity_id, "appearance"
+            ):
+                return True
+            if features.has_gait and self.memory.formal_prototypes(identity_id, "gait"):
+                return True
+        return False
 
     def _decision_from_ranking(
         self,
@@ -1155,6 +1991,43 @@ class CrossEventVerifier:
             self._candidates[candidate_id] = candidate
         return candidate
 
+    def _snapshot_candidate_runtime(self, candidate_id: str) -> dict[str, Any]:
+        """快照一个候选的可变内存状态，供 SQLite 失败时回滚。"""
+
+        return {
+            "candidate_present": candidate_id in self._candidates,
+            "candidate": deepcopy(self._candidates.get(candidate_id)),
+            "observations_present": candidate_id in self._candidate_observations,
+            "observation_count": len(self._candidate_observations.get(candidate_id, ())),
+            "quarantine_present": candidate_id in self.memory.quarantine,
+            "quarantine": deepcopy(self.memory.quarantine.get(candidate_id)),
+        }
+
+    def _restore_candidate_runtime(
+        self,
+        candidate_id: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        """恢复候选及隔离向量，保持内存与已回滚事务一致。"""
+
+        if snapshot["candidate_present"]:
+            candidate = snapshot["candidate"]
+            assert candidate is not None
+            self._candidates[candidate_id] = deepcopy(candidate)
+        else:
+            self._candidates.pop(candidate_id, None)
+        if snapshot["observations_present"]:
+            observations = self._candidate_observations.get(candidate_id, [])
+            self._candidate_observations[candidate_id] = observations[
+                : int(snapshot["observation_count"])
+            ]
+        else:
+            self._candidate_observations.pop(candidate_id, None)
+        if snapshot["quarantine_present"]:
+            self.memory.quarantine[candidate_id] = deepcopy(snapshot["quarantine"])
+        else:
+            self.memory.quarantine.pop(candidate_id, None)
+
     def _candidate_key(self, observation: Observation, candidate_id: str | None) -> str:
         """解析调用方提供的稳定跨事件候选键。"""
         if candidate_id:
@@ -1252,15 +2125,30 @@ class CrossEventVerifier:
                 view_angle=observation.quality.view_angle,
                 clothing_tag=str(observation.metadata.get("clothing_tag")) if observation.metadata.get("clothing_tag") else None,
                 source_event_id=observation.event_id,
+                model_version=observation.model_version,
+                feature_schema=observation.feature_schema,
+                artifact_sha256=observation.artifact_sha256,
+                preprocess_version=observation.preprocess_version,
+                joint_format=observation.joint_format,
+                sequence_length=observation.sequence_length,
+                tta_mode=observation.tta_mode,
+                coordinate_contract=observation.coordinate_contract,
+                embedding_dimensions=dict(observation.embedding_dimensions),
             )
             successful = tuple(item for item in updates if not item.blocked)
             if not successful:
                 return ()
-            self.store.save_prototypes(
-                list(self.memory.formal_prototypes(identity_id)),
-                replace_identity=identity_id,
-                zone="formal",
-            )
+            with self.store.transaction():
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                self.store.audit(
+                    "formal_prototype_update",
+                    identity_id,
+                    {"event_id": observation.event_id, "updates": [item.action for item in successful]},
+                )
             self.rebuild_index()
             for item in successful:
                 similarity = (
@@ -1270,11 +2158,6 @@ class CrossEventVerifier:
                 )
                 if similarity is not None:
                     self.stability.update(identity_id, item.modality, float(np.clip(similarity, 0.0, 1.0)))
-            self.store.audit(
-                "formal_prototype_update",
-                identity_id,
-                {"event_id": observation.event_id, "updates": [item.action for item in successful]},
-            )
             return updates
         except Exception:
             self.memory.restore(identity_id, memory_snapshot)
@@ -1288,6 +2171,7 @@ class CrossEventVerifier:
         candidate_id: str | None = None,
         ranking: Sequence[ScoreBreakdown] | None = None,
         forced_identity: str | None = None,
+        blocked_identity_ids: Sequence[str] = (),
         open_set_guard: bool = False,
     ) -> Decision:
         """运行完整的单观测协议。
@@ -1303,12 +2187,37 @@ class CrossEventVerifier:
         用方意外实现出不同的安全规则。
         """
         observation = observation.normalized()
-        ranking = tuple(self.rank(observation) if ranking is None else ranking)
+        if observation.calibration_version != self.config.calibration_version:
+            return Decision(
+                kind=DecisionKind.NEED_MORE_DATA,
+                state=VerificationState.UNKNOWN,
+                reasons=("calibration_contract_mismatch",),
+                ranking=(),
+            )
+        ranking_was_computed = ranking is None
+        ranking = tuple(self.rank(observation) if ranking_was_computed else ranking)
+        # Batch assignment may reserve an identity for another track.  Keep the
+        # complete ranking in the returned audit result, but exclude reserved
+        # identities from the decision path so an unassigned row cannot consume
+        # the same identity a second time.
+        blocked_ids = set(blocked_identity_ids)
+        decision_ranking = tuple(
+            item
+            for item in ranking
+            if item.identity_id not in blocked_ids
+        )
+        if not ranking and self._formal_gallery_has_query_modality(observation):
+            return Decision(
+                kind=DecisionKind.NEED_MORE_DATA,
+                state=VerificationState.UNKNOWN,
+                reasons=("feature_contract_mismatch",),
+                ranking=(),
+            )
         # 外观响应先于普通排名检查，因为有效的步态签发令牌明确绑定了一个
         # 身份/轨迹。
         response_decision, response_request, response_error = self._appearance_response(
             observation,
-            ranking,
+            decision_ranking,
             candidate_id,
         )
         if response_decision is not None:
@@ -1316,7 +2225,7 @@ class CrossEventVerifier:
         else:
             decision = self._decision_from_ranking(
                 observation,
-                ranking,
+                decision_ranking,
                 forced_identity=forced_identity,
                 open_set_guard=open_set_guard,
             )
@@ -1325,6 +2234,17 @@ class CrossEventVerifier:
                     decision,
                     reasons=tuple((*decision.reasons, response_error)),
                 )
+        if blocked_ids:
+            if not decision_ranking and ranking and not self._quality_block_reasons(observation):
+                decision = replace(
+                    decision,
+                    kind=DecisionKind.UNKNOWN,
+                    state=VerificationState.UNKNOWN,
+                    identity_id=None,
+                    reasons=("identity_already_assigned",),
+                )
+            # Do not hide the raw alternatives from the caller or audit log.
+            decision = replace(decision, ranking=ranking)
         # 正式结果可以更新正式图库。其他所有结果都进入隔离区，只能通过证据
         # 累积和下面的晋升策略继续推进。
         if decision.kind in {
@@ -1476,6 +2396,15 @@ class CrossEventVerifier:
             view_angle=observation.quality.view_angle,
             clothing_tag=str(observation.metadata.get("clothing_tag")) if observation.metadata.get("clothing_tag") else None,
             source_event_id=observation.event_id,
+            model_version=observation.model_version,
+            feature_schema=observation.feature_schema,
+            artifact_sha256=observation.artifact_sha256,
+            preprocess_version=observation.preprocess_version,
+            joint_format=observation.joint_format,
+            sequence_length=observation.sequence_length,
+            tta_mode=observation.tta_mode,
+            coordinate_contract=observation.coordinate_contract,
+            embedding_dimensions=dict(observation.embedding_dimensions),
         )
         self.store.save_prototypes(
             list(self.memory.quarantine_prototypes(cid)),
@@ -1489,6 +2418,8 @@ class CrossEventVerifier:
             "gait_anchor": self._strong_gait_signal(observation),
             "appearance_absorption_request_id": observation.appearance_request_id,
             "model_version": observation.model_version,
+            "feature_schema": observation.feature_schema,
+            "calibration_version": observation.calibration_version,
             "threshold_version": observation.threshold_version,
         }
         if evidence_payload["gait_anchor"]:
@@ -1562,11 +2493,20 @@ class CrossEventVerifier:
     ) -> Decision:
         """处理一条轨迹/事件，并返回安全、可审计的决策。"""
 
-        return self._process(
-            observation,
-            candidate_id=candidate_id,
-            open_set_guard=open_set_guard,
-        )
+        normalized = observation.normalized()
+        runtime_candidate_id = self._candidate_key(normalized, candidate_id)
+        snapshot = self._snapshot_candidate_runtime(runtime_candidate_id)
+        try:
+            with self.store.transaction():
+                return self._process(
+                    normalized,
+                    candidate_id=candidate_id,
+                    open_set_guard=open_set_guard,
+                )
+        except Exception:
+            self._restore_candidate_runtime(runtime_candidate_id, snapshot)
+            self.rebuild_index()
+            raise
 
     def verify_batch(
         self,
@@ -1577,12 +2517,34 @@ class CrossEventVerifier:
     ) -> list[Decision]:
         """使用一个 SQLite 事务完成一帧的批量验证和证据写入。"""
 
-        with self.store.transaction():
-            return self._verify_batch(
-                observations,
-                candidate_ids=candidate_ids,
-                open_set_guard=open_set_guard,
+        if candidate_ids is not None and len(candidate_ids) != len(observations):
+            raise ValueError("candidate_ids must align with observations")
+        normalized = [item.normalized() for item in observations]
+        runtime_candidate_ids = tuple(
+            dict.fromkeys(
+                self._candidate_key(
+                    item,
+                    candidate_ids[index] if candidate_ids is not None else None,
+                )
+                for index, item in enumerate(normalized)
             )
+        )
+        snapshots = {
+            candidate_id: self._snapshot_candidate_runtime(candidate_id)
+            for candidate_id in runtime_candidate_ids
+        }
+        try:
+            with self.store.transaction():
+                return self._verify_batch(
+                    normalized,
+                    candidate_ids=candidate_ids,
+                    open_set_guard=open_set_guard,
+                )
+        except Exception:
+            for candidate_id, snapshot in snapshots.items():
+                self._restore_candidate_runtime(candidate_id, snapshot)
+            self.rebuild_index()
+            raise
 
     def _verify_batch(
         self,
@@ -1708,16 +2670,12 @@ class CrossEventVerifier:
                     )
                 )
             else:
-                filtered = tuple(
-                    score
-                    for score in rankings[index]
-                    if score.identity_id not in assigned_identities
-                )
                 decisions.append(
                     self._process(
                         item,
                         candidate_id=candidate_id,
-                        ranking=filtered,
+                        ranking=rankings[index],
+                        blocked_identity_ids=assigned_identities,
                         open_set_guard=open_set_guard,
                     )
                 )
@@ -1798,10 +2756,15 @@ class CrossEventVerifier:
             raise ValueError(f"target identity is not active: {target}")
 
         formal_snapshot = self.memory.snapshot(target)
+        target_was_present = target in self.memory.formal
         candidate_snapshot = {
             modality: list(values)
             for modality, values in self.memory.quarantine.get(candidate_id, {}).items()
         }
+        candidate_was_present = candidate_id in self.memory.quarantine
+        candidate_record_snapshot = deepcopy(candidate)
+        previous_identity_state = self._identity_states.get(target)
+        had_identity_state = target in self._identity_states
         db_snapshot = self.store.snapshot_identity(target, reason="before-candidate-promotion")
         try:
             if force and candidate.state == VerificationState.SUSPENDED:
@@ -1818,22 +2781,24 @@ class CrossEventVerifier:
                 target,
                 minimum_quality=self.config.minimum_append_quality,
             )
-            self.store.upsert_identity(target, VerificationState.CONFIRMED_IDENTITY)
-            self.store.save_prototypes(
-                list(self.memory.formal_prototypes(target)),
-                replace_identity=target,
-                zone="formal",
-            )
-            self.store.save_prototypes([], replace_identity=candidate_id, zone="quarantine")
-            candidate.confirmed_identity = target
-            candidate.updated_at = time.time()
-            self._identity_states[target] = VerificationState.CONFIRMED_IDENTITY
-            self.store.save_candidate(candidate)
-            self.store.audit(
-                "candidate_promoted",
-                candidate_id,
-                {"identity_id": target, "prototype_count": copied, "forced": force},
-            )
+            with self.store.transaction():
+                self.store.upsert_identity(target, VerificationState.CONFIRMED_IDENTITY)
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(target)),
+                    replace_identity=target,
+                    zone="formal",
+                )
+                self.store.save_prototypes([], replace_identity=candidate_id, zone="quarantine")
+                self.store.delete_gait_event_proposals(candidate_id)
+                candidate.confirmed_identity = target
+                candidate.updated_at = time.time()
+                self._identity_states[target] = VerificationState.CONFIRMED_IDENTITY
+                self.store.save_candidate(candidate)
+                self.store.audit(
+                    "candidate_promoted",
+                    candidate_id,
+                    {"identity_id": target, "prototype_count": copied, "forced": force},
+                )
             self.rebuild_index()
             return PromotionResult(
                 candidate_id=candidate_id,
@@ -1844,9 +2809,23 @@ class CrossEventVerifier:
                 reasons=reasons if force and not eligible else (),
             )
         except Exception:
-            self.memory.restore(target, formal_snapshot)
-            self.memory.quarantine[candidate_id] = candidate_snapshot
+            if target_was_present:
+                self.memory.restore(target, formal_snapshot)
+            else:
+                self.memory.remove_formal(target)
+            if candidate_was_present:
+                self.memory.quarantine[candidate_id] = candidate_snapshot
+            else:
+                self.memory.remove_candidate(candidate_id)
+            candidate.__dict__.clear()
+            candidate.__dict__.update(deepcopy(candidate_record_snapshot.__dict__))
+            if had_identity_state:
+                assert previous_identity_state is not None
+                self._identity_states[target] = previous_identity_state
+            else:
+                self._identity_states.pop(target, None)
             self.store.restore_snapshot(db_snapshot)
+            self.rebuild_index()
             raise
 
     def _next_identity_id(self) -> str:
@@ -1862,45 +2841,135 @@ class CrossEventVerifier:
             number += 1
         return f"P{number}"
 
+    def next_identity_id(self) -> str:
+        """为自动视觉身份登记公开一个稳定的下一个 P 编号。"""
+
+        return self._next_identity_id()
+
     def rollback(self, identity_id: str, snapshot_id: int) -> int:
         """恢复正式图库快照，并保留审计轨迹。"""
 
-        restored = self.store.restore_snapshot(snapshot_id)
-        grouped: dict[str, list[Any]] = {}
-        for prototype in restored:
-            grouped.setdefault(prototype.modality, []).append(prototype)
-        self.memory.restore(identity_id, grouped)
-        self.store.save_prototypes(
-            list(self.memory.formal_prototypes(identity_id)),
-            replace_identity=identity_id,
-            zone="formal",
-        )
-        self.rebuild_index()
-        self.store.audit(
-            "formal_gallery_rollback",
-            identity_id,
-            {"snapshot_id": snapshot_id, "prototype_count": len(restored)},
-        )
-        return len(restored)
+        memory_snapshot = self.memory.snapshot(identity_id)
+        try:
+            with self.store.transaction():
+                restored = self.store.restore_snapshot(snapshot_id)
+                grouped: dict[str, list[Any]] = {}
+                for prototype in restored:
+                    grouped.setdefault(prototype.modality, []).append(prototype)
+                self.memory.restore(identity_id, grouped)
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                self.store.audit(
+                    "formal_gallery_rollback",
+                    identity_id,
+                    {"snapshot_id": snapshot_id, "prototype_count": len(restored)},
+                )
+            self.rebuild_index()
+            return len(restored)
+        except Exception:
+            self.memory.restore(identity_id, memory_snapshot)
+            self.rebuild_index()
+            raise
 
     def purge_expired_candidates(self, *, now: float | None = None) -> tuple[str, ...]:
         """撤销过期的非正式候选人，并删除其隔离向量。"""
         now = time.time() if now is None else float(now)
-        removed: list[str] = []
-        for candidate_id, candidate in list(self._candidates.items()):
-            if now - candidate.updated_at <= self.config.candidate_ttl_seconds:
-                continue
-            if candidate.state in {VerificationState.CONFIRMED_IDENTITY, VerificationState.REVOKED}:
-                continue
-            candidate.state = VerificationState.REVOKED
-            candidate.updated_at = now
-            self.memory.remove_candidate(candidate_id)
-            self.store.save_prototypes([], replace_identity=candidate_id, zone="quarantine")
-            self.store.save_candidate(candidate)
-            self.store.audit("candidate_expired", candidate_id)
-            removed.append(candidate_id)
-        return tuple(removed)
+        terminal = {
+            VerificationState.CONFIRMED_IDENTITY,
+            VerificationState.MERGED,
+            VerificationState.REVOKED,
+        }
+        expired_ids = [
+            candidate_id
+            for candidate_id, candidate in self._candidates.items()
+            if candidate.state not in terminal
+            and now - candidate.updated_at > self.config.candidate_ttl_seconds
+        ]
+        expired_set = set(expired_ids)
+        active_candidates = [
+            item
+            for item in self._candidates.values()
+            if item.state not in terminal and item.candidate_id not in expired_set
+        ]
+        overflow = sorted(
+            active_candidates,
+            key=lambda item: item.updated_at,
+        )[:-self.config.quarantine_max_candidates]
+        capacity_ids = [item.candidate_id for item in overflow]
+        actions = [(candidate_id, "candidate_expired") for candidate_id in expired_ids]
+        actions.extend(
+            (candidate_id, "candidate_capacity_evicted")
+            for candidate_id in capacity_ids
+        )
+        if not actions:
+            return ()
+
+        candidate_snapshots = {
+            candidate_id: deepcopy(self._candidates[candidate_id])
+            for candidate_id, _ in actions
+        }
+        quarantine_snapshots = {
+            candidate_id: deepcopy(self.memory.quarantine.get(candidate_id))
+            for candidate_id, _ in actions
+        }
+        try:
+            with self.store.transaction():
+                for candidate_id, audit_action in actions:
+                    candidate = self._candidates[candidate_id]
+                    candidate.state = VerificationState.REVOKED
+                    candidate.updated_at = now
+                    self.memory.remove_candidate(candidate_id)
+                    self.store.delete_gait_event_proposals(candidate_id)
+                    self.store.save_prototypes(
+                        [],
+                        replace_identity=candidate_id,
+                        zone="quarantine",
+                    )
+                    self.store.save_candidate(candidate)
+                    self.store.audit(audit_action, candidate_id)
+            self.rebuild_index()
+            return tuple(candidate_id for candidate_id, _ in actions)
+        except Exception:
+            for candidate_id, snapshot in candidate_snapshots.items():
+                self._candidates[candidate_id] = snapshot
+                quarantine = quarantine_snapshots[candidate_id]
+                if quarantine is None:
+                    self.memory.quarantine.pop(candidate_id, None)
+                else:
+                    self.memory.quarantine[candidate_id] = quarantine
+            self.rebuild_index()
+            raise
+
+    def maintenance(self, *, now: float | None = None) -> tuple[str, ...]:
+        """执行在线候选清理，供采集线程按低频周期调用。"""
+
+        return self.purge_expired_candidates(now=now)
 
     def close(self) -> None:
         """关闭由该验证器持有的存储适配器。"""
         self.store.close()
+
+    def clear_gallery(self) -> None:
+        """清空身份图库和相关运行证据，并重置进程内索引。"""
+
+        self.store.clear_all_data()
+        self.memory = PrototypeMemory(
+            maximum_prototypes=self.config.maximum_prototypes,
+            diversity_threshold=self.config.gallery_diversity_threshold,
+            appearance_max_learning_rate=self.config.appearance_max_learning_rate,
+            gait_max_learning_rate=self.config.gait_max_learning_rate,
+            minimum_append_quality=self.config.minimum_append_quality,
+            maximum_quarantine_prototypes=self.config.quarantine_max_prototypes,
+        )
+        self._identity_states.clear()
+        self._candidates.clear()
+        self._candidate_observations.clear()
+        self.appearance_absorption = AppearanceAbsorptionManager(
+            self.config.appearance_request_ttl_seconds
+        )
+        self.stability = StabilityTracker()
+        self.challenge_manager = ChallengeManager()
+        self.vector_index = DualModalityIndex()

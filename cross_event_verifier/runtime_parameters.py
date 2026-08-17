@@ -135,6 +135,15 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "单一 formal gait 原型与新轨迹达到此余弦相似度时，即使外观不同也不自动复制身份。",
     ),
     _float_spec(
+        "verifier.open_set_max_impostor_similarity",
+        "开放集与步态锚点",
+        "开放集最大冒认相似度",
+        0.50,
+        0.999,
+        0.90,
+        "任何 formal gait 原型超过此原始余弦上限时，禁止自动创建新身份；需用目标域冒认数据标定。",
+    ),
+    _float_spec(
         "verifier.single_gallery_appearance_novelty_threshold",
         "开放集与步态锚点",
         "单图库外观拒识阈值",
@@ -272,11 +281,11 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
     _int_spec(
         "automation.minimum_independent_gait_events",
         "自动注册稳定性",
-        "独立步态事件数",
+        "兼容模式独立步态事件数",
         1,
         8,
         2,
-        "自动创建新身份前需要来自不同采集会话/挑战的稳定步态事件数。",
+        "旧版步态优先 API 创建新身份前的事件数；生产 OSNet-first 流程使用“步态暂可用/就绪事件数”。",
     ),
     _int_spec(
         "automation.gait_sample_window",
@@ -360,6 +369,123 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "外观响应被吸收前的图像质量下限。",
     ),
     _float_spec(
+        "verifier.appearance_conflict_similarity",
+        "融合与外观响应",
+        "外观冲突余弦门",
+        -1.0,
+        1.0,
+        0.35,
+        "高质量外观低于此原始余弦时，禁止 GaitGraph2 覆盖已绑定视觉身份。",
+    ),
+    _int_spec(
+        "verifier.appearance_identity_min_samples",
+        "视觉身份与步态就绪",
+        "视觉身份稳定样本数",
+        2,
+        64,
+        8,
+        "OSNet 连续稳定样本达到此数量后，才允许自动生成视觉身份编号。",
+    ),
+    _float_spec(
+        "verifier.appearance_identity_min_stability",
+        "视觉身份与步态就绪",
+        "视觉身份稳定度",
+        0.50,
+        1.0,
+        0.90,
+        "OSNet 样本与外观中心的最低一致性。",
+    ),
+    _float_spec(
+        "verifier.appearance_identity_novelty_threshold",
+        "视觉身份与步态就绪",
+        "视觉身份开放集相似度",
+        0.50,
+        0.999,
+        0.90,
+        "新建视觉身份前，与已有 OSNet 身份的原始相似度达到此值时继续等待绑定。",
+    ),
+    _int_spec(
+        "verifier.gait_provisional_min_events",
+        "视觉身份与步态就绪",
+        "步态暂可用事件数",
+        1,
+        8,
+        2,
+        "独立步态事件达到此数量后进入步态暂可用状态。",
+    ),
+    _int_spec(
+        "verifier.gait_ready_min_events",
+        "视觉身份与步态就绪",
+        "步态就绪事件数",
+        1,
+        8,
+        3,
+        "独立步态事件达到此数量后，继续检查覆盖度、留出和开放集。",
+    ),
+    _int_spec(
+        "verifier.gait_ready_min_coverage",
+        "视觉身份与步态就绪",
+        "步态条件覆盖数",
+        1,
+        8,
+        2,
+        "步态就绪要求覆盖的摄像头/视角条件数量。",
+    ),
+    _float_spec(
+        "verifier.gait_event_min_similarity",
+        "视觉身份与步态就绪",
+        "步态事件一致性下限",
+        0.0,
+        1.0,
+        0.70,
+        "独立步态事件与同身份事件的最低一致性，低于此值进入步态冲突。",
+    ),
+    _float_spec(
+        "verifier.gait_holdout_min_similarity",
+        "视觉身份与步态就绪",
+        "步态留出相似度下限",
+        0.0,
+        1.0,
+        0.70,
+        "leave-one-event-out 留出验证的 genuine 相似度下限。",
+    ),
+    _float_spec(
+        "verifier.gait_duplicate_event_similarity",
+        "视觉身份与步态就绪",
+        "步态事件近重复上限",
+        0.90,
+        0.999,
+        0.985,
+        "新事件达到此相似度时只视为同条件重复，不重复计数。",
+    ),
+    _int_spec(
+        "verifier.gait_learning_min_frames",
+        "视觉身份与步态就绪",
+        "步态事件最少真实帧",
+        8,
+        120,
+        25,
+        "步态样本可以进入事件学习所需的真实有效姿态帧数。",
+    ),
+    _int_spec(
+        "verifier.gait_identity_min_frames",
+        "视觉身份与步态就绪",
+        "步态身份检索真实帧",
+        8,
+        120,
+        45,
+        "GaitGraph2 可以承担身份检索所需的真实有效姿态帧数。",
+    ),
+    _float_spec(
+        "verifier.gait_min_pose_coverage",
+        "视觉身份与步态就绪",
+        "步态真实姿态覆盖率",
+        0.0,
+        1.0,
+        0.75,
+        "有效姿态帧占 Track 窗口的最低比例，防止插值帧伪装成完整运动。",
+    ),
+    _float_spec(
         "calibration.appearance_scale",
         "分支概率校准",
         "外观校准斜率",
@@ -428,8 +554,8 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         "检测推理间隔",
         1,
         6,
-        2,
-        "YOLO/ByteTrack 每隔多少帧刷新一次；中间帧复用最近轨迹框。",
+        1,
+        "YOLO/ByteTrack 每隔多少帧刷新一次；中间帧使用短时运动预测框。",
     ),
     _float_spec(
         "vision.keypoint_confidence",
@@ -597,9 +723,17 @@ class RuntimeParameterController:
             if key.startswith("vision.")
         }
         next_revision = self._revision + 1
+        calibration_changed = any(
+            key.startswith("calibration.") for key in parsed
+        )
         candidate_config = replace(
             self.verifier.config,
             **verifier_changes,
+            calibration_version=(
+                f"runtime-v{next_revision}"
+                if calibration_changed
+                else self.verifier.config.calibration_version
+            ),
             threshold_version=f"runtime-v{next_revision}",
         )
         candidate_policy = replace(self.automation.policy, **automation_changes)
@@ -628,12 +762,47 @@ class RuntimeParameterController:
             scale=float(appearance_values["scale"]),
             midpoint=float(appearance_values["midpoint"]),
             name=self.verifier.appearance_calibrator.name,
+            source=(
+                "manual-runtime"
+                if calibration_changed
+                else self.verifier.appearance_calibrator.source
+            ),
+            sample_count=(
+                0
+                if calibration_changed
+                else self.verifier.appearance_calibrator.sample_count
+            ),
+            version=(
+                f"runtime-v{next_revision}"
+                if calibration_changed
+                else self.verifier.appearance_calibrator.version
+            ),
         )
         candidate_gait = ScoreCalibrator(
             scale=float(gait_values["scale"]),
             midpoint=float(gait_values["midpoint"]),
             name=self.verifier.gait_calibrator.name,
+            source=(
+                "manual-runtime"
+                if calibration_changed
+                else self.verifier.gait_calibrator.source
+            ),
+            sample_count=(
+                0 if calibration_changed else self.verifier.gait_calibrator.sample_count
+            ),
+            version=(
+                f"runtime-v{next_revision}"
+                if calibration_changed
+                else self.verifier.gait_calibrator.version
+            ),
         )
+        if self.verifier.config.require_calibrated_scores and not (
+            candidate_appearance.is_target_calibrated
+            and candidate_gait.is_target_calibrated
+        ):
+            raise ValueError(
+                "当前验证器要求目标域校准；不能用实时手工参数替换校准档案"
+            )
 
         # 可选视觉适配器先校验并提交。从此处开始的操作都是不会失败的进程内赋值。
         # 调用发生在媒体线程的两次 process_frame 之间。

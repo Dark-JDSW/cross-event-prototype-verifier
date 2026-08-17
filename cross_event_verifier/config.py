@@ -5,6 +5,7 @@
 """
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -46,12 +47,38 @@ class VerifierConfig:
     # 以强质量明确拒绝当前唯一身份。
     single_gallery_gait_similarity_limit: float = 0.985
     single_gallery_appearance_novelty_threshold: float = 0.30
+    # 多身份开放集的绝对上限。margin 只表达“相对更像”，不能替代
+    # max-impostor 门；该值必须在目标域校准后覆盖默认研究值。
+    open_set_max_impostor_similarity: float = 0.90
     strong_gait_probability: float = 0.90
     strong_gait_quality: float = 0.70
     strong_gait_margin: float = 0.08
     strong_appearance_probability: float = 0.90
     strong_appearance_quality: float = 0.70
+    # Only a high-quality appearance below this raw cosine is a hard visual
+    # contradiction.  The lower-than-match value leaves ordinary cross-view
+    # variance recoverable through the bound Track and multi-prototype memory.
+    appearance_conflict_similarity: float = 0.35
     appearance_request_ttl_seconds: float = 90.0
+
+    # OSNet-first visual identity and GaitGraph2 enrollment.  These thresholds
+    # describe readiness of a visual identity's gait gallery; they do not
+    # decide whether a Track may receive its initial visual label.
+    appearance_identity_min_samples: int = 8
+    appearance_identity_min_stability: float = 0.90
+    appearance_identity_novelty_threshold: float = 0.90
+    gait_provisional_min_events: int = 2
+    gait_ready_min_events: int = 3
+    gait_ready_min_coverage: int = 2
+    gait_event_min_similarity: float = 0.70
+    gait_holdout_min_similarity: float = 0.70
+    gait_duplicate_event_similarity: float = 0.985
+    # GaitGraph2 can resample a short window to its fixed input length.  The
+    # shorter threshold is for learning an event; formal gait assignment needs
+    # a longer real observation window and sufficient pose coverage.
+    gait_learning_min_frames: int = 25
+    gait_identity_min_frames: int = 45
+    gait_min_pose_coverage: float = 0.75
 
     # 质量感知融合。两个分支都有数据时外观仍是有界锚点；只有外观缺失时步态
     # 才可以接管。
@@ -77,12 +104,44 @@ class VerifierConfig:
 
     # 运行来源信息。
     model_version: str = "unconfigured"
+    feature_schema: str = "unconfigured-v1"
+    calibration_version: str = "heuristic-default-v1"
+    # Research/demo defaults remain available for local tests, but production
+    # deployments can require a fitted target-domain calibration profile.
+    require_calibrated_scores: bool = False
     threshold_version: str = "default-v1"
+    artifact_sha256: str = "unverified"
+    preprocess_version: str = "unversioned-v1"
+    joint_format: str = "unknown"
+    sequence_length: int | None = None
+    tta_mode: str = "unknown"
+    coordinate_contract: str = "unknown"
+    embedding_dimensions: Mapping[str, int] = field(default_factory=dict)
+    vector_recall_k: int = 64
+    quarantine_max_prototypes: int = 5
+    quarantine_max_candidates: int = 10000
     camera_transitions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     maximum_transition_seconds: float = 90.0
 
     def __post_init__(self) -> None:
         """在构造时校验取值范围和跨字段不变量。"""
+        if not str(self.model_version).strip():
+            raise ValueError("model_version cannot be empty")
+        if not str(self.feature_schema).strip():
+            raise ValueError("feature_schema cannot be empty")
+        if not str(self.calibration_version).strip():
+            raise ValueError("calibration_version cannot be empty")
+        if not str(self.threshold_version).strip():
+            raise ValueError("threshold_version cannot be empty")
+        for name in (
+            "artifact_sha256",
+            "preprocess_version",
+            "joint_format",
+            "tta_mode",
+            "coordinate_contract",
+        ):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"{name} cannot be empty")
         bounded = {
             "detection_confidence_floor": self.detection_confidence_floor,
             "keypoint_confidence_floor": self.keypoint_confidence_floor,
@@ -98,11 +157,19 @@ class VerifierConfig:
             "gait_novelty_threshold": self.gait_novelty_threshold,
             "single_gallery_gait_similarity_limit": self.single_gallery_gait_similarity_limit,
             "single_gallery_appearance_novelty_threshold": self.single_gallery_appearance_novelty_threshold,
+            "open_set_max_impostor_similarity": self.open_set_max_impostor_similarity,
             "strong_gait_probability": self.strong_gait_probability,
             "strong_gait_quality": self.strong_gait_quality,
             "strong_gait_margin": self.strong_gait_margin,
             "strong_appearance_probability": self.strong_appearance_probability,
             "strong_appearance_quality": self.strong_appearance_quality,
+            "appearance_conflict_similarity": self.appearance_conflict_similarity,
+            "appearance_identity_min_stability": self.appearance_identity_min_stability,
+            "appearance_identity_novelty_threshold": self.appearance_identity_novelty_threshold,
+            "gait_event_min_similarity": self.gait_event_min_similarity,
+            "gait_holdout_min_similarity": self.gait_holdout_min_similarity,
+            "gait_duplicate_event_similarity": self.gait_duplicate_event_similarity,
+            "gait_min_pose_coverage": self.gait_min_pose_coverage,
             "maximum_gait_weight": self.maximum_gait_weight,
             "spatial_prior_weight": self.spatial_prior_weight,
             "gallery_diversity_threshold": self.gallery_diversity_threshold,
@@ -127,6 +194,32 @@ class VerifierConfig:
             )
         if self.minimum_frames < 1:
             raise ValueError("minimum_frames must be positive")
+        if self.gait_learning_min_frames < 1:
+            raise ValueError("gait_learning_min_frames must be positive")
+        if self.gait_identity_min_frames < self.gait_learning_min_frames:
+            raise ValueError(
+                "gait_identity_min_frames cannot be shorter than gait_learning_min_frames"
+            )
+        for name in (
+            "appearance_identity_min_samples",
+            "gait_provisional_min_events",
+            "gait_ready_min_events",
+            "gait_ready_min_coverage",
+        ):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.gait_provisional_min_events > self.gait_ready_min_events:
+            raise ValueError(
+                "gait_provisional_min_events cannot exceed gait_ready_min_events"
+            )
+        if self.gait_ready_min_coverage > self.gait_ready_min_events:
+            raise ValueError(
+                "gait_ready_min_coverage cannot exceed gait_ready_min_events"
+            )
+        if self.gait_duplicate_event_similarity <= self.gait_event_min_similarity:
+            raise ValueError(
+                "gait_duplicate_event_similarity must exceed gait_event_min_similarity"
+            )
         if self.minimum_gait_cycles < 0:
             raise ValueError("minimum_gait_cycles cannot be negative")
         if self.maximum_prototypes < 1:
@@ -135,3 +228,18 @@ class VerifierConfig:
             raise ValueError("minimum_independent_events must be positive")
         if self.appearance_request_ttl_seconds <= 0:
             raise ValueError("appearance_request_ttl_seconds must be positive")
+        if self.sequence_length is not None and self.sequence_length < 1:
+            raise ValueError("sequence_length must be positive when configured")
+        if self.vector_recall_k < 1:
+            raise ValueError("vector_recall_k must be positive")
+        if self.quarantine_max_prototypes < 1:
+            raise ValueError("quarantine_max_prototypes must be positive")
+        if self.quarantine_max_candidates < 1:
+            raise ValueError("quarantine_max_candidates must be positive")
+        dimensions = {
+            str(key): int(value)
+            for key, value in dict(self.embedding_dimensions).items()
+        }
+        if any(value <= 0 for value in dimensions.values()):
+            raise ValueError("embedding_dimensions must contain positive values")
+        object.__setattr__(self, "embedding_dimensions", MappingProxyType(dimensions))

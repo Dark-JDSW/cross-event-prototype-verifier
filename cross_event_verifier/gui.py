@@ -7,6 +7,7 @@ Tk 只负责展示。``FrameWorker`` 执行采集和推理，``VideoVerifierPipe
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -90,6 +91,7 @@ class VerifierWindow:
             self.verifier,
             self.vision,
             automation_policy=AutomationPolicy(enabled=automatic_capable),
+            appearance_first=True,
         )
         self.worker = FrameWorker(self.pipeline)
         self._photo: tk.PhotoImage | None = None
@@ -99,6 +101,7 @@ class VerifierWindow:
         self.video_path = tk.StringVar()
         self.camera_id = tk.StringVar(value="camera-1")
         self.identity_id = tk.StringVar(value="P1")
+        self.candidate_id = tk.StringVar()
         self.automatic_registration = tk.BooleanVar(value=automatic_capable)
         self.automation_status = tk.StringVar(
             value=(
@@ -263,16 +266,28 @@ class VerifierWindow:
         ).grid(row=1, column=0, columnspan=2, padx=6, pady=(2, 8), sticky="w")
         ttk.Label(enrollment, text="人工身份 ID").grid(row=2, column=0, padx=6, pady=8)
         ttk.Entry(enrollment, textvariable=self.identity_id, width=18).grid(row=2, column=1, padx=6, pady=8)
+        ttk.Label(enrollment, text="跨事件候选键").grid(row=3, column=0, padx=6, pady=8)
+        ttk.Entry(enrollment, textvariable=self.candidate_id, width=18).grid(
+            row=3,
+            column=1,
+            padx=6,
+            pady=8,
+        )
+        ttk.Label(
+            enrollment,
+            text="视觉身份尚未完成时，临时 Track 换视频/摄像头仍需保持不变；已有 P 会由 OSNet 自动重新绑定。",
+            wraplength=470,
+        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
         ttk.Button(
             enrollment,
             text="人工登记选中目标（兜底）",
             command=self.register_selected,
-        ).grid(row=3, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="ew")
+        ).grid(row=5, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="ew")
         ttk.Label(
             enrollment,
-            text="自动流程只用强步态建号；外观必须经一次性请求后才会吸收。",
+            text="当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GaitGraph2 原型。",
             wraplength=470,
-        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
+        ).grid(row=6, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
 
         request_box = ttk.LabelFrame(side, text="外观吸收（自动；此处为人工兜底）")
         request_box.pack(fill="x", pady=(14, 0))
@@ -306,6 +321,11 @@ class VerifierWindow:
         gallery.pack(fill="x", pady=(14, 0))
         self.gallery_label = ttk.Label(gallery, text="无")
         self.gallery_label.pack(anchor="w", padx=8, pady=8)
+        ttk.Button(
+            gallery,
+            text="清除现有 ID（重新建库）",
+            command=self.clear_existing_ids,
+        ).pack(fill="x", padx=8, pady=(0, 8))
 
         self._build_parameter_page(parameter_page)
 
@@ -482,17 +502,18 @@ class VerifierWindow:
 
     def _source_spec(self) -> SourceSpec:
         """校验输入源控件，并将其转换为工作线程使用的 ``SourceSpec``。"""
+        candidate_id = self.candidate_id.get().strip() or None
         if self.source_kind.get() == "file":
             path = self.video_path.get().strip()
             if not path:
                 raise ValueError("请先选择视频文件")
-            return SourceSpec("file", path, Path(path).name)
+            return SourceSpec("file", path, Path(path).name, candidate_id)
         try:
             index = int(self.camera_index.get().strip())
         except ValueError as error:
             raise ValueError("摄像头设备号必须是整数") from error
         label = self.camera_id.get().strip() or f"camera-{index}"
-        return SourceSpec("camera", index, label)
+        return SourceSpec("camera", index, label, candidate_id)
 
     def start(self) -> None:
         """校验所选摄像头或文件输入源后开始采集。"""
@@ -522,7 +543,7 @@ class VerifierWindow:
             return
         self.worker.set_automatic_registration(enabled)
         self.automation_status.set(
-            "自动注册：开启，稳定强步态将自动生成 P 身份"
+            "自动注册：开启，OSNet 将先确认视觉身份，随后学习步态原型"
             if enabled
             else "自动注册：关闭；识别和外观令牌响应仍继续"
         )
@@ -537,6 +558,41 @@ class VerifierWindow:
         track_id = int(selected[0]) if selected else None
         self.worker.register_identity(identity_id, track_id)
         self.status.set("登记请求已排队，将在采集线程安全执行")
+
+    def clear_existing_ids(self) -> None:
+        """备份后清空全部身份数据，供重新识别/建库。"""
+
+        if not messagebox.askyesno(
+            "确认清除身份",
+            "将清除全部视觉身份、步态原型、事件和审计记录。\n"
+            "清除前会自动创建数据库备份，是否继续？",
+            icon="warning",
+        ):
+            return
+        self.worker.stop()
+        store = self.verifier.store
+        backup_path: Path | None = None
+        if store.path != ":memory:":
+            database = Path(store.path)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = database.with_name(
+                f"{database.stem}-before-clear-{stamp}{database.suffix}"
+            )
+            store.backup_to(str(backup_path))
+        try:
+            self.pipeline.clear_gallery()
+        except Exception as error:
+            messagebox.showerror("清除失败", f"身份数据未完成清除：{error}")
+            return
+        for item in self.track_tree.get_children():
+            self.track_tree.delete(item)
+        self.gallery_label.configure(text="无")
+        self.pending_requests.set("无")
+        self.automation_status.set("自动注册：开启，等待人物进入画面")
+        self.status.set(
+            "已清除全部身份数据"
+            + (f"；备份：{backup_path.name}" if backup_path is not None else "")
+        )
 
     def apply_appearance_request(self) -> None:
         """排队一次性外观令牌，可选绑定到选中的 Track。"""

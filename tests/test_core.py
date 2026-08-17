@@ -156,6 +156,14 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(assigned, {0: 1, 1: 0})
 
+    def test_gated_assignment_has_explicit_unknown_for_infeasible_rows(self) -> None:
+        assigned = gated_global_assignment(
+            np.asarray([[0.20, 0.30]], dtype=np.float32),
+            accept_threshold=0.80,
+            appearance_floor=0.0,
+        )
+        self.assertEqual(assigned, {})
+
     def test_formal_match_is_separate_from_unknown_candidate(self) -> None:
         verifier = CrossEventVerifier()
         verifier.register_identity("P1", FeatureBundle([1, 0, 0], [0, 1, 0]))
@@ -239,6 +247,131 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(hits[0].identity_id, "P1")
             second.close()
 
+    def test_embedding_contract_blocks_cross_model_gallery_match_and_write(self) -> None:
+        config = VerifierConfig(
+            model_version="production-model-a",
+            feature_schema="gaitgraph2-rtmpose-v1",
+        )
+        verifier = CrossEventVerifier(config)
+        verifier.register_identity("P1", FeatureBundle(appearance=[1, 0, 0]))
+
+        incompatible = Observation(
+            event_id="incompatible-model",
+            model_version="production-model-b",
+            feature_schema="gaitgraph2-hrnet-v2",
+            features=FeatureBundle(appearance=[1, 0, 0]),
+            quality=good_quality(),
+        )
+        self.assertEqual(verifier.rank(incompatible), ())
+        incompatible_decision = verifier.verify(incompatible)
+        self.assertEqual(incompatible_decision.kind, DecisionKind.NEED_MORE_DATA)
+        self.assertIn("feature_contract_mismatch", incompatible_decision.reasons)
+        wrong_dimension = Observation(
+            event_id="incompatible-dimension",
+            model_version="production-model-a",
+            feature_schema="gaitgraph2-rtmpose-v1",
+            features=FeatureBundle(appearance=[1, 0]),
+            quality=good_quality(),
+        )
+        self.assertEqual(verifier.rank(wrong_dimension), ())
+        with self.assertRaises(ValueError):
+            verifier.memory.add_formal(
+                "P1",
+                FeatureBundle(appearance=[1, 0, 0]),
+                model_version="production-model-b",
+                feature_schema="gaitgraph2-hrnet-v2",
+            )
+        verifier.close()
+
+    def test_calibration_status_is_explicit_and_strict_mode_rejects_defaults(self) -> None:
+        default_verifier = CrossEventVerifier()
+        self.assertFalse(default_verifier.calibration_status["ready"])
+        default_verifier.register_identity("P1", FeatureBundle(appearance=[1, 0, 0]))
+        mismatched_observation = Observation(
+            event_id="calibration-mismatch",
+            calibration_version="target-camera-v1",
+            features=FeatureBundle(appearance=[1, 0, 0]),
+            quality=good_quality(),
+        )
+        self.assertEqual(default_verifier.rank(mismatched_observation), ())
+        mismatched_decision = default_verifier.verify(mismatched_observation)
+        self.assertEqual(mismatched_decision.kind, DecisionKind.NEED_MORE_DATA)
+        self.assertIn("calibration_contract_mismatch", mismatched_decision.reasons)
+        default_verifier.close()
+
+        with self.assertRaises(ValueError):
+            CrossEventVerifier(VerifierConfig(require_calibrated_scores=True))
+
+        from cross_event_verifier.calibration import ScoreCalibrator
+
+        similarities = np.concatenate(
+            [np.linspace(-0.2, 0.2, 16), np.linspace(0.6, 0.95, 16)]
+        )
+        labels = np.asarray([0] * 16 + [1] * 16, dtype=np.int64)
+        fitted = ScoreCalibrator.fit(
+            similarities,
+            labels,
+            name="target-camera-v1",
+            minimum_pairs=32,
+        )
+        strict = CrossEventVerifier(
+            VerifierConfig(
+                require_calibrated_scores=True,
+                calibration_version="target-camera-v1",
+            ),
+            appearance_calibrator=fitted,
+            gait_calibrator=fitted,
+        )
+        self.assertTrue(strict.calibration_status["ready"])
+        strict.close()
+
+    def test_embedding_and_calibration_contracts_survive_sqlite_round_trip(self) -> None:
+        store = SqliteStore(":memory:")
+        observation = Observation(
+            event_id="contract-round-trip",
+            model_version="model-a",
+            feature_schema="gaitgraph2-rtmpose-v1",
+            calibration_version="target-camera-v1",
+            threshold_version="threshold-v4",
+            features=FeatureBundle(appearance=[1, 0, 0]),
+            quality=good_quality(),
+        )
+        store.save_observation(observation, candidate_id="C1")
+        restored_observation = store.observations_for_candidate("C1")[0]
+        self.assertEqual(restored_observation.feature_schema, "gaitgraph2-rtmpose-v1")
+        self.assertEqual(restored_observation.calibration_version, "target-camera-v1")
+
+        verifier = CrossEventVerifier(
+            VerifierConfig(model_version="model-a", feature_schema="gaitgraph2-rtmpose-v1"),
+            store=store,
+        )
+        verifier.register_identity("P1", FeatureBundle(appearance=[1, 0, 0]))
+        prototype = verifier.memory.formal_prototypes("P1", "appearance")[0]
+        self.assertEqual(prototype.model_version, "model-a")
+        self.assertEqual(prototype.feature_schema, "gaitgraph2-rtmpose-v1")
+        verifier.close()
+
+    def test_maintenance_does_not_revoke_merged_candidate(self) -> None:
+        verifier = CrossEventVerifier(
+            VerifierConfig(
+                candidate_ttl_seconds=1.0,
+                quarantine_max_candidates=1,
+            )
+        )
+        candidate = verifier._get_or_create_candidate("merged-candidate")
+        candidate.state = VerificationState.MERGED
+        candidate.updated_at = 0.0
+        verifier.store.save_candidate(candidate)
+
+        removed = verifier.maintenance(now=100.0)
+
+        self.assertEqual(removed, ())
+        self.assertEqual(
+            verifier.get_candidate("merged-candidate").state,
+            VerificationState.MERGED,
+        )
+        verifier.close()
+
     def test_strong_gait_requests_appearance_and_strong_response_is_absorbed(self) -> None:
         verifier = CrossEventVerifier()
         verifier.register_identity("P1", FeatureBundle([1, 0, 0], [0, 1, 0]))
@@ -304,6 +437,39 @@ class CoreTests(unittest.TestCase):
         after = tuple(verifier.memory.formal_prototypes("P1", "appearance"))
         self.assertEqual(len(after), len(before))
         self.assertTrue(np.array_equal(after[0].vector, before[0].vector))
+
+    def test_appearance_request_rejects_a_different_track(self) -> None:
+        verifier = CrossEventVerifier()
+        verifier.register_identity("P1", FeatureBundle([1, 0, 0], [0, 1, 0]))
+        issued = verifier.verify(
+            Observation(
+                event_id="track-bound-gait",
+                camera_id="cam-a",
+                capture_session_id="session-a",
+                track_id="track-a",
+                features=FeatureBundle(gait=[0, 1, 0]),
+                quality=good_quality(),
+            )
+        )
+        response = verifier.verify(
+            Observation(
+                event_id="track-bound-response",
+                camera_id="cam-a",
+                capture_session_id="session-b",
+                track_id="track-b",
+                appearance_request_id=issued.appearance_request_id,
+                features=FeatureBundle(appearance=[1, 0, 0]),
+                quality=TrackQuality(
+                    detection_confidence=0.95,
+                    box_height=200,
+                    sharpness=0.95,
+                    occlusion=0.05,
+                ),
+            )
+        )
+        self.assertNotEqual(response.kind, DecisionKind.APPEARANCE_RESPONSE_ACCEPTED)
+        self.assertIn("appearance_request_track_mismatch", response.reasons)
+        verifier.close()
 
     def test_strong_gait_can_authorize_a_new_clothing_appearance(self) -> None:
         verifier = CrossEventVerifier()

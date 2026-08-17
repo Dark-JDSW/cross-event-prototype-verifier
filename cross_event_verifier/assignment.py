@@ -122,18 +122,34 @@ def gated_global_assignment(
     if scores.size == 0:
         return {}
 
-    feasible = np.isfinite(scores) & (scores >= accept_threshold) & (
+    real_columns = scores.shape[1]
+    feasible_real = np.isfinite(scores) & (scores >= accept_threshold) & (
         appearance >= appearance_floor
     )
-    # 允许求解器暂时选择禁用边，之后再丢弃；对于不存在完整可行覆盖的
-    # 矩形矩阵，这是必要的处理方式。
-    cost = np.where(feasible, -scores, 1e6).astype(np.float64)
+    # 为每一行增加一个显式 UNKNOWN 哑列。哑列的零分数比任何通过门的
+    # 正分数代价更高/更低取决于代价符号，因此求解器只会选择可行真实边，
+    # 没有可行边时则稳定地落到 UNKNOWN，而不是先占用身份列再事后丢弃。
+    dummy_count = scores.shape[0]
+    scores_with_dummy = np.concatenate(
+        [scores, np.zeros((scores.shape[0], dummy_count), dtype=np.float32)],
+        axis=1,
+    )
+    feasible = np.concatenate(
+        [feasible_real, np.ones((scores.shape[0], dummy_count), dtype=bool)],
+        axis=1,
+    )
+    # 禁用真实边的巨大代价使其永远不优于哑列；哑列代价为 0。
+    cost = np.where(
+        feasible,
+        -scores_with_dummy,
+        1e6,
+    ).astype(np.float64)
     result: dict[int, int] = {}
     for row, column in _linear_sum_assignment(cost):
-        if row >= scores.shape[0] or column >= scores.shape[1] or not feasible[row, column]:
+        if row >= scores.shape[0] or column >= real_columns or not feasible[row, column]:
             continue
         if margin_threshold > 0:
-            other_scores = scores[row, feasible[row] & (np.arange(scores.shape[1]) != column)]
+            other_scores = scores[row, feasible_real[row] & (np.arange(real_columns) != column)]
             if other_scores.size and float(scores[row, column] - np.max(other_scores)) < margin_threshold:
                 continue
         result[int(row)] = int(column)

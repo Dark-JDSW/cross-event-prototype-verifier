@@ -3,6 +3,8 @@
 import unittest
 import tkinter as tk
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 import numpy as np
@@ -15,6 +17,7 @@ from cross_event_verifier.gui import (
 )
 from cross_event_verifier.media import FrameWorker, ParameterUpdateMessage, SourceSpec
 from cross_event_verifier.pipeline import VideoVerifierPipeline
+from cross_event_verifier.storage import SqliteStore
 from cross_event_verifier.types import TrackQuality
 from cross_event_verifier.vision import OpenCvDemoAdapter, VisionTrack
 
@@ -131,6 +134,26 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
+    def test_track_candidate_key_survives_active_count_changes(self) -> None:
+        """同一 Track 增减同框人数时仍保持视觉身份 must-link。"""
+
+        pipeline = VideoVerifierPipeline(
+            CrossEventVerifier(),
+            FakeVision(),
+            appearance_first=True,
+        )
+        pipeline.set_source(
+            "cam-must-link",
+            capture_session_id="must-link-session",
+            candidate_id="enrollment-1",
+        )
+        first = pipeline._candidate_id_for_track(7, active_count=1)
+        after_another_person_enters = pipeline._candidate_id_for_track(7, active_count=2)
+        other_track = pipeline._candidate_id_for_track(8, active_count=2)
+        self.assertEqual(first, "enrollment-1")
+        self.assertEqual(after_another_person_enters, first)
+        self.assertNotEqual(other_track, first)
+
     def test_gui_poll_interval_supports_sixty_hertz_refresh(self) -> None:
         self.assertEqual(GUI_POLL_INTERVAL_MS, 16)
 
@@ -304,6 +327,110 @@ class GuiPipelineTests(unittest.TestCase):
         self.assertIsNotNone(request)
         self.assertEqual(request.status, "consumed")
         verifier.close()
+
+    def test_default_two_event_registration_survives_source_switch_with_stable_candidate(self) -> None:
+        verifier = CrossEventVerifier()
+        pipeline = VideoVerifierPipeline(
+            verifier,
+            FakeVision(),
+            camera_id="cam-auto",
+            automation_policy=AutomationPolicy(
+                minimum_track_frames=1,
+                minimum_stable_gait_samples=3,
+                gait_sample_window=4,
+                minimum_independent_gait_events=2,
+            ),
+        )
+        frame = np.zeros((220, 120, 3), dtype=np.uint8)
+
+        pipeline.set_source(
+            "cam-auto",
+            capture_session_id="event-a",
+            candidate_id="enrollment-1",
+        )
+        for timestamp in (300.0, 301.0, 302.0):
+            result = pipeline.process_frame(frame, timestamp=timestamp)
+        self.assertEqual(
+            result.tracks[0].automation.stage.value,
+            "waiting_independent_event",
+        )
+        self.assertEqual(verifier.formal_identities, ())
+
+        pipeline.set_source(
+            "cam-auto",
+            capture_session_id="event-b",
+            candidate_id="enrollment-1",
+        )
+        for timestamp in (303.0, 304.0, 305.0):
+            result = pipeline.process_frame(frame, timestamp=timestamp)
+
+        self.assertTrue(result.tracks[0].automation.auto_registered)
+        self.assertEqual(result.tracks[0].decision.identity_id, "P1")
+        self.assertEqual(verifier.formal_identities, ("P1",))
+        self.assertEqual(verifier.get_candidate("enrollment-1").state.value, "merged")
+        verifier.close()
+
+    def test_default_two_event_registration_survives_process_restart(self) -> None:
+        frame = np.zeros((220, 120, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "restart.sqlite3"
+            first = CrossEventVerifier(store=SqliteStore(str(path)))
+            first_pipeline = VideoVerifierPipeline(
+                first,
+                FakeVision(),
+                camera_id="cam-auto",
+                automation_policy=AutomationPolicy(
+                    minimum_track_frames=1,
+                    minimum_stable_gait_samples=3,
+                    gait_sample_window=4,
+                    minimum_independent_gait_events=2,
+                ),
+            )
+            first_pipeline.set_source(
+                "cam-auto",
+                capture_session_id="event-restart-a",
+                candidate_id="enrollment-restart",
+            )
+            for timestamp in (310.0, 311.0, 312.0):
+                result = first_pipeline.process_frame(frame, timestamp=timestamp)
+            self.assertEqual(
+                result.tracks[0].automation.stage.value,
+                "waiting_independent_event",
+            )
+            first.close()
+
+            second = CrossEventVerifier(store=SqliteStore(str(path)))
+            second_pipeline = VideoVerifierPipeline(
+                second,
+                FakeVision(),
+                camera_id="cam-auto",
+                automation_policy=AutomationPolicy(
+                    minimum_track_frames=1,
+                    minimum_stable_gait_samples=3,
+                    gait_sample_window=4,
+                    minimum_independent_gait_events=2,
+                ),
+            )
+            restored_events = second.store.load_gait_event_proposals(
+                "enrollment-restart"
+            )
+            self.assertEqual(len(restored_events), 1)
+            self.assertEqual(restored_events[0]["camera_id"], "cam-auto")
+            self.assertEqual(
+                restored_events[0]["capture_session_id"],
+                "event-restart-a",
+            )
+            second_pipeline.set_source(
+                "cam-auto",
+                capture_session_id="event-restart-b",
+                candidate_id="enrollment-restart",
+            )
+            for timestamp in (313.0, 314.0, 315.0):
+                result = second_pipeline.process_frame(frame, timestamp=timestamp)
+            self.assertTrue(result.tracks[0].automation.auto_registered)
+            self.assertEqual(result.tracks[0].decision.identity_id, "P1")
+            self.assertEqual(second.formal_identities, ("P1",))
+            second.close()
 
     def test_novel_gait_is_registered_when_gallery_already_has_an_identity(self) -> None:
         verifier = CrossEventVerifier()
@@ -492,6 +619,29 @@ class GuiPipelineTests(unittest.TestCase):
         video = SourceSpec("file", "sample.mp4", "sample.mp4")
         self.assertEqual(camera.kind, "camera")
         self.assertEqual(video.value, "sample.mp4")
+
+    def test_clear_gallery_removes_persistent_and_runtime_identity_data(self) -> None:
+        store = SqliteStore(":memory:")
+        verifier = CrossEventVerifier(store=store)
+        verifier.register_identity(
+            "P1",
+            FeatureBundle(
+                appearance=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                gait=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        )
+        self.assertEqual(verifier.formal_identities, ("P1",))
+
+        verifier.clear_gallery()
+
+        self.assertEqual(verifier.formal_identities, ())
+        self.assertEqual(store.list_candidates(), [])
+        counts = {
+            table: store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("identities", "prototypes", "gait_enrollment_events", "audit_log")
+        }
+        self.assertEqual(counts, {table: 0 for table in counts})
+        verifier.close()
 
     def test_pipeline_keeps_identity_assignment_one_to_one_for_two_people(self) -> None:
         verifier = CrossEventVerifier()

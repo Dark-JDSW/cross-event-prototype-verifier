@@ -396,18 +396,40 @@ class GaitGraph2Encoder(nn.Module):
 
 
 def _fill_missing(sequence: np.ndarray) -> np.ndarray:
-    """按 OpenGait ``NormalizeEmpty`` 规则填补空关节。"""
+    """按时间轴填补空关节，同时保留缺失置信度掩码。
+
+    旧实现只在当前帧用帧中心替换空点；更严重的是上游直接删除整帧，
+    让帧间差分把遮挡当成连续运动。这里先对每个关节沿真实保留的帧槽
+    做线性插值，再对整段完全缺失的关节使用 OpenGait 风格的局部中心。
+    置信度列不被伪造，因此质量门仍能看到原始缺失。
+    """
     result = np.asarray(sequence, dtype=np.float32).copy()
+    if result.ndim != 3 or result.shape[0] == 0:
+        return result
+    time_axis = np.arange(result.shape[0], dtype=np.float32)
+    has_any_valid = np.zeros(result.shape[1], dtype=bool)
+    for joint in range(result.shape[1]):
+        valid = result[:, joint, 2] > 0.0
+        if valid.any():
+            has_any_valid[joint] = True
+            for channel in (0, 1):
+                result[:, joint, channel] = np.interp(
+                    time_axis,
+                    time_axis[valid],
+                    result[valid, joint, channel],
+                ).astype(np.float32)
     for frame in result:
-        empty = frame[:, 0] == 0.0
+        # A joint observed elsewhere in the window already has a temporal
+        # interpolation.  Only a joint that is missing for the entire window
+        # needs the OpenGait-style local-center fallback.
+        empty = (frame[:, 2] <= 0.0) & ~has_any_valid
         if not empty.any():
             continue
-        # OpenGait computes the frame center over all 17 rows (including the
-        # zero rows) and only then replaces the empty coordinates. Matching
-        # that detail keeps missing-joint handling checkpoint-compatible.
-        center = frame.mean(axis=0)
-        frame[empty, 0] = center[0]
-        frame[empty, 1] = center[1]
+        valid = ~empty
+        if valid.any():
+            center = frame[valid].mean(axis=0)
+            frame[empty, 0] = center[0]
+            frame[empty, 1] = center[1]
         frame[empty, 2] = 0.0
     return result
 
@@ -416,8 +438,26 @@ def _fixed_length(sequence: np.ndarray, length: int) -> np.ndarray:
     """将姿态窗口重采样为模型要求的固定时序长度。"""
     if len(sequence) == length:
         return sequence
-    indexes = np.rint(np.linspace(0, len(sequence) - 1, length)).astype(np.int64)
-    return sequence[indexes]
+    source_axis = np.arange(len(sequence), dtype=np.float32)
+    target_axis = np.linspace(0, len(sequence) - 1, length, dtype=np.float32)
+    flattened = sequence.reshape(len(sequence), -1)
+    resized = np.stack(
+        [
+            np.interp(target_axis, source_axis, flattened[:, column])
+            for column in range(flattened.shape[1])
+        ],
+        axis=1,
+    )
+    # Coordinates may be interpolated across a missing slot, but confidence is
+    # a validity mask rather than a continuous signal.  Nearest-neighbour
+    # sampling keeps a missing pose masked instead of manufacturing a partial
+    # confidence value during fixed-length resampling.
+    if sequence.shape[-1] >= 3:
+        nearest = np.rint(target_axis).astype(np.int64)
+        resized[:, 2::sequence.shape[-1]] = flattened[
+            nearest, 2::sequence.shape[-1]
+        ]
+    return resized.reshape(length, *sequence.shape[1:]).astype(np.float32)
 
 
 def gait_graph_multi_input(sequence: np.ndarray) -> np.ndarray:

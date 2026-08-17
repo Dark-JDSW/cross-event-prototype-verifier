@@ -153,6 +153,7 @@ class OpenCvDemoAdapter:
 
     supports_automatic_registration = False
     model_version = "opencv-hog-diagnostic-v1"
+    feature_schema = "opencv-hog-diagnostic-v1"
     backend_status = "OpenCV HOG 诊断模式（禁止自动注册）"
 
     def __init__(

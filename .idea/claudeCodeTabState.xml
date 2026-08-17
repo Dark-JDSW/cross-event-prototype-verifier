@@ -7,11 +7,11 @@
           <value>
             <TabSessionState>
               <option name="provider" value="codex" />
-              <option name="sessionId" value="01a0035e-eafa-7bc0-b9bc-9a8fff3b5b07" />
+              <option name="sessionId" value="01a00e6d-e1d9-7421-9b90-66b03b93ddbb" />
               <option name="cwd" value="C:\Users\wzige\PycharmProjects\cross-event-prototype-verifier" />
               <option name="model" value="gpt-5.6-luna" />
               <option name="permissionMode" value="bypassPermissions" />
-              <option name="reasoningEffort" value="medium" />
+              <option name="reasoningEffort" value="low" />
             </TabSessionState>
           </value>
         </entry>

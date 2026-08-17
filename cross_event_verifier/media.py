@@ -30,6 +30,7 @@ class SourceSpec:
     kind: Literal["camera", "file"]
     value: int | str
     label: str
+    candidate_id: str | None = None
 
 
 class OpenCvCapture:
@@ -56,6 +57,10 @@ class OpenCvCapture:
             if not capture.isOpened():
                 capture.release()
                 capture = cv2.VideoCapture(index)
+            # Do not let an overloaded inference thread accumulate seconds of
+            # stale camera frames.  Backends may ignore this hint; processing
+            # remains synchronous and the worker still reports its latency.
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             capture = cv2.VideoCapture(str(self.spec.value))
         if not capture.isOpened():
@@ -151,26 +156,58 @@ class FrameWorker:
         self,
         message: FrameMessage | StatusMessage | RegistrationMessage | ParameterUpdateMessage,
     ) -> None:
-        """发布消息；队列已满时丢弃最旧的帧/状态消息。"""
+        """发布消息；只丢弃旧帧，不丢弃控制/状态/登记结果。"""
         try:
             self.messages.put_nowait(message)
         except queue.Full:
-            try:
-                self.messages.get_nowait()
-            except queue.Empty:
-                pass
+            retained: list[object] = []
+            removed_frame = False
+            while True:
+                try:
+                    older = self.messages.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(older, FrameMessage) and not removed_frame:
+                    removed_frame = True
+                    continue
+                retained.append(older)
+            for older in retained:
+                try:
+                    self.messages.put_nowait(older)
+                except queue.Full:
+                    break
+            if isinstance(message, FrameMessage) and not removed_frame:
+                # A full queue containing only control messages must preserve
+                # those messages; the newest frame is intentionally dropped.
+                return
+            if not removed_frame and not isinstance(message, FrameMessage):
+                # Control/status messages are never silently discarded.  Block
+                # until the GUI drains one when the bounded queue contains only
+                # control messages; dropping a frame is preferable to losing a
+                # registration result or an error notification.
+                self.messages.put(message)
+                return
             try:
                 self.messages.put_nowait(message)
             except queue.Full:
                 pass
 
-    def start(self, spec: SourceSpec) -> None:
-        """停止旧工作线程，并为 ``spec`` 启动守护线程。"""
+    def start(self, spec: SourceSpec, *, candidate_id: str | None = None) -> None:
+        """停止旧工作线程，并为 ``spec`` 启动守护线程。
+
+        ``candidate_id`` 由采集任务/操作员显式提供，允许同一未知人物在
+        不同输入源之间继续积累独立事件；缺省时保持会话隔离。
+        """
         self.stop()
         self._stop.clear()
+        effective_candidate = (
+            candidate_id if candidate_id is not None else spec.candidate_id
+        )
+        if effective_candidate is not None and not effective_candidate.strip():
+            raise ValueError("candidate_id cannot be empty")
         self._thread = threading.Thread(
             target=self._run,
-            args=(spec,),
+            args=(spec, effective_candidate.strip() if effective_candidate else None),
             name="cross-event-capture",
             daemon=True,
         )
@@ -279,14 +316,20 @@ class FrameWorker:
             except Exception as error:  # 将用户操作错误显示在 GUI 中
                 self._put(RegistrationMessage(False, f"登记失败：{error}"))
 
-    def _run(self, spec: SourceSpec) -> None:
+    def _run(self, spec: SourceSpec, candidate_id: str | None) -> None:
         """持续采集、处理并发布帧，直到停止或输入结束。"""
         capture: OpenCvCapture | None = None
         try:
             capture = OpenCvCapture(spec)
             capture.open()
             session_id = f"{spec.kind}-{int(time.time() * 1000)}"
-            self.pipeline.set_source(spec.label, capture_session_id=session_id)
+            self.pipeline.set_source(
+                spec.label,
+                capture_session_id=session_id,
+                candidate_id=candidate_id,
+            )
+            session_start = time.time()
+            last_maintenance = time.monotonic()
             fps_text = f"{capture.fps:.1f} FPS" if capture.fps > 1.0 else "实时输入"
             backend_status = str(
                 getattr(
@@ -311,7 +354,18 @@ class FrameWorker:
                     self._put(StatusMessage("ended", "视频已结束"))
                     break
                 started = time.perf_counter()
-                result = self.pipeline.process_frame(frame)
+                if spec.kind == "file" and capture.capture is not None:
+                    position_ms = float(
+                        capture.capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0
+                    )
+                    frame_timestamp = float(session_start + position_ms / 1000.0)
+                else:
+                    frame_timestamp = time.time()
+                result = self.pipeline.process_frame(frame, timestamp=frame_timestamp)
+                if time.monotonic() - last_maintenance >= 30.0:
+                    removed_candidates = self.pipeline.verifier.maintenance(now=time.time())
+                    self.pipeline.automation.discard_candidates(removed_candidates)
+                    last_maintenance = time.monotonic()
                 self._put(FrameMessage(result))
                 if spec.kind == "file" and capture.fps > 1.0:
                     remaining = (1.0 / capture.fps) - (time.perf_counter() - started)

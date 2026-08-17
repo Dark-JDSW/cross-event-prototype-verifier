@@ -2,6 +2,8 @@
 
 import unittest
 from dataclasses import replace
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -13,6 +15,7 @@ from cross_event_verifier.automation import (
     AutomaticVerificationController,
 )
 from cross_event_verifier.types import DecisionKind, TrackQuality
+from cross_event_verifier.storage import SqliteStore
 
 
 def good_quality(*, gait_branch_quality: float = 0.95) -> TrackQuality:
@@ -111,27 +114,36 @@ class RegistrationRegressionTests(unittest.TestCase):
         self.assertEqual(verifier.formal_identities, ("P1",))
         verifier.close()
 
-    def test_multi_gallery_allows_clear_gait_winner_below_near_duplicate_limit(self) -> None:
+    def test_multi_gallery_rejects_high_absolute_impostor_even_with_margin(self) -> None:
         verifier = CrossEventVerifier(VerifierConfig())
         verifier.register_identity("P1", FeatureBundle(gait=[1.0, 0.0, 0.0]))
         verifier.register_identity("P2", FeatureBundle(gait=[0.0, 1.0, 0.0]))
         query = np.array([0.98, np.sqrt(1.0 - 0.98**2), 0.0], dtype=np.float32)
 
-        enrolled = verifier.enroll_gait_identity(
-            Observation(
-                event_id="clear-winner-enrollment",
-                camera_id="cam-a",
-                capture_session_id="session-a",
-                track_id="track-clear-winner",
-                features=FeatureBundle(gait=query),
-                quality=good_quality(),
-            ),
-            candidate_id="candidate-clear-winner",
-            gait_confidence=0.95,
-        )
+        with self.assertRaisesRegex(ValueError, "not open-set novel"):
+            verifier.enroll_gait_identity(
+                Observation(
+                    event_id="clear-winner-enrollment",
+                    camera_id="cam-a",
+                    capture_session_id="session-a",
+                    track_id="track-clear-winner",
+                    features=FeatureBundle(gait=query),
+                    quality=good_quality(),
+                ),
+                candidate_id="candidate-clear-winner",
+                gait_confidence=0.95,
+            )
 
-        self.assertEqual(enrolled.identity_id, "P3")
-        self.assertEqual(verifier.formal_identities, ("P1", "P2", "P3"))
+        self.assertEqual(verifier.formal_identities, ("P1", "P2"))
+        rejected = [
+            item
+            for item in verifier.store.audit_log()
+            if item["action"] == "gait_open_set_rejected"
+        ]
+        self.assertEqual(
+            rejected[-1]["payload"]["reason"],
+            "gait_open_set_similarity_too_high",
+        )
         verifier.close()
 
     def test_multi_gallery_ambiguous_gait_does_not_enroll(self) -> None:
@@ -294,6 +306,135 @@ class RegistrationRegressionTests(unittest.TestCase):
         self.assertEqual(status.stage, AutomationStage.APPEARANCE_PENDING)
         self.assertTrue(status.auto_registered)
         self.assertEqual(results[-1].identity_id, "P2")
+        verifier.close()
+
+    def test_automatic_event_proposals_survive_verifier_restart(self) -> None:
+        policy = AutomationPolicy(
+            minimum_track_frames=1,
+            minimum_stable_gait_samples=3,
+            gait_sample_window=4,
+            minimum_independent_gait_events=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "registration.sqlite3")
+            first_verifier = CrossEventVerifier(store=SqliteStore(path))
+            first_controller = AutomaticVerificationController(first_verifier, policy)
+            for index in range(3):
+                first_controller.verify(
+                    Observation(
+                        event_id=f"restart-a-{index}",
+                        camera_id="cam-a",
+                        capture_session_id="event-a",
+                        track_id="track-7",
+                        features=FeatureBundle(gait=[0, 1, 0]),
+                        quality=good_quality(),
+                    ),
+                    candidate_id="enrollment-restart",
+                )
+            self.assertEqual(first_verifier.formal_identities, ())
+            first_verifier.close()
+
+            second_verifier = CrossEventVerifier(store=SqliteStore(path))
+            second_controller = AutomaticVerificationController(second_verifier, policy)
+            result = None
+            for index in range(3):
+                result, status = second_controller.verify(
+                    Observation(
+                        event_id=f"restart-b-{index}",
+                        camera_id="cam-a",
+                        capture_session_id="event-b",
+                        track_id="track-7",
+                        features=FeatureBundle(gait=[0, 1, 0]),
+                        quality=good_quality(),
+                    ),
+                    candidate_id="enrollment-restart",
+                )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.identity_id, "P1")
+            self.assertTrue(status.auto_registered)
+            self.assertEqual(second_verifier.formal_identities, ("P1",))
+            self.assertEqual(
+                second_verifier.store.load_gait_event_proposals(
+                    "enrollment-restart"
+                ),
+                [],
+            )
+            second_verifier.close()
+
+    def test_restart_discards_event_proposals_from_an_old_model_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "contract.sqlite3")
+            first = CrossEventVerifier(
+                store=SqliteStore(path),
+                config=VerifierConfig(
+                    model_version="model-a",
+                    feature_schema="schema-a",
+                ),
+            )
+            observation = Observation(
+                event_id="old-contract-event",
+                camera_id="cam-a",
+                capture_session_id="session-a",
+                track_id="track-1",
+                timestamp=100.0,
+                features=FeatureBundle(gait=[0.0, 1.0, 0.0]),
+                quality=good_quality(),
+                model_version="model-a",
+                feature_schema="schema-a",
+            )
+            first.save_gait_event_proposal(
+                candidate_id="contract-candidate",
+                event_key="session:session-a",
+                vector=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+                stability=0.99,
+                observation=observation,
+            )
+            first.close()
+
+            second = CrossEventVerifier(
+                store=SqliteStore(path),
+                config=VerifierConfig(
+                    model_version="model-b",
+                    feature_schema="schema-b",
+                ),
+            )
+            AutomaticVerificationController(second)
+            self.assertEqual(
+                second.store.load_gait_event_proposals("contract-candidate"),
+                [],
+            )
+            second.close()
+
+    def test_automatic_registration_blocks_incompatible_gallery_contract(self) -> None:
+        verifier = CrossEventVerifier(
+            VerifierConfig(
+                model_version="model-a",
+                feature_schema="gaitgraph2-rtmpose-v1",
+            )
+        )
+        verifier.register_identity("P1", FeatureBundle(gait=[0, 1, 0]))
+        controller = AutomaticVerificationController(
+            verifier,
+            AutomationPolicy(
+                minimum_track_frames=1,
+                minimum_stable_gait_samples=3,
+                gait_sample_window=4,
+                minimum_independent_gait_events=1,
+            ),
+        )
+        decision, status = controller.verify(
+            Observation(
+                event_id="contract-switch",
+                model_version="model-b",
+                feature_schema="gaitgraph2-hrnet-v2",
+                features=FeatureBundle(gait=[1, 0, 0]),
+                quality=good_quality(),
+            ),
+            candidate_id="contract-candidate",
+        )
+        self.assertEqual(decision.kind, DecisionKind.NEED_MORE_DATA)
+        self.assertEqual(status.stage, AutomationStage.BLOCKED)
+        self.assertEqual(verifier.formal_identities, ("P1",))
         verifier.close()
 
     def test_partial_gait_waits_without_clearing_as_identity_negative(self) -> None:

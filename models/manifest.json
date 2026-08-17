@@ -1,5 +1,10 @@
 {
   "schema_version": 2,
+  "runtime_contract": {
+    "ultralytics": "8.3.163",
+    "yolo_model_release": "v8.4.0",
+    "note": "The YOLO11L asset release and Python runtime are checked independently; do not infer package compatibility from the URL alone."
+  },
   "models": {
     "yolo11l.pt": {
       "bytes": 51387343,

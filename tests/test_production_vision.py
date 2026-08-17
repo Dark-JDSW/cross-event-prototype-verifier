@@ -9,11 +9,13 @@ import torch
 from cross_event_verifier.gait_graph import (
     TemporalGaitEncoder,
     _coco_adjacency,
+    _fill_missing,
     gait_graph_multi_input,
 )
 from cross_event_verifier.production_vision import (
     ProductionVisionAdapter,
     ProductionVisionConfig,
+    _RtmposeEstimator,
     _canonical_pose,
 )
 from cross_event_verifier.types import Prototype
@@ -106,6 +108,16 @@ class _RecordingBatchModel:
 
 
 class ProductionVisionTests(unittest.TestCase):
+    def test_simcc_confidence_uses_the_less_reliable_axis(self) -> None:
+        simcc_x = np.zeros((1, 1, 4), dtype=np.float32)
+        simcc_y = np.zeros((1, 1, 4), dtype=np.float32)
+        simcc_x[0, 0, 1] = 0.90
+        simcc_y[0, 0, 2] = 0.10
+
+        _, _, confidence = _RtmposeEstimator._decode_simcc(simcc_x, simcc_y)
+
+        self.assertAlmostEqual(float(confidence[0, 0]), 0.10, places=6)
+
     def test_demo_backend_cannot_auto_register(self) -> None:
         self.assertFalse(OpenCvDemoAdapter.supports_automatic_registration)
 
@@ -170,6 +182,20 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertGreater(float(np.abs(transformed[:, :, 1]).sum()), 0.0)
         self.assertTrue(np.isfinite(transformed).all())
 
+    def test_gait_graph_interpolates_partial_joint_gaps_without_fabricating_confidence(self) -> None:
+        sequence = np.zeros((3, 17, 3), dtype=np.float32)
+        sequence[:, 1:, 0] = 20.0
+        sequence[:, 1:, 1] = 30.0
+        sequence[:, 1:, 2] = 0.9
+        sequence[0, 0] = (0.0, 10.0, 0.9)
+        sequence[2, 0] = (10.0, 20.0, 0.9)
+
+        filled = _fill_missing(sequence)
+
+        self.assertAlmostEqual(float(filled[1, 0, 0]), 5.0, places=6)
+        self.assertAlmostEqual(float(filled[1, 0, 1]), 15.0, places=6)
+        self.assertEqual(float(filled[1, 0, 2]), 0.0)
+
     def test_gait_graph_adjacency_matches_opengait_partition_normalization(self) -> None:
         """The official graph normalizes over all reachable hops before masking."""
         adjacency = _coco_adjacency(3)
@@ -203,6 +229,7 @@ class ProductionVisionTests(unittest.TestCase):
         config = ProductionVisionConfig(
             minimum_pose_frames=8,
             gait_sequence_length=8,
+            detector_inference_stride=2,
             appearance_stride=30,
             gait_inference_stride=3,
         )

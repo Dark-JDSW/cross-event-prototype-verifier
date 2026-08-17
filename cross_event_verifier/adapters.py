@@ -7,7 +7,7 @@ YOLO、FastReID 和 OpenGait 推理留在验证器核心之外，只需要产出
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -135,8 +135,23 @@ def observation_from_tracker(
     contour_area: float = 0.0,
     contour_jitter: float = 0.0,
     id_switches: int = 0,
+    valid_pose_frames: int | None = None,
+    valid_leg_frames: int | None = None,
+    detector_gap_frames: int = 0,
+    track_gap_frames: int = 0,
+    timestamp_span_seconds: float = 0.0,
     view_angle: str | None = None,
     appearance_request_id: str | None = None,
+    model_version: str = "unconfigured",
+    feature_schema: str = "unconfigured-v1",
+    artifact_sha256: str = "unverified",
+    preprocess_version: str = "unversioned-v1",
+    joint_format: str = "unknown",
+    sequence_length: int | None = None,
+    tta_mode: str = "unknown",
+    coordinate_contract: str = "unknown",
+    embedding_dimensions: Mapping[str, int] | None = None,
+    calibration_version: str = "heuristic-default-v1",
     **metadata: object,
 ) -> Observation:
     """从 YOLO/ByteTrack 轨迹片段构造一个 ``Observation``。
@@ -159,6 +174,11 @@ def observation_from_tracker(
         contour_jitter=contour_jitter,
         id_switches=id_switches,
         frame_count=frame_count,
+        valid_pose_frames=valid_pose_frames,
+        valid_leg_frames=valid_leg_frames,
+        detector_gap_frames=detector_gap_frames,
+        track_gap_frames=track_gap_frames,
+        timestamp_span_seconds=timestamp_span_seconds,
         gait_cycles=gait_cycles,
         walking_ratio=walking_ratio,
         view_angle=view_angle,
@@ -172,5 +192,15 @@ def observation_from_tracker(
         features=FeatureBundle(appearance=appearance, gait=gait),
         quality=quality,
         appearance_request_id=appearance_request_id,
+        model_version=model_version,
+        feature_schema=feature_schema,
+        artifact_sha256=artifact_sha256,
+        preprocess_version=preprocess_version,
+        joint_format=joint_format,
+        sequence_length=sequence_length,
+        tta_mode=tta_mode,
+        coordinate_contract=coordinate_contract,
+        embedding_dimensions=dict(embedding_dimensions or {}),
+        calibration_version=calibration_version,
         metadata=metadata,
     )

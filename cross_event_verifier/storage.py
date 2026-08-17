@@ -22,6 +22,7 @@ from .types import (
     AppearanceAbsorptionRequest,
     CandidateRecord,
     FeatureBundle,
+    GaitEnrollmentEvent,
     Observation,
     Prototype,
     TrackQuality,
@@ -40,7 +41,9 @@ def _pack_vector(value: np.ndarray | None) -> tuple[bytes | None, int | None]:
 
 def _unpack_vector(blob: bytes | None, dimension: int | None) -> np.ndarray | None:
     """解码一个已存储的 float32 blob，并恢复其归一化表示。"""
-    if blob is None or dimension is None:
+    if blob is None or dimension is None or int(dimension) <= 0:
+        return None
+    if len(blob) != int(dimension) * np.dtype(np.float32).itemsize:
         return None
     vector = np.frombuffer(blob, dtype=np.float32, count=int(dimension)).copy()
     return normalize_vector(vector)
@@ -70,6 +73,12 @@ class SqliteStore:
         self.connection.row_factory = sqlite3.Row
         self._transaction_depth = 0
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
+        self.connection.execute("PRAGMA synchronous = NORMAL")
+        if path != ":memory:":
+            # WAL lets the GUI/readers continue while the worker commits a
+            # frame transaction.  In-memory databases do not support WAL.
+            self.connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -111,7 +120,16 @@ class SqliteStore:
                     view_angle TEXT,
                     clothing_tag TEXT,
                     source_event_id TEXT,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    model_version TEXT NOT NULL DEFAULT 'unconfigured',
+                    feature_schema TEXT NOT NULL DEFAULT 'unconfigured-v1',
+                    artifact_sha256 TEXT NOT NULL DEFAULT 'unverified',
+                    preprocess_version TEXT NOT NULL DEFAULT 'unversioned-v1',
+                    joint_format TEXT NOT NULL DEFAULT 'unknown',
+                    sequence_length INTEGER,
+                    tta_mode TEXT NOT NULL DEFAULT 'unknown',
+                    coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_dimensions_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_prototypes_identity_zone
                     ON prototypes(identity_id, zone, modality);
@@ -129,13 +147,24 @@ class SqliteStore:
                     gait_dimension INTEGER,
                     quality_json TEXT NOT NULL,
                     model_version TEXT NOT NULL,
+                    feature_schema TEXT NOT NULL DEFAULT 'unconfigured-v1',
+                    calibration_version TEXT NOT NULL DEFAULT 'heuristic-default-v1',
                     threshold_version TEXT NOT NULL,
                     source_event_json TEXT NOT NULL DEFAULT '[]',
                     challenge_id TEXT,
                     challenge_response_json TEXT NOT NULL DEFAULT '{}',
                     appearance_request_id TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    artifact_sha256 TEXT NOT NULL DEFAULT 'unverified',
+                    preprocess_version TEXT NOT NULL DEFAULT 'unversioned-v1',
+                    joint_format TEXT NOT NULL DEFAULT 'unknown',
+                    sequence_length INTEGER,
+                    tta_mode TEXT NOT NULL DEFAULT 'unknown',
+                    coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_dimensions_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE INDEX IF NOT EXISTS idx_observations_candidate_timestamp
+                    ON observations(candidate_id, timestamp);
                 CREATE TABLE IF NOT EXISTS appearance_requests (
                     request_id TEXT PRIMARY KEY,
                     identity_id TEXT NOT NULL,
@@ -147,6 +176,8 @@ class SqliteStore:
                     expires_at REAL NOT NULL,
                     status TEXT NOT NULL,
                     response_event_id TEXT,
+                    camera_id TEXT,
+                    track_id TEXT,
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE IF NOT EXISTS evidence (
@@ -163,6 +194,59 @@ class SqliteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_evidence_candidate
                     ON evidence(candidate_id, created_at);
+                CREATE TABLE IF NOT EXISTS automation_gait_events (
+                    candidate_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    vector BLOB NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    stability REAL NOT NULL,
+                    model_version TEXT NOT NULL,
+                    feature_schema TEXT NOT NULL,
+                    calibration_version TEXT NOT NULL DEFAULT 'heuristic-default-v1',
+                    artifact_sha256 TEXT NOT NULL DEFAULT 'unverified',
+                    preprocess_version TEXT NOT NULL DEFAULT 'unversioned-v1',
+                    joint_format TEXT NOT NULL DEFAULT 'unknown',
+                    sequence_length INTEGER,
+                    tta_mode TEXT NOT NULL DEFAULT 'unknown',
+                    coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_dimensions_json TEXT NOT NULL DEFAULT '{}',
+                    camera_id TEXT NOT NULL DEFAULT 'unknown-camera',
+                    capture_session_id TEXT NOT NULL DEFAULT 'unknown-session',
+                    start_timestamp REAL,
+                    end_timestamp REAL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(candidate_id, event_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_automation_gait_events_candidate
+                    ON automation_gait_events(candidate_id, created_at);
+                CREATE TABLE IF NOT EXISTS gait_enrollment_events (
+                    identity_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    camera_id TEXT NOT NULL,
+                    capture_session_id TEXT NOT NULL,
+                    track_id TEXT NOT NULL,
+                    vector BLOB NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    stability REAL NOT NULL,
+                    quality REAL NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    view_angle TEXT,
+                    created_at REAL NOT NULL,
+                    model_version TEXT NOT NULL DEFAULT 'unconfigured',
+                    feature_schema TEXT NOT NULL DEFAULT 'unconfigured-v1',
+                    calibration_version TEXT NOT NULL DEFAULT 'heuristic-default-v1',
+                    artifact_sha256 TEXT NOT NULL DEFAULT 'unverified',
+                    preprocess_version TEXT NOT NULL DEFAULT 'unversioned-v1',
+                    joint_format TEXT NOT NULL DEFAULT 'unknown',
+                    sequence_length INTEGER,
+                    tta_mode TEXT NOT NULL DEFAULT 'unknown',
+                    coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_dimensions_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY(identity_id, event_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_gait_enrollment_events_identity
+                    ON gait_enrollment_events(identity_id, created_at);
                 CREATE TABLE IF NOT EXISTS snapshots (
                     snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     identity_id TEXT NOT NULL,
@@ -182,6 +266,71 @@ class SqliteStore:
             self._ensure_column(
                 "observations", "appearance_request_id", "TEXT"
             )
+            self._ensure_column(
+                "prototypes", "model_version", "TEXT NOT NULL DEFAULT 'unconfigured'"
+            )
+            self._ensure_column(
+                "prototypes", "feature_schema", "TEXT NOT NULL DEFAULT 'unconfigured-v1'"
+            )
+            for column, definition in (
+                ("artifact_sha256", "TEXT NOT NULL DEFAULT 'unverified'"),
+                ("preprocess_version", "TEXT NOT NULL DEFAULT 'unversioned-v1'"),
+                ("joint_format", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("sequence_length", "INTEGER"),
+                ("tta_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("coordinate_contract", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("embedding_dimensions_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                self._ensure_column("prototypes", column, definition)
+            self._ensure_column(
+                "observations", "feature_schema", "TEXT NOT NULL DEFAULT 'unconfigured-v1'"
+            )
+            self._ensure_column(
+                "observations", "calibration_version", "TEXT NOT NULL DEFAULT 'heuristic-default-v1'"
+            )
+            for column, definition in (
+                ("artifact_sha256", "TEXT NOT NULL DEFAULT 'unverified'"),
+                ("preprocess_version", "TEXT NOT NULL DEFAULT 'unversioned-v1'"),
+                ("joint_format", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("sequence_length", "INTEGER"),
+                ("tta_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("coordinate_contract", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("embedding_dimensions_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                self._ensure_column("observations", column, definition)
+            self._ensure_column("appearance_requests", "camera_id", "TEXT")
+            self._ensure_column("appearance_requests", "track_id", "TEXT")
+            for column, definition in (
+                ("calibration_version", "TEXT NOT NULL DEFAULT 'heuristic-default-v1'"),
+                ("artifact_sha256", "TEXT NOT NULL DEFAULT 'unverified'"),
+                ("preprocess_version", "TEXT NOT NULL DEFAULT 'unversioned-v1'"),
+                ("joint_format", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("sequence_length", "INTEGER"),
+                ("tta_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("coordinate_contract", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("embedding_dimensions_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                self._ensure_column("automation_gait_events", column, definition)
+            for column, definition in (
+                ("camera_id", "TEXT NOT NULL DEFAULT 'unknown-camera'"),
+                ("capture_session_id", "TEXT NOT NULL DEFAULT 'unknown-session'"),
+                ("start_timestamp", "REAL"),
+                ("end_timestamp", "REAL"),
+            ):
+                self._ensure_column("automation_gait_events", column, definition)
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)",
+                (time.time(),),
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?)",
+                (time.time(),),
+            )
+            self.connection.execute("PRAGMA user_version = 3")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         """为旧版本数据库执行小型增量迁移。"""
@@ -231,6 +380,31 @@ class SqliteStore:
         """所有工作线程停止后关闭 SQLite 连接。"""
         with self._lock:
             self.connection.close()
+
+    def backup_to(self, path: str) -> None:
+        """将当前数据库一致地复制到另一个 SQLite 文件。"""
+
+        with self._lock, sqlite3.connect(path) as target:
+            self.connection.backup(target)
+
+    def clear_all_data(self) -> None:
+        """清除身份图库及其运行证据，但保留数据库 schema。"""
+
+        tables = (
+            "identities",
+            "candidates",
+            "prototypes",
+            "observations",
+            "appearance_requests",
+            "evidence",
+            "automation_gait_events",
+            "gait_enrollment_events",
+            "snapshots",
+            "audit_log",
+        )
+        with self._lock, self.connection:
+            for table in tables:
+                self.connection.execute(f"DELETE FROM {table}")
 
     def upsert_identity(
         self,
@@ -358,12 +532,44 @@ class SqliteStore:
                 blob, dimension = _pack_vector(prototype.vector)
                 if blob is None or dimension is None:
                     continue
+                expected_dimension = dict(prototype.embedding_dimensions).get(
+                    prototype.modality
+                )
+                if expected_dimension is not None and int(expected_dimension) != int(dimension):
+                    raise ValueError(
+                        "prototype dimension does not satisfy its embedding contract: "
+                        f"{prototype.modality}={dimension}, expected={expected_dimension}"
+                    )
                 self.connection.execute(
                     """
-                    INSERT OR REPLACE INTO prototypes(
+                    INSERT INTO prototypes(
                         prototype_id,identity_id,zone,modality,vector,dimension,quality,
-                        camera_id,view_angle,clothing_tag,source_event_id,created_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        camera_id,view_angle,clothing_tag,source_event_id,created_at,
+                        model_version,feature_schema,artifact_sha256,preprocess_version,
+                        joint_format,sequence_length,tta_mode,coordinate_contract,
+                        embedding_dimensions_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(prototype_id) DO UPDATE SET
+                        identity_id=excluded.identity_id,
+                        zone=excluded.zone,
+                        modality=excluded.modality,
+                        vector=excluded.vector,
+                        dimension=excluded.dimension,
+                        quality=excluded.quality,
+                        camera_id=excluded.camera_id,
+                        view_angle=excluded.view_angle,
+                        clothing_tag=excluded.clothing_tag,
+                        source_event_id=excluded.source_event_id,
+                        created_at=excluded.created_at,
+                        model_version=excluded.model_version,
+                        feature_schema=excluded.feature_schema,
+                        artifact_sha256=excluded.artifact_sha256,
+                        preprocess_version=excluded.preprocess_version,
+                        joint_format=excluded.joint_format,
+                        sequence_length=excluded.sequence_length,
+                        tta_mode=excluded.tta_mode,
+                        coordinate_contract=excluded.coordinate_contract,
+                        embedding_dimensions_json=excluded.embedding_dimensions_json
                     """,
                     (
                         prototype.prototype_id,
@@ -378,6 +584,15 @@ class SqliteStore:
                         prototype.clothing_tag,
                         prototype.source_event_id,
                         prototype.created_at,
+                        prototype.model_version,
+                        prototype.feature_schema,
+                        prototype.artifact_sha256,
+                        prototype.preprocess_version,
+                        prototype.joint_format,
+                        prototype.sequence_length,
+                        prototype.tta_mode,
+                        prototype.coordinate_contract,
+                        json.dumps(dict(prototype.embedding_dimensions), ensure_ascii=False),
                     ),
                 )
 
@@ -403,6 +618,21 @@ class SqliteStore:
                     source_event_id=row["source_event_id"],
                     prototype_id=row["prototype_id"],
                     created_at=float(row["created_at"]),
+                    model_version=row["model_version"],
+                    feature_schema=row["feature_schema"],
+                    artifact_sha256=row["artifact_sha256"],
+                    preprocess_version=row["preprocess_version"],
+                    joint_format=row["joint_format"],
+                    sequence_length=(
+                        int(row["sequence_length"])
+                        if row["sequence_length"] is not None
+                        else None
+                    ),
+                    tta_mode=row["tta_mode"],
+                    coordinate_contract=row["coordinate_contract"],
+                    embedding_dimensions=dict(
+                        json.loads(row["embedding_dimensions_json"] or "{}")
+                    ),
                 )
             )
         return result
@@ -412,6 +642,21 @@ class SqliteStore:
         normalized = observation.normalized()
         appearance, appearance_dimension = _pack_vector(normalized.features.appearance)
         gait, gait_dimension = _pack_vector(normalized.features.gait)
+        declared_dimensions = dict(normalized.embedding_dimensions)
+        for modality, actual_dimension in (
+            ("appearance", appearance_dimension),
+            ("gait", gait_dimension),
+        ):
+            expected_dimension = declared_dimensions.get(modality)
+            if (
+                actual_dimension is not None
+                and expected_dimension is not None
+                and int(actual_dimension) != int(expected_dimension)
+            ):
+                raise ValueError(
+                    "observation dimension does not satisfy embedding contract: "
+                    f"{modality}={actual_dimension}, expected={expected_dimension}"
+                )
         quality_json = json.dumps(asdict(normalized.quality), ensure_ascii=False, default=_json_default)
         with self._write_scope():
             self.connection.execute(
@@ -420,8 +665,11 @@ class SqliteStore:
                     event_id,candidate_id,camera_id,capture_session_id,track_id,timestamp,
                     end_timestamp,appearance,appearance_dimension,gait,gait_dimension,
                     quality_json,model_version,threshold_version,source_event_json,
-                    challenge_id,challenge_response_json,appearance_request_id,metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    feature_schema,calibration_version,challenge_id,challenge_response_json,
+                    appearance_request_id,metadata_json,artifact_sha256,preprocess_version,
+                    joint_format,sequence_length,tta_mode,coordinate_contract,
+                    embedding_dimensions_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     normalized.event_id,
@@ -439,10 +687,19 @@ class SqliteStore:
                     normalized.model_version,
                     normalized.threshold_version,
                     json.dumps(normalized.source_event_ids, ensure_ascii=False),
+                    normalized.feature_schema,
+                    normalized.calibration_version,
                     normalized.challenge_id,
                     json.dumps(normalized.challenge_response, ensure_ascii=False, default=_json_default),
                     normalized.appearance_request_id,
                     json.dumps(normalized.metadata, ensure_ascii=False, default=_json_default),
+                    normalized.artifact_sha256,
+                    normalized.preprocess_version,
+                    normalized.joint_format,
+                    normalized.sequence_length,
+                    normalized.tta_mode,
+                    normalized.coordinate_contract,
+                    json.dumps(dict(normalized.embedding_dimensions), ensure_ascii=False),
                 ),
             )
 
@@ -451,11 +708,24 @@ class SqliteStore:
         with self._write_scope():
             self.connection.execute(
                 """
-                INSERT OR REPLACE INTO appearance_requests(
+                INSERT INTO appearance_requests(
                     request_id,identity_id,issued_by_event_id,candidate_id,
                     gait_probability,gait_quality,issued_at,expires_at,status,
-                    response_event_id,metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    response_event_id,camera_id,track_id,metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    identity_id=excluded.identity_id,
+                    issued_by_event_id=excluded.issued_by_event_id,
+                    candidate_id=excluded.candidate_id,
+                    gait_probability=excluded.gait_probability,
+                    gait_quality=excluded.gait_quality,
+                    issued_at=excluded.issued_at,
+                    expires_at=excluded.expires_at,
+                    status=excluded.status,
+                    response_event_id=excluded.response_event_id,
+                    camera_id=excluded.camera_id,
+                    track_id=excluded.track_id,
+                    metadata_json=excluded.metadata_json
                 """,
                 (
                     request.request_id,
@@ -468,6 +738,8 @@ class SqliteStore:
                     request.expires_at,
                     request.status,
                     request.response_event_id,
+                    request.camera_id,
+                    request.track_id,
                     json.dumps(request.metadata, ensure_ascii=False, default=_json_default),
                 ),
             )
@@ -486,6 +758,8 @@ class SqliteStore:
             expires_at=float(row["expires_at"]),
             status=row["status"],
             response_event_id=row["response_event_id"],
+            camera_id=row["camera_id"],
+            track_id=row["track_id"],
             metadata=dict(json.loads(row["metadata_json"])),
         )
 
@@ -533,6 +807,259 @@ class SqliteStore:
                 ),
             )
 
+    def save_gait_event_proposal(
+        self,
+        *,
+        candidate_id: str,
+        event_key: str,
+        vector: np.ndarray,
+        stability: float,
+        model_version: str,
+        feature_schema: str,
+        calibration_version: str = "heuristic-default-v1",
+        artifact_sha256: str = "unverified",
+        preprocess_version: str = "unversioned-v1",
+        joint_format: str = "unknown",
+        sequence_length: int | None = None,
+        tta_mode: str = "unknown",
+        coordinate_contract: str = "unknown",
+        embedding_dimensions: dict[str, int] | None = None,
+        camera_id: str = "unknown-camera",
+        capture_session_id: str = "unknown-session",
+        start_timestamp: float | None = None,
+        end_timestamp: float | None = None,
+        created_at: float | None = None,
+    ) -> None:
+        """持久化一个跨会话自动建号事件，重复事件键只保留首次证据。"""
+
+        packed, dimension = _pack_vector(vector)
+        if packed is None or dimension is None:
+            raise ValueError("gait event proposal vector must be finite and non-zero")
+        expected_dimension = dict(embedding_dimensions or {}).get("gait")
+        if expected_dimension is not None and int(expected_dimension) != int(dimension):
+            raise ValueError(
+                "gait event proposal dimension does not satisfy embedding contract: "
+                f"gait={dimension}, expected={expected_dimension}"
+            )
+        with self._write_scope():
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO automation_gait_events(
+                    candidate_id,event_key,vector,dimension,stability,
+                    model_version,feature_schema,calibration_version,
+                    artifact_sha256,preprocess_version,
+                    joint_format,sequence_length,tta_mode,coordinate_contract,
+                    embedding_dimensions_json,camera_id,capture_session_id,
+                    start_timestamp,end_timestamp,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    candidate_id,
+                    event_key,
+                    sqlite3.Binary(packed),
+                    dimension,
+                    float(stability),
+                    model_version,
+                    feature_schema,
+                    calibration_version,
+                    artifact_sha256,
+                    preprocess_version,
+                    joint_format,
+                    sequence_length,
+                    tta_mode,
+                    coordinate_contract,
+                    json.dumps(dict(embedding_dimensions or {}), ensure_ascii=False),
+                    camera_id,
+                    capture_session_id,
+                    start_timestamp,
+                    end_timestamp,
+                    time.time() if created_at is None else float(created_at),
+                ),
+            )
+
+    def load_gait_event_proposals(
+        self,
+        candidate_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """加载跨重启自动建号事件提案。"""
+
+        with self._lock:
+            if candidate_id is None:
+                rows = self.connection.execute(
+                    "SELECT * FROM automation_gait_events ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """
+                    SELECT * FROM automation_gait_events
+                    WHERE candidate_id=? ORDER BY created_at
+                    """,
+                    (candidate_id,),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            vector = _unpack_vector(row["vector"], row["dimension"])
+            if vector is None:
+                continue
+            result.append(
+                {
+                    "candidate_id": row["candidate_id"],
+                    "event_key": row["event_key"],
+                    "vector": vector,
+                    "stability": float(row["stability"]),
+                    "model_version": row["model_version"],
+                    "feature_schema": row["feature_schema"],
+                    "calibration_version": row["calibration_version"],
+                    "artifact_sha256": row["artifact_sha256"],
+                    "preprocess_version": row["preprocess_version"],
+                    "joint_format": row["joint_format"],
+                    "sequence_length": row["sequence_length"],
+                    "tta_mode": row["tta_mode"],
+                    "coordinate_contract": row["coordinate_contract"],
+                    "embedding_dimensions": dict(
+                        json.loads(row["embedding_dimensions_json"] or "{}")
+                    ),
+                    "camera_id": row["camera_id"],
+                    "capture_session_id": row["capture_session_id"],
+                    "start_timestamp": row["start_timestamp"],
+                    "end_timestamp": row["end_timestamp"],
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return result
+
+    def delete_gait_event_proposals(self, candidate_id: str) -> None:
+        """删除候选人已消费或明确作废的跨会话步态事件。"""
+
+        with self._write_scope():
+            self.connection.execute(
+                "DELETE FROM automation_gait_events WHERE candidate_id=?",
+                (candidate_id,),
+            )
+
+    def save_gait_enrollment_event(
+        self,
+        event: GaitEnrollmentEvent,
+        *,
+        replace_existing: bool = False,
+    ) -> bool:
+        """保存事件；同一事件可更新代表向量，但不会增加事件数量。"""
+
+        packed, dimension = _pack_vector(event.vector)
+        if packed is None or dimension is None:
+            raise ValueError("gait enrollment event vector must be finite and non-zero")
+        expected_dimension = dict(event.embedding_dimensions).get("gait")
+        if expected_dimension is not None and int(expected_dimension) != int(dimension):
+            raise ValueError(
+                "gait enrollment event dimension does not satisfy embedding contract"
+            )
+        with self._write_scope():
+            operation = "INSERT OR REPLACE" if replace_existing else "INSERT OR IGNORE"
+            cursor = self.connection.execute(
+                f"""
+                {operation} INTO gait_enrollment_events(
+                    identity_id,event_key,event_id,camera_id,capture_session_id,track_id,
+                    vector,dimension,stability,quality,sample_count,view_angle,created_at,
+                    model_version,feature_schema,calibration_version,artifact_sha256,
+                    preprocess_version,joint_format,sequence_length,tta_mode,
+                    coordinate_contract,embedding_dimensions_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event.identity_id,
+                    event.event_key,
+                    event.event_id,
+                    event.camera_id,
+                    event.capture_session_id,
+                    event.track_id,
+                    sqlite3.Binary(packed),
+                    dimension,
+                    float(event.stability),
+                    float(event.quality),
+                    int(event.sample_count),
+                    event.view_angle,
+                    float(event.created_at),
+                    event.model_version,
+                    event.feature_schema,
+                    event.calibration_version,
+                    event.artifact_sha256,
+                    event.preprocess_version,
+                    event.joint_format,
+                    event.sequence_length,
+                    event.tta_mode,
+                    event.coordinate_contract,
+                    json.dumps(dict(event.embedding_dimensions), ensure_ascii=False),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def load_gait_enrollment_events(
+        self,
+        identity_id: str | None = None,
+    ) -> list[GaitEnrollmentEvent]:
+        """恢复视觉身份下已接受的独立步态事件。"""
+
+        with self._lock:
+            if identity_id is None:
+                rows = self.connection.execute(
+                    "SELECT * FROM gait_enrollment_events ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """
+                    SELECT * FROM gait_enrollment_events
+                    WHERE identity_id=? ORDER BY created_at
+                    """,
+                    (identity_id,),
+                ).fetchall()
+        events: list[GaitEnrollmentEvent] = []
+        for row in rows:
+            vector = _unpack_vector(row["vector"], row["dimension"])
+            if vector is None:
+                continue
+            events.append(
+                GaitEnrollmentEvent(
+                    identity_id=row["identity_id"],
+                    event_key=row["event_key"],
+                    event_id=row["event_id"],
+                    camera_id=row["camera_id"],
+                    capture_session_id=row["capture_session_id"],
+                    track_id=row["track_id"],
+                    vector=vector,
+                    stability=float(row["stability"]),
+                    quality=float(row["quality"]),
+                    sample_count=int(row["sample_count"]),
+                    view_angle=row["view_angle"],
+                    created_at=float(row["created_at"]),
+                    model_version=row["model_version"],
+                    feature_schema=row["feature_schema"],
+                    calibration_version=row["calibration_version"],
+                    artifact_sha256=row["artifact_sha256"],
+                    preprocess_version=row["preprocess_version"],
+                    joint_format=row["joint_format"],
+                    sequence_length=(
+                        int(row["sequence_length"])
+                        if row["sequence_length"] is not None
+                        else None
+                    ),
+                    tta_mode=row["tta_mode"],
+                    coordinate_contract=row["coordinate_contract"],
+                    embedding_dimensions=dict(
+                        json.loads(row["embedding_dimensions_json"] or "{}")
+                    ),
+                )
+            )
+        return events
+
+    def delete_gait_enrollment_events(self, identity_id: str) -> None:
+        """显式删除一个视觉身份的步态事件记录。"""
+
+        with self._write_scope():
+            self.connection.execute(
+                "DELETE FROM gait_enrollment_events WHERE identity_id=?",
+                (identity_id,),
+            )
+
     def list_evidence(self, candidate_id: str) -> list[dict[str, Any]]:
         """返回候选证据行，并将载荷解码为字典。"""
         with self._lock:
@@ -575,6 +1102,21 @@ class SqliteStore:
                     ),
                     quality=quality,
                     model_version=row["model_version"],
+                    feature_schema=row["feature_schema"],
+                    artifact_sha256=row["artifact_sha256"],
+                    preprocess_version=row["preprocess_version"],
+                    joint_format=row["joint_format"],
+                    sequence_length=(
+                        int(row["sequence_length"])
+                        if row["sequence_length"] is not None
+                        else None
+                    ),
+                    tta_mode=row["tta_mode"],
+                    coordinate_contract=row["coordinate_contract"],
+                    embedding_dimensions=dict(
+                        json.loads(row["embedding_dimensions_json"] or "{}")
+                    ),
+                    calibration_version=row["calibration_version"],
                     threshold_version=row["threshold_version"],
                     source_event_ids=tuple(json.loads(row["source_event_json"])),
                     challenge_id=row["challenge_id"],
@@ -603,6 +1145,15 @@ class SqliteStore:
                     "source_event_id": prototype.source_event_id,
                     "prototype_id": prototype.prototype_id,
                     "created_at": prototype.created_at,
+                    "model_version": prototype.model_version,
+                    "feature_schema": prototype.feature_schema,
+                    "artifact_sha256": prototype.artifact_sha256,
+                    "preprocess_version": prototype.preprocess_version,
+                    "joint_format": prototype.joint_format,
+                    "sequence_length": prototype.sequence_length,
+                    "tta_mode": prototype.tta_mode,
+                    "coordinate_contract": prototype.coordinate_contract,
+                    "embedding_dimensions": dict(prototype.embedding_dimensions),
                 }
             )
         with self._write_scope():
@@ -640,6 +1191,15 @@ class SqliteStore:
                     source_event_id=value.get("source_event_id"),
                     prototype_id=value["prototype_id"],
                     created_at=float(value["created_at"]),
+                    model_version=value.get("model_version", "unconfigured"),
+                    feature_schema=value.get("feature_schema", "unconfigured-v1"),
+                    artifact_sha256=value.get("artifact_sha256", "unverified"),
+                    preprocess_version=value.get("preprocess_version", "unversioned-v1"),
+                    joint_format=value.get("joint_format", "unknown"),
+                    sequence_length=value.get("sequence_length"),
+                    tta_mode=value.get("tta_mode", "unknown"),
+                    coordinate_contract=value.get("coordinate_contract", "unknown"),
+                    embedding_dimensions=dict(value.get("embedding_dimensions", {})),
                 )
             )
         with self._write_scope():

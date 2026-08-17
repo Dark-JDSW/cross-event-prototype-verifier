@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import time
 from typing import Sequence
 
 import cv2
@@ -66,12 +67,14 @@ class ProductionVisionConfig:
     keypoint_confidence: float = 0.45
     minimum_pose_frames: int = 25
     gait_sequence_length: int = 60
-    detector_inference_stride: int = 2
+    detector_inference_stride: int = 1
     appearance_stride: int = 6
     gait_inference_stride: int = 3
     low_light_threshold: float = 100.0
     low_light_check_interval: int = 12
     state_retention_frames: int = 90
+    state_retention_seconds: float = 3.0
+    maximum_track_gap_seconds: float = 1.5
     device: str | None = None
     # 生产推理有意采用“失败即关闭”策略。任何一个分支回退到 CPU，都会让实时
     # 管线表面看起来正常，却悄悄破坏吞吐量并使预期部署配置失效。
@@ -90,6 +93,8 @@ class ProductionVisionConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.output_confidence < self.detector_confidence:
             raise ValueError("output_confidence cannot be below detector_confidence")
+        if self.maximum_people < 1:
+            raise ValueError("maximum_people must be positive")
         if self.minimum_pose_frames < 8:
             raise ValueError("minimum_pose_frames must be at least 8")
         if self.gait_sequence_length < self.minimum_pose_frames:
@@ -100,6 +105,12 @@ class ProductionVisionConfig:
             raise ValueError("appearance_stride must be at least 1")
         if self.gait_inference_stride < 1:
             raise ValueError("gait_inference_stride must be at least 1")
+        if self.state_retention_seconds <= 0 or self.maximum_track_gap_seconds <= 0:
+            raise ValueError("track retention/gap seconds must be positive")
+        if self.maximum_track_gap_seconds >= self.state_retention_seconds:
+            raise ValueError(
+                "maximum_track_gap_seconds must be shorter than state_retention_seconds"
+            )
         if self.require_cuda and self.torch_device.lower().startswith("cpu"):
             raise ValueError("生产视觉链路 require_cuda=True 时不能把 device 设为 CPU")
 
@@ -144,6 +155,23 @@ def production_readiness(
     for module in ("torch", "ultralytics", "onnxruntime"):
         if importlib.util.find_spec(module) is None:
             issues.append(f"缺少 Python 依赖：{module}")
+    if importlib.util.find_spec("ultralytics") is not None and MODEL_MANIFEST.is_file():
+        try:
+            runtime_contract = json.loads(
+                MODEL_MANIFEST.read_text(encoding="utf-8")
+            ).get("runtime_contract", {})
+            expected_ultralytics = runtime_contract.get("ultralytics")
+            if expected_ultralytics:
+                import ultralytics
+
+                actual_ultralytics = str(getattr(ultralytics, "__version__", "unknown"))
+                if actual_ultralytics != str(expected_ultralytics):
+                    issues.append(
+                        "Ultralytics 运行时版本与模型清单不符："
+                        f"expected={expected_ultralytics}, actual={actual_ultralytics}"
+                    )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            issues.append(f"运行时模型契约无效：{error}")
     if cfg.require_cuda:
         try:
             import torch
@@ -265,6 +293,7 @@ class _YoloByteTracker:
             raise ProductionVisionError("YOLO/ByteTrack 生产模式不允许使用 CPU device")
         self.half = self.device.lower() not in {"cpu", "-1"} and torch.cuda.is_available()
         self.model = YOLO(str(config.detector_path))
+        self.overflowed = False
 
     def track(self, frame: np.ndarray) -> tuple[_Detection, ...]:
         """仅跟踪人物，并返回裁剪且通过置信度门控的检测框。"""
@@ -279,16 +308,23 @@ class _YoloByteTracker:
                 imgsz=self.config.image_size,
                 half=self.half,
                 device=self.device,
-                max_det=self.config.maximum_people,
+                # Ask for one extra result so a crowded frame is observable
+                # instead of silently looking like an ordinary 16-person frame.
+                max_det=self.config.maximum_people + 1,
                 verbose=False,
             )
         except Exception as error:
             raise ProductionVisionError(f"YOLO/ByteTrack 推理失败：{error}") from error
         if not results or results[0].boxes is None or results[0].boxes.id is None:
+            self.overflowed = False
             return ()
         boxes = results[0].boxes.xyxy.detach().cpu().numpy()
+        self.overflowed = len(boxes) > self.config.maximum_people
+        boxes = boxes[: self.config.maximum_people]
         ids = results[0].boxes.id.detach().cpu().numpy()
+        ids = ids[: self.config.maximum_people]
         confidences = results[0].boxes.conf.detach().cpu().numpy()
+        confidences = confidences[: self.config.maximum_people]
         height, width = frame.shape[:2]
         output: list[_Detection] = []
         for raw_box, raw_id, raw_confidence in zip(boxes, ids, confidences):
@@ -341,9 +377,12 @@ class _RtmposeEstimator:
                     "RTMPose 生产模式要求 CUDAExecutionProvider，"
                     f"当前可用后端：{available}"
                 )
-            # 不要注册 CPU/DML 回退 provider。如果 CUDA 包损坏，启动必须失败，
-            # 而不是悄悄在 CPU 上运行姿态推理。
+            # CUDA 负责主图，CPU 作为明确的图分区回退以承接少量 shape/layout
+            # 辅助节点。provider 列表本身不代表每个节点的位置，启动诊断会
+            # 同时记录实际 provider 配置和端到端延迟。
             providers = [("CUDAExecutionProvider", {"device_id": 0})]
+            if "CPUExecutionProvider" in available:
+                providers.append("CPUExecutionProvider")
         else:
             providers = [
                 provider
@@ -365,10 +404,10 @@ class _RtmposeEstimator:
             sess_options=options,
             providers=providers,
         )
-        if require_cuda and hasattr(self.session, "disable_fallback"):
-            self.session.disable_fallback()
         self.input_name = self.session.get_inputs()[0].name
         self.providers = tuple(self.session.get_providers())
+        self.provider_options = dict(self.session.get_provider_options())
+        self.last_latency_ms = 0.0
 
     @classmethod
     def _crop(
@@ -436,18 +475,14 @@ class _RtmposeEstimator:
             rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32)
             rgb = (rgb - self._MEAN) / self._STD
             batch[index] = rgb.transpose(2, 0, 1)
+        started = time.perf_counter()
         try:
             simcc_x, simcc_y = self.session.run(None, {self.input_name: batch})
         except Exception as error:
             raise ProductionVisionError(f"RTMPose 推理失败：{error}") from error
+        self.last_latency_ms = (time.perf_counter() - started) * 1000.0
         simcc_x, simcc_y = simcc_x[:count], simcc_y[:count]
-        positions_x = simcc_x.argmax(2) / self._SIMCC_SPLIT
-        positions_y = simcc_y.argmax(2) / self._SIMCC_SPLIT
-        confidence = np.clip(
-            (simcc_x.max(2) + simcc_y.max(2)) * 0.5,
-            0.0,
-            1.0,
-        )
+        positions_x, positions_y, confidence = self._decode_simcc(simcc_x, simcc_y)
         for row, destination_index in enumerate(indexes):
             (center_x, center_y), (width, height) = metadata[row]
             points = np.stack(
@@ -461,9 +496,27 @@ class _RtmposeEstimator:
             output[destination_index] = points
         return output
 
+    @classmethod
+    def _decode_simcc(
+        cls,
+        simcc_x: np.ndarray,
+        simcc_y: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """按 MMPose ``get_simcc_maximum`` 语义解码坐标和置信度。
+
+        SimCC 的关键点置信度是两个轴峰值中较小的一个。取平均会在一个轴
+        明显不可靠时抬高分数，进而错误地通过关键点/下肢质量门。
+        """
+
+        positions_x = simcc_x.argmax(2) / cls._SIMCC_SPLIT
+        positions_y = simcc_y.argmax(2) / cls._SIMCC_SPLIT
+        confidence = np.minimum(simcc_x.max(2), simcc_y.max(2))
+        return positions_x, positions_y, np.clip(confidence, 0.0, 1.0)
+
 
 class _OsnetAppearanceExtractor:
     """批量处理 OSNet-AIN 裁剪图，并返回 L2 归一化外观向量。"""
+    output_dimension = 512
     def __init__(self, path: Path, device: str | None) -> None:
         """在选定的 Torch 设备上加载一次 OSNet-AIN。"""
         try:
@@ -527,7 +580,14 @@ class _TrackState:
     frame_count: int = 0
     last_seen_frame: int = 0
     poses: deque[np.ndarray] = field(default_factory=deque)
+    timestamps: deque[float] = field(default_factory=deque)
     boxes: deque[Box] = field(default_factory=lambda: deque(maxlen=20))
+    valid_pose_frames: int = 0
+    valid_leg_frames: int = 0
+    detector_gap_frames: int = 0
+    track_gap_frames: int = 0
+    last_seen_timestamp: float | None = None
+    last_valid_timestamp: float | None = None
     appearance: np.ndarray | None = None
     last_appearance_frame: int | None = None
     gait: np.ndarray | None = None
@@ -559,6 +619,8 @@ def _canonical_pose(
     points = np.asarray(keypoints, dtype=np.float32).copy()
     valid = np.isfinite(points).all(axis=1) & (points[:, 2] >= confidence_floor)
     points[~valid] = 0.0
+    if not bool(valid.any()):
+        return None
     # Do not clip valid coordinates to the box. GREW stores raw image-space
     # coordinates, and a detector/pose mismatch should be handled by quality
     # gates rather than silently changing the model's coordinate distribution.
@@ -584,6 +646,7 @@ def _pose_visibility(points: np.ndarray | None, floor: float) -> tuple[float, fl
 def _walking_metrics(
     poses: Sequence[np.ndarray],
     box: Box | None = None,
+    timestamps: Sequence[float] | None = None,
 ) -> tuple[float, float]:
     """根据下肢相位估计运动能量和步态周期数。"""
     if len(poses) < 8:
@@ -607,6 +670,17 @@ def _walking_metrics(
     valid_lower = confidence[:, [13, 14, 15, 16]] > 0
     deltas = np.linalg.norm(np.diff(lower, axis=0), axis=2)
     delta_valid = valid_lower[1:] & valid_lower[:-1]
+    if timestamps is not None and len(timestamps) == len(values):
+        times = np.asarray(timestamps, dtype=np.float64)
+        deltas_time = np.diff(times)
+        positive = deltas_time[deltas_time > 1e-6]
+        if positive.size:
+            nominal = float(np.median(positive))
+            # Preserve the observed time base: do not turn a detector/track
+            # gap into a single high-speed gait step.
+            scale = np.clip(deltas_time / max(nominal, 1e-6), 1.0, 8.0)
+            deltas = deltas / scale[:, None]
+            delta_valid &= (deltas_time <= nominal * 2.5)[:, None]
     energy = float(deltas[delta_valid].mean()) if delta_valid.any() else 0.0
     walking_ratio = float(np.clip((energy - 0.003) / 0.025, 0.0, 1.0))
 
@@ -691,6 +765,35 @@ class ProductionVisionAdapter:
     # database produced by the old bbox-normalized path must not be reused as
     # if its gait prototypes were comparable to this stream.
     model_version = "yolo11l-bytetrack+rtmpose-s+osnet-ain+gaitgraph2-grew-opengait-input-v2"
+    feature_schema = (
+        "osnet-ain-512-imagenet-v1|"
+        "gaitgraph2-grew-coco17-raw-full-frame-t60-tta3-v2"
+    )
+    preprocess_version = "rtmpose-s-256x192-simcc2|opengait-coco17-raw-t60-tta3-v2"
+    joint_format = "COCO-17"
+    tta_mode = "original+temporal-reverse+horizontal-flip"
+    coordinate_contract = "raw-full-frame-image-coordinates"
+    embedding_dimensions = {"appearance": 512, "gait": 384}
+
+    @property
+    def artifact_sha256(self) -> str:
+        """返回模型清单的稳定指纹，作为图库协议的一部分。
+
+        启动时 ``production_readiness(..., verify_hashes=True)`` 校验真实
+        文件；这里保存清单内容的摘要，避免每一帧重新读取大权重。
+        """
+        if not MODEL_MANIFEST.is_file():
+            return "manifest-missing"
+        try:
+            payload = MODEL_MANIFEST.read_bytes()
+            return hashlib.sha256(payload).hexdigest()
+        except OSError:
+            return "manifest-unreadable"
+
+    @property
+    def sequence_length(self) -> int:
+        """返回当前 GaitGraph2 窗口长度。"""
+        return int(self.config.gait_sequence_length)
     _RUNTIME_PARAMETER_NAMES = (
         "detector_confidence",
         "output_confidence",
@@ -706,7 +809,7 @@ class ProductionVisionAdapter:
     def __init__(self, config: ProductionVisionConfig | None = None) -> None:
         """校验就绪状态，并准备延迟加载的模型槽位。"""
         self.config = config or ProductionVisionConfig()
-        ready, issues = production_readiness(self.config)
+        ready, issues = production_readiness(self.config, verify_hashes=True)
         if not ready:
             raise ProductionVisionError("；".join(issues))
         self.detector: _YoloByteTracker | None = None
@@ -723,6 +826,16 @@ class ProductionVisionAdapter:
         self._cached_detections: tuple[_Detection, ...] = ()
         self._last_detector_frame: int | None = None
         self._detector_refreshed_this_frame = False
+        self._current_timestamp: float | None = None
+        self._last_frame_latency_ms = 0.0
+        self._frame_latency_samples_ms: deque[float] = deque(maxlen=120)
+
+    def _record_frame_latency(self, started: float) -> None:
+        """记录最近端到端帧处理耗时，供启动/运行诊断使用。"""
+
+        elapsed = (time.perf_counter() - started) * 1000.0
+        self._last_frame_latency_ms = elapsed
+        self._frame_latency_samples_ms.append(elapsed)
 
     def _load(self) -> None:
         """只加载一次检测、姿态、外观和步态模型。"""
@@ -744,6 +857,16 @@ class ProductionVisionAdapter:
                 sequence_length=self.config.gait_sequence_length,
                 use_tta=True,
             )
+            gait_dimension = getattr(self.gait, "output_dimension", None)
+            if gait_dimension is not None and gait_dimension != 384:
+                raise ProductionVisionError(
+                    "GaitGraph2 production contract requires a 384-dimensional TTA embedding"
+                )
+            appearance_dimension = getattr(self.appearance, "output_dimension", None)
+            if appearance_dimension is not None and appearance_dimension != 512:
+                raise ProductionVisionError(
+                    "OSNet-AIN production contract requires a 512-dimensional embedding"
+                )
         except Exception:
             self.detector = None
             self.pose = None
@@ -756,8 +879,42 @@ class ProductionVisionAdapter:
         """描述已加载的后端和当前使用的 ONNX provider。"""
         if self.detector is None:
             return "生产模型将在开始采集时加载"
-        pose_backend = ",".join(self.pose.providers) if self.pose is not None else "none"
-        return f"YOLO/ByteTrack + RTMPose({pose_backend}) + OSNet-AIN + GaitGraph2"
+        pose_backend = (
+            ",".join(getattr(self.pose, "providers", ()))
+            if self.pose is not None
+            else "none"
+        )
+        pose_latency = (
+            float(getattr(self.pose, "last_latency_ms", 0.0))
+            if self.pose is not None
+            else 0.0
+        )
+        latency = (
+            f", last RTMPose {pose_latency:.1f}ms"
+            if pose_latency > 0
+            else ""
+        )
+        return f"YOLO/ByteTrack + RTMPose({pose_backend}{latency}) + OSNet-AIN + GaitGraph2"
+
+    def diagnostics(self) -> dict[str, object]:
+        """返回启动/运行诊断，明确 provider 列表不等于节点全在 GPU。"""
+        if self.pose is None:
+            return {"loaded": False, "providers": (), "node_placement": "not-observed"}
+        return {
+            "loaded": True,
+            "providers": tuple(getattr(self.pose, "providers", ())),
+            "provider_options": dict(getattr(self.pose, "provider_options", {})),
+            "last_rtmpose_latency_ms": float(
+                getattr(self.pose, "last_latency_ms", 0.0)
+            ),
+            "last_frame_latency_ms": self._last_frame_latency_ms,
+            "p95_frame_latency_ms": (
+                float(np.percentile(tuple(self._frame_latency_samples_ms), 95))
+                if self._frame_latency_samples_ms
+                else 0.0
+            ),
+            "node_placement": "ORT graph partitioning; inspect profiling for per-node placement",
+        }
 
     def runtime_parameters(self) -> dict[str, int | float]:
         """返回已加载或未加载适配器支持的热更新参数。"""
@@ -798,6 +955,9 @@ class ProductionVisionAdapter:
         if reset_gait:
             for state in self.states.values():
                 state.poses.clear()
+                state.timestamps.clear()
+                state.valid_pose_frames = 0
+                state.valid_leg_frames = 0
                 state.gait = None
                 state.last_gait_frame = None
 
@@ -812,6 +972,9 @@ class ProductionVisionAdapter:
         self._cached_detections = ()
         self._last_detector_frame = None
         self._detector_refreshed_this_frame = False
+        self._current_timestamp = None
+        self._last_frame_latency_ms = 0.0
+        self._frame_latency_samples_ms.clear()
 
     def _detections_for_frame(self, frame_bgr: np.ndarray) -> tuple[_Detection, ...]:
         """按配置刷新检测，并在中间帧复用最近一次轨迹框。
@@ -832,16 +995,87 @@ class ProductionVisionAdapter:
             assert self.detector is not None
             self._cached_detections = self.detector.track(frame_bgr)
             self._last_detector_frame = self.frame_index
-        return self._cached_detections
+            return self._cached_detections
+        # ByteTrack is stateful, but it only sees detector calls.  On skipped
+        # frames predict a short constant-velocity box from the recent track
+        # history instead of freezing the crop; this keeps pose/appearance
+        # aligned with motion while the next persisted tracker update remains
+        # authoritative.
+        delta = max(1, self.frame_index - (self._last_detector_frame or self.frame_index))
+        height, width = frame_bgr.shape[:2]
+        predicted: list[_Detection] = []
+        for detection in self._cached_detections:
+            state = self.states.get(detection.track_id)
+            box = detection.box
+            if state is not None and len(state.boxes) >= 2:
+                previous = np.asarray(state.boxes[-2], dtype=np.float32)
+                current = np.asarray(state.boxes[-1], dtype=np.float32)
+                velocity = current - previous
+                raw = current + velocity * min(delta, 2)
+                x1, y1, x2, y2 = (int(round(float(value))) for value in raw)
+                x1 = max(0, min(x1, max(width - 1, 0)))
+                y1 = max(0, min(y1, max(height - 1, 0)))
+                x2 = max(x1 + 1, min(x2, width))
+                y2 = max(y1 + 1, min(y2, height))
+                box = (x1, y1, x2, y2)
+                state.detector_gap_frames += 1
+            predicted.append(_Detection(detection.track_id, box, detection.confidence))
+        return tuple(predicted)
 
-    def _expire_states(self, active_ids: set[int]) -> None:
+    def _expire_states(
+        self,
+        active_ids: set[int],
+        *,
+        timestamp: float | None = None,
+    ) -> None:
         """删除缺席时间超过保留策略的时序状态。"""
         for track_id, state in tuple(self.states.items()):
             if track_id in active_ids:
                 continue
-            if self.frame_index - state.last_seen_frame > self.config.state_retention_frames:
+            frame_gap = self.frame_index - state.last_seen_frame
+            time_gap = (
+                float(timestamp - state.last_seen_timestamp)
+                if timestamp is not None and state.last_seen_timestamp is not None
+                else 0.0
+            )
+            if (
+                time_gap > self.config.state_retention_seconds
+                or frame_gap > self.config.state_retention_frames
+            ):
+                # A reappearing ByteTrack ID is not allowed to inherit old gait
+                # evidence after a real track gap.
                 del self.states[track_id]
                 self.latest.pop(track_id, None)
+
+    @staticmethod
+    def _append_missing_slot(state: _TrackState, timestamp: float) -> None:
+        """在短暂漏检期间保留一个带掩码的时间槽。"""
+
+        if state.last_seen_timestamp is not None and timestamp <= state.last_seen_timestamp:
+            return
+        state.poses.append(np.zeros((17, 3), dtype=np.float32))
+        state.timestamps.append(float(timestamp))
+        state.valid_pose_frames = sum(
+            bool(np.any(item[:, 2] > 0.0)) for item in state.poses
+        )
+        state.valid_leg_frames = sum(
+            bool(np.mean(item[[11, 12, 13, 14, 15, 16], 2] > 0.0) >= 0.45)
+            for item in state.poses
+        )
+
+    def process_at(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        timestamp: float | None = None,
+    ) -> tuple[VisionTrack, ...]:
+        """按输入源时间戳处理一帧，保留 ``process`` 的兼容入口。"""
+        previous = self._current_timestamp
+        self._current_timestamp = time.time() if timestamp is None else float(timestamp)
+        try:
+            return self.process(frame_bgr)
+        finally:
+            self._current_timestamp = previous
 
     def process(self, frame_bgr: np.ndarray) -> tuple[VisionTrack, ...]:
         """运行一帧 BGR 图像的生产处理链。
@@ -852,16 +1086,25 @@ class ProductionVisionAdapter:
         """
         if frame_bgr is None or frame_bgr.size == 0:
             return ()
+        started = time.perf_counter()
         self._load()
         assert self.detector is not None
         assert self.pose is not None
         assert self.appearance is not None
         assert self.gait is not None
+        timestamp = self._current_timestamp
+        if timestamp is None:
+            timestamp = time.time()
         self.frame_index += 1
         inference_frame = self.enhancer.apply(frame_bgr)
         detections = self._detections_for_frame(inference_frame)
+        active_detection_ids = {item.track_id for item in detections}
+        for track_id, state in tuple(self.states.items()):
+            if track_id not in active_detection_ids:
+                self._append_missing_slot(state, timestamp)
         if not detections:
-            self._expire_states(set())
+            self._expire_states(set(), timestamp=timestamp)
+            self._record_frame_latency(started)
             return ()
 
         boxes = [item.box for item in detections]
@@ -877,17 +1120,32 @@ class ProductionVisionAdapter:
                 detection.track_id,
                 _TrackState(
                     poses=deque(maxlen=self.config.gait_sequence_length),
+                    timestamps=deque(maxlen=self.config.gait_sequence_length),
                 ),
             )
+            if (
+                state.last_seen_timestamp is not None
+                and timestamp - state.last_seen_timestamp
+                > self.config.maximum_track_gap_seconds
+            ):
+                state.track_gap_frames += 1
+                state.poses.clear()
+                state.timestamps.clear()
+                state.gait = None
+                state.last_gait_frame = None
+                state.valid_pose_frames = 0
+                state.valid_leg_frames = 0
             if state.boxes and _abrupt_track_jump(state.boxes[-1], detection.box):
                 state.id_switches += 1
                 state.poses.clear()
+                state.timestamps.clear()
                 state.gait = None
                 state.last_gait_frame = None
                 state.appearance = None
                 state.last_appearance_frame = None
             state.frame_count += 1
             state.last_seen_frame = self.frame_index
+            state.last_seen_timestamp = timestamp
             state.boxes.append(detection.box)
             canonical = _canonical_pose(
                 poses[index],
@@ -898,9 +1156,29 @@ class ProductionVisionAdapter:
                 canonical,
                 self.config.keypoint_confidence,
             )
-            if canonical is not None and leg_visibility >= 0.45:
-                state.poses.append(canonical)
-            walking_ratio, gait_cycles = _walking_metrics(state.poses, detection.box)
+            # Keep one time slot per observed track frame.  Invalid pose rows
+            # remain masked zeros and are gap-filled by the gait preprocessor;
+            # deleting them would compress the gait phase.
+            state.poses.append(
+                canonical.copy()
+                if canonical is not None
+                else np.zeros((17, 3), dtype=np.float32)
+            )
+            state.timestamps.append(float(timestamp))
+            state.valid_pose_frames = sum(
+                bool(np.any(item[:, 2] > 0.0)) for item in state.poses
+            )
+            state.valid_leg_frames = sum(
+                bool(np.mean(item[[11, 12, 13, 14, 15, 16], 2] > 0.0) >= 0.45)
+                for item in state.poses
+            )
+            if canonical is not None:
+                state.last_valid_timestamp = timestamp
+            walking_ratio, gait_cycles = _walking_metrics(
+                state.poses,
+                detection.box,
+                state.timestamps,
+            )
             gait_due = (
                 state.gait is None
                 or state.last_gait_frame is None
@@ -915,7 +1193,7 @@ class ProductionVisionAdapter:
                 + max(1, self.config.detector_inference_stride)
             )
             if (
-                len(state.poses) >= self.config.minimum_pose_frames
+                state.valid_pose_frames >= self.config.minimum_pose_frames
                 and gait_cycles >= 0.5
                 and gait_due
                 and (
@@ -970,7 +1248,11 @@ class ProductionVisionAdapter:
                 appearance_indexes.append(index)
         if appearance_indexes:
             appearance_boxes = [boxes[index] for index in appearance_indexes]
-            appearance_values = self.appearance.extract(frame_bgr, appearance_boxes)
+            # All learned branches see the same low-light transform.  Feeding
+            # OSNet the raw frame while pose/detection see CLAHE creates a
+            # branch-specific quality shift that the shared thresholds cannot
+            # represent.
+            appearance_values = self.appearance.extract(inference_frame, appearance_boxes)
             for destination, value in zip(appearance_indexes, appearance_values):
                 state = self.states[detections[destination].track_id]
                 state.last_appearance_frame = state.frame_count
@@ -999,15 +1281,26 @@ class ProductionVisionAdapter:
                 reasons.append("box_truncated")
             if leg_visibility < 0.45:
                 reasons.append("low_leg_visibility")
-            if len(state.poses) < self.config.minimum_pose_frames:
+            if state.valid_pose_frames < self.config.minimum_pose_frames:
                 reasons.append("gait_sequence_immature")
+            if state.detector_gap_frames:
+                reasons.append("detector_gap")
+            if state.track_gap_frames:
+                reasons.append("track_gap")
+            if bool(getattr(self.detector, "overflowed", False)):
+                reasons.append("maximum_people_reached")
             sequence_maturity = min(
                 1.0,
                 len(state.poses) / max(self.config.minimum_pose_frames, 1),
             )
+            pose_validity = min(
+                1.0,
+                state.valid_pose_frames / max(self.config.minimum_pose_frames, 1),
+            )
             gait_quality = float(
                 np.clip(
                     leg_visibility
+                    * np.sqrt(pose_validity)
                     * np.sqrt(sequence_maturity)
                     * (0.25 + 0.75 * walking_ratio),
                     0.0,
@@ -1031,6 +1324,15 @@ class ProductionVisionAdapter:
                 contour_jitter=_box_jitter(state.boxes),
                 id_switches=state.id_switches,
                 frame_count=state.frame_count,
+                valid_pose_frames=state.valid_pose_frames,
+                valid_leg_frames=state.valid_leg_frames,
+                detector_gap_frames=state.detector_gap_frames,
+                track_gap_frames=state.track_gap_frames,
+                timestamp_span_seconds=(
+                    float(state.timestamps[-1] - state.timestamps[0])
+                    if len(state.timestamps) >= 2
+                    else 0.0
+                ),
                 gait_cycles=gait_cycles,
                 walking_ratio=walking_ratio,
                 view_angle=_view_angle(canonical),
@@ -1049,7 +1351,8 @@ class ProductionVisionAdapter:
             output.append(track)
             self.latest[detection.track_id] = track
             active_ids.add(detection.track_id)
-        self._expire_states(active_ids)
+        self._expire_states(active_ids, timestamp=timestamp)
+        self._record_frame_latency(started)
         return tuple(output)
 
 

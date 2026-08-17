@@ -9,7 +9,7 @@
 torch==2.12.1+cu132
 torchvision==0.27.1+cu132
 
-numpy>=1.24
+numpy>=1.24,<3
 
 # 桌面 GUI 和摄像头/视频输入：
 opencv-python>=4.8,<5
@@ -17,7 +17,7 @@ opencv-python>=4.8,<5
 # 生产视觉栈：
 ultralytics==8.3.163
 lap==0.5.13
-onnxruntime-gpu>=1.27,<1.28; platform_system == "Windows"
+onnxruntime-gpu==1.27.0; platform_system == "Windows"
 onnxruntime-gpu>=1.20; platform_system != "Windows"
 
 # 可选加速器：
