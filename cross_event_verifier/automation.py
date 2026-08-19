@@ -14,6 +14,12 @@ from typing import Sequence
 
 import numpy as np
 
+from .actions import ActionPrediction, ActionRouter, ActionType
+from .aggregation import (
+    gait_quality_weight,
+    weighted_cosine_stability,
+    weighted_unit_mean,
+)
 from .engine import CrossEventVerifier
 from .types import (
     Decision,
@@ -42,6 +48,7 @@ class AutomationStage(str, Enum):
     GAIT_PROVISIONAL = "gait_provisional"
     GAIT_READY = "gait_ready"
     GAIT_CONFLICT = "gait_conflict"
+    ACTION_QUARANTINE = "action_quarantine"
     BLOCKED = "blocked"
 
 
@@ -95,17 +102,25 @@ class AutomationStatus:
     readiness_state: str | None = None
     gait_event_count: int = 0
     gait_prototype_count: int = 0
+    gait_stable_sample_count: int = 0
     visual_identity_confirmed: bool = False
+    action_type: str | None = None
+    action_confidence: float | None = None
+    action_quality: str | None = None
 
 
 @dataclass
 class _TrackAutomationState:
     """每条轨迹可变的建号窗口和待处理令牌绑定。"""
     gait_samples: deque[np.ndarray] = field(default_factory=deque)
+    gait_sample_weights: deque[float] = field(default_factory=deque)
     pending_request_id: str | None = None
     identity_id: str | None = None
     gait_event_proposals: dict[str, "_GaitProposal"] = field(default_factory=dict)
     gait_window_start_timestamp: float | None = None
+    subtracklet_id: str | None = None
+    action_type: ActionType | None = None
+    action_gate_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,7 +282,7 @@ class AutomaticVerificationController:
         """丢弃未完成的建号证据，同时保留仍有效的令牌。"""
 
         for state in self._states.values():
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             state.gait_event_proposals.clear()
         for candidate_id in tuple(self._states):
@@ -291,8 +306,9 @@ class AutomaticVerificationController:
         keep = {value for value in preserve_candidate_ids if value}
         for candidate_id in tuple(self._states):
             state = self._states[candidate_id]
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
+            state.subtracklet_id = None
             if discard_unpreserved and candidate_id not in keep:
                 del self._states[candidate_id]
                 self.verifier.delete_gait_event_proposals(candidate_id)
@@ -347,15 +363,62 @@ class AutomaticVerificationController:
         state.pending_request_id = value
 
     @staticmethod
-    def _unit_mean(samples: deque[np.ndarray]) -> np.ndarray | None:
+    def _clear_gait_window(state: _TrackAutomationState) -> None:
+        """Clear vectors and their aligned quality weights together."""
+
+        state.gait_samples.clear()
+        state.gait_sample_weights.clear()
+
+    @staticmethod
+    def _sync_subtracklet(
+        state: _TrackAutomationState,
+        observation: Observation,
+    ) -> None:
+        """让旧 ByteTrack 子轨迹的未完成步态窗口不能污染新窗口。"""
+
+        value = observation.metadata.get("subtracklet_id")
+        current = str(value) if value not in (None, "") else None
+        if current is None:
+            return
+        if state.subtracklet_id is not None and state.subtracklet_id != current:
+            AutomaticVerificationController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+            state.action_type = None
+            state.action_gate_active = False
+        state.subtracklet_id = current
+
+    @staticmethod
+    def _resolve_action(
+        state: _TrackAutomationState,
+        observation: Observation,
+    ) -> ActionPrediction | None:
+        """更新动作路由状态；未接入动作分类器时返回 ``None``。"""
+
+        prediction = ActionRouter.from_metadata(observation.metadata)
+        if prediction is None:
+            if state.action_gate_active:
+                # Once an explicit action stream starts, a missing next label
+                # is not silently treated as WALK.  This prevents a classifier
+                # dropout from reopening the legacy gait path.
+                return None
+            return None
+        if state.action_gate_active and state.action_type != prediction.action_type:
+            AutomaticVerificationController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+        state.action_type = prediction.action_type
+        state.action_gate_active = True
+        return prediction
+
+    @staticmethod
+    def _unit_mean(
+        samples: deque[np.ndarray],
+        weights: deque[float] | None = None,
+    ) -> np.ndarray | None:
         """返回滚动步态样本窗口的归一化中心。"""
-        if not samples:
-            return None
-        vector = np.mean(np.stack(tuple(samples), axis=0), axis=0)
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-8:
-            return None
-        return (vector / norm).astype(np.float32)
+        return weighted_unit_mean(
+            samples,
+            tuple(weights) if weights is not None else None,
+        )
 
     def _live_token(
         self,
@@ -389,6 +452,33 @@ class AutomaticVerificationController:
         向量会与滚动单位中心比较。突然不匹配时只重置该轨迹的未完成窗口，
         防止把两个人或两个轨迹身份的样本平均到一起。
         """
+        action_prediction = self._resolve_action(state, observation)
+        if state.action_gate_active and not ActionRouter().allows_walk(action_prediction):
+            self._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+            action_type = (
+                action_prediction.action_type.value
+                if action_prediction is not None
+                else ActionType.UNKNOWN.value
+            )
+            return None, AutomationStatus(
+                AutomationStage.ACTION_QUARANTINE,
+                (
+                    f"动作 {action_type} 未通过 WALK 门控，"
+                    "不写入旧 GaitGraph2 步态图库"
+                ),
+                action_type=action_type,
+                action_confidence=(
+                    action_prediction.confidence
+                    if action_prediction is not None
+                    else None
+                ),
+                action_quality=(
+                    action_prediction.quality.value
+                    if action_prediction is not None
+                    else None
+                ),
+            )
         features = observation.features.normalized()
         quality = observation.quality
         hard_reasons = quality.gait_hard_veto_reasons(
@@ -408,7 +498,7 @@ class AutomaticVerificationController:
             # the frames before the break.  Partial quality, by contrast,
             # remains recoverable and is handled below without becoming a
             # negative identity signal.
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
         gait_quality = quality.gait_availability(
             self.verifier.config.minimum_frames,
@@ -428,7 +518,7 @@ class AutomaticVerificationController:
             # A frame without a gait feature breaks the stable sample window;
             # do not join the next valid vector to samples from before the
             # missing-pose interval.
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return None, AutomationStatus(
                 AutomationStage.WAITING_STRONG_GAIT,
@@ -455,14 +545,27 @@ class AutomaticVerificationController:
                 gait_quality_band=quality_band.value,
             )
         if quality_band == GaitQualityBand.PARTIAL:
+            if not self.verifier.config.allow_partial_gait_samples:
+                return None, AutomationStatus(
+                    AutomationStage.WAIT_MORE_DATA,
+                    f"步态质量 PARTIAL（Q={gait_quality:.2f}），仅保留候选证据",
+                    progress=(
+                        gait_quality / self.verifier.config.strong_gait_quality
+                        if self.verifier.config.strong_gait_quality > 0
+                        else 0.0
+                    ),
+                    gait_quality_band=quality_band.value,
+                )
+
+        sample_weight = gait_quality_weight(
+            gait_quality,
+            quality_band,
+            strong_threshold=self.verifier.config.strong_gait_quality,
+        )
+        if sample_weight <= 0.0:
             return None, AutomationStatus(
                 AutomationStage.WAIT_MORE_DATA,
-                f"步态质量 PARTIAL（Q={gait_quality:.2f}），仅保留候选证据",
-                progress=(
-                    gait_quality / self.verifier.config.strong_gait_quality
-                    if self.verifier.config.strong_gait_quality > 0
-                    else 0.0
-                ),
+                "步态质量贡献为零，等待更完整序列",
                 gait_quality_band=quality_band.value,
             )
 
@@ -485,17 +588,21 @@ class AutomaticVerificationController:
             )
 
         vector = np.asarray(features.gait, dtype=np.float32).reshape(-1)
-        reference = self._unit_mean(state.gait_samples)
+        reference = self._unit_mean(
+            state.gait_samples,
+            state.gait_sample_weights,
+        )
         if reference is not None:
             if reference.shape != vector.shape:
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = observation.timestamp
             else:
                 similarity = float(np.dot(reference, vector))
                 if similarity < self.policy.minimum_sample_similarity:
-                    state.gait_samples.clear()
+                    self._clear_gait_window(state)
                     state.gait_window_start_timestamp = observation.timestamp
                     state.gait_samples.append(vector.copy())
+                    state.gait_sample_weights.append(sample_weight)
                     return None, AutomationStatus(
                         AutomationStage.GAIT_UNSTABLE,
                         f"步态波动，重新采集（相似度 {similarity:.2f}）",
@@ -504,31 +611,61 @@ class AutomaticVerificationController:
                     )
 
         state.gait_samples.append(vector.copy())
+        state.gait_sample_weights.append(sample_weight)
         while len(state.gait_samples) > self.policy.gait_sample_window:
             state.gait_samples.popleft()
+            state.gait_sample_weights.popleft()
         sample_count = len(state.gait_samples)
-        progress = min(1.0, sample_count / self.policy.minimum_stable_gait_samples)
-        if sample_count < self.policy.minimum_stable_gait_samples:
+        sample_mass = float(sum(state.gait_sample_weights))
+        required_mass = (
+            self.policy.minimum_stable_gait_samples
+            * self.verifier.config.minimum_weighted_gait_mass
+        )
+        progress = min(
+            1.0,
+            sample_count / self.policy.minimum_stable_gait_samples,
+            sample_mass / max(required_mass, 1e-8),
+        )
+        if (
+            sample_count < self.policy.minimum_stable_gait_samples
+            or sample_mass < required_mass
+        ):
             return None, AutomationStatus(
-                AutomationStage.COLLECTING_GAIT,
                 (
-                    f"采集稳定步态 {sample_count}/"
+                    AutomationStage.WAIT_MORE_DATA
+                    if quality_band == GaitQualityBand.PARTIAL
+                    else AutomationStage.COLLECTING_GAIT
+                ),
+                (
+                    (
+                        "步态质量 PARTIAL，"
+                        if quality_band == GaitQualityBand.PARTIAL
+                        else ""
+                    )
+                    + f"采集稳定步态 {sample_count}/"
                     f"{self.policy.minimum_stable_gait_samples}"
+                    f"（质量权重 {sample_mass:.2f}/{required_mass:.2f}）"
                 ),
                 progress=progress,
                 gait_quality_band=quality_band.value,
             )
 
-        centroid = self._unit_mean(state.gait_samples)
+        centroid = self._unit_mean(
+            state.gait_samples,
+            state.gait_sample_weights,
+        )
         if centroid is None:
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return None, AutomationStatus(
                 AutomationStage.GAIT_UNSTABLE,
                 "步态聚合失败，重新采集",
             )
-        similarities = [float(np.dot(item, centroid)) for item in state.gait_samples]
-        stability = float(np.mean(similarities))
+        stability = weighted_cosine_stability(
+            state.gait_samples,
+            centroid,
+            state.gait_sample_weights,
+        )
         required_stability = max(
             self.policy.minimum_gait_stability,
             self.verifier.config.strong_gait_probability,
@@ -615,17 +752,20 @@ class AutomaticVerificationController:
                 raise
         if len(state.gait_event_proposals) < self.policy.minimum_independent_gait_events:
             return None
-        vectors = np.stack(
-            [item.vector for item in state.gait_event_proposals.values()],
-            axis=0,
+        proposals = tuple(state.gait_event_proposals.values())
+        centroid = weighted_unit_mean(
+            [item.vector for item in proposals],
+            [max(float(item.stability), 0.05) for item in proposals],
         )
-        centroid = np.mean(vectors, axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm <= 1e-8:
+        if centroid is None:
             return None
         return _GaitProposal(
-            (centroid / norm).astype(np.float32),
-            min(item.stability for item in state.gait_event_proposals.values()),
+            centroid,
+            weighted_cosine_stability(
+                [item.vector for item in proposals],
+                centroid,
+                [max(float(item.stability), 0.05) for item in proposals],
+            ),
             proposal.model_version,
             proposal.feature_schema,
             proposal.calibration_version,
@@ -647,6 +787,7 @@ class AutomaticVerificationController:
         """验证一条轨迹，并推进其自动建号协议。"""
 
         state = self._states.setdefault(candidate_id, _TrackAutomationState())
+        self._sync_subtracklet(state, observation)
         request_id = self._live_token(state, observation.appearance_request_id)
         effective_observation = (
             replace(observation, appearance_request_id=request_id)
@@ -683,6 +824,7 @@ class AutomaticVerificationController:
         ] = []
         for observation, candidate_id in zip(observations, candidate_ids):
             state = self._states.setdefault(candidate_id, _TrackAutomationState())
+            self._sync_subtracklet(state, observation)
             request_id = self._live_token(state, observation.appearance_request_id)
             effective = (
                 replace(observation, appearance_request_id=request_id)
@@ -731,7 +873,7 @@ class AutomaticVerificationController:
             if self._manual_request_id == consumed:
                 self._manual_request_id = None
             state.identity_id = decision.identity_id
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return decision, AutomationStatus(
                 AutomationStage.APPEARANCE_ABSORBED,
@@ -744,7 +886,7 @@ class AutomaticVerificationController:
         if decision.appearance_request_id and decision.identity_id:
             state.pending_request_id = decision.appearance_request_id
             state.identity_id = decision.identity_id
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return decision, AutomationStatus(
                 AutomationStage.APPEARANCE_PENDING,
@@ -775,7 +917,7 @@ class AutomaticVerificationController:
 
         if decision.kind == DecisionKind.FORMAL_MATCH and decision.identity_id:
             state.identity_id = decision.identity_id
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return decision, AutomationStatus(
                 AutomationStage.IDENTIFIED,
@@ -790,7 +932,7 @@ class AutomaticVerificationController:
                 "自动注册已关闭",
             )
         if decision.state == VerificationState.SUSPENDED:
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return decision, AutomationStatus(
                 AutomationStage.BLOCKED,
@@ -799,7 +941,7 @@ class AutomaticVerificationController:
         if any("conflict" in reason for reason in decision.reasons):
             # 冲突帧只代表当前证据不可判定，不应把整条轨迹永久终止。清掉
             # 可能混入不同分支/身份的窗口，从下一帧重新建立干净序列。
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return decision, AutomationStatus(
                 AutomationStage.GAIT_UNSTABLE,
@@ -835,7 +977,7 @@ class AutomaticVerificationController:
             candidate_id=candidate_id,
         )
         stable_sample_count = len(state.gait_samples)
-        state.gait_samples.clear()
+        self._clear_gait_window(state)
         state.gait_window_start_timestamp = None
         if event_proposal is None:
             return decision, AutomationStatus(
@@ -884,7 +1026,7 @@ class AutomaticVerificationController:
             # 本窗口后让轨迹重新收集，避免下一帧反复拿同一批向量重试，也不
             # 把 GUI 永久留在 BLOCKED。真正不可恢复的候选状态（例如挂起）
             # 仍保留 BLOCKED 语义。
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             if "open-set novel" in str(error):
                 state.gait_event_proposals.clear()
@@ -913,7 +1055,7 @@ class AutomaticVerificationController:
                 f"自动注册暂缓：{error}",
             )
 
-        state.gait_samples.clear()
+        self._clear_gait_window(state)
         state.gait_window_start_timestamp = None
         state.gait_event_proposals.clear()
         self.verifier.delete_gait_event_proposals(candidate_id)

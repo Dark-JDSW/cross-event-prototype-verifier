@@ -619,6 +619,86 @@ class GuiPipelineTests(unittest.TestCase):
         video = SourceSpec("file", "sample.mp4", "sample.mp4")
         self.assertEqual(camera.kind, "camera")
         self.assertEqual(video.value, "sample.mp4")
+        self.assertEqual(video.repeat_count, 1)
+        repeated = SourceSpec("file", "sample.mp4", "sample.mp4", repeat_count=3)
+        self.assertEqual(repeated.repeat_count, 3)
+        with self.assertRaises(ValueError):
+            SourceSpec("file", "sample.mp4", "sample.mp4", repeat_count=0)
+        with self.assertRaises(ValueError):
+            SourceSpec("camera", 0, "camera-0", repeat_count=2)
+
+    def test_worker_repeats_file_with_one_capture_session(self) -> None:
+        class FakeCapture:
+            instances: list["FakeCapture"] = []
+
+            def __init__(self, spec: SourceSpec) -> None:
+                self.spec = spec
+                self.fps = 0.0
+                self.frame_count = 1
+                self.width = 2
+                self.height = 2
+                self.capture = type(
+                    "Video",
+                    (),
+                    {"get": lambda _self, property_id: 0.0},
+                )()
+                self.read_count = 0
+                self.released = False
+                self.instances.append(self)
+
+            def open(self) -> None:
+                return None
+
+            def read(self) -> tuple[bool, object]:
+                if self.read_count:
+                    return False, None
+                self.read_count += 1
+                return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+            def release(self) -> None:
+                self.released = True
+                self.capture = None
+
+        class FakePipeline:
+            def __init__(self) -> None:
+                self.vision = type("Vision", (), {"backend_status": "test"})()
+                self.verifier = type(
+                    "Verifier",
+                    (),
+                    {"maintenance": lambda _self, now: ()},
+                )()
+                self.automation = type(
+                    "Automation",
+                    (),
+                    {"discard_candidates": lambda _self, candidates: None},
+                )()
+                self.source_calls: list[dict[str, object]] = []
+
+            def set_source(self, label: str, **kwargs: object) -> None:
+                self.source_calls.append({"label": label, **kwargs})
+
+            def process_frame(self, frame: object, *, timestamp: float) -> object:
+                return (frame, timestamp)
+
+        pipeline = FakePipeline()
+        worker = FrameWorker(pipeline)  # type: ignore[arg-type]
+        with patch("cross_event_verifier.media.OpenCvCapture", FakeCapture):
+            worker._run(
+                SourceSpec("file", "sample.mp4", "sample.mp4", repeat_count=2),
+                "candidate-1",
+            )
+
+        self.assertEqual(len(FakeCapture.instances), 2)
+        self.assertTrue(all(item.released for item in FakeCapture.instances))
+        self.assertEqual(len(pipeline.source_calls), 2)
+        self.assertEqual(
+            {item["capture_session_id"] for item in pipeline.source_calls},
+            {pipeline.source_calls[0]["capture_session_id"]},
+        )
+        self.assertEqual(
+            [item["candidate_id"] for item in pipeline.source_calls],
+            ["candidate-1", "candidate-1"],
+        )
 
     def test_clear_gallery_removes_persistent_and_runtime_identity_data(self) -> None:
         store = SqliteStore(":memory:")

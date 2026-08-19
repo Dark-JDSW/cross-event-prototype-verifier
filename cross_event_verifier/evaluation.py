@@ -60,6 +60,63 @@ class EncoderEvaluation:
         }
 
 
+@dataclass(frozen=True)
+class OpenSetProtocolReport:
+    """Closed-set rank plus unknown-rejection results for one open-set split."""
+
+    rank: int
+    target_fpir: float
+    threshold: float
+    known_probe_count: int
+    unknown_probe_count: int
+    known_correct_count: int
+    known_rejected_count: int
+    unknown_accepted_count: int
+    calibration_unknown_count: int
+
+    @property
+    def fnir(self) -> float:
+        """False-negative identification rate for known probes."""
+
+        if self.known_probe_count == 0:
+            return float("nan")
+        return 1.0 - self.known_correct_count / self.known_probe_count
+
+    @property
+    def fpir(self) -> float:
+        """False-positive identification rate for unknown probes."""
+
+        if self.unknown_probe_count == 0:
+            return float("nan")
+        return self.unknown_accepted_count / self.unknown_probe_count
+
+    @property
+    def rank_accuracy(self) -> float:
+        """Rank-k identification accuracy before interpreting unknown status."""
+
+        if self.known_probe_count == 0:
+            return float("nan")
+        return self.known_correct_count / self.known_probe_count
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a serialisable report for experiment logs."""
+
+        return {
+            "rank": self.rank,
+            "target_fpir": self.target_fpir,
+            "threshold": self.threshold,
+            "known_probe_count": self.known_probe_count,
+            "unknown_probe_count": self.unknown_probe_count,
+            "known_correct_count": self.known_correct_count,
+            "known_rejected_count": self.known_rejected_count,
+            "unknown_accepted_count": self.unknown_accepted_count,
+            "calibration_unknown_count": self.calibration_unknown_count,
+            "fnir": self.fnir,
+            "fpir": self.fpir,
+            "rank_accuracy": self.rank_accuracy,
+        }
+
+
 def _unit(value: Sequence[float] | np.ndarray) -> np.ndarray | None:
     """将离线评估向量转为单位向量；无效向量返回 ``None``。"""
 
@@ -136,6 +193,128 @@ def threshold_at_fpir(
     if eligible:
         return min(eligible)
     return float(np.nextafter(np.max(impostor), np.inf))
+
+
+def _gallery_representatives(
+    gallery_embeddings: Mapping[
+        str,
+        Iterable[Sequence[float] | np.ndarray],
+    ],
+) -> dict[str, tuple[np.ndarray, ...]]:
+    """Normalise a multi-template gallery without merging its templates."""
+
+    return {
+        str(identity): tuple(
+            item for value in values if (item := _unit(value)) is not None
+        )
+        for identity, values in gallery_embeddings.items()
+    }
+
+
+def _rank_gallery(
+    query: Sequence[float] | np.ndarray,
+    gallery: Mapping[str, tuple[np.ndarray, ...]],
+) -> tuple[tuple[str, float], ...]:
+    """Return identities ordered by their best compatible template score."""
+
+    vector = _unit(query)
+    if vector is None:
+        return ()
+    scores: list[tuple[str, float]] = []
+    for identity, templates in gallery.items():
+        compatible = [
+            float(np.dot(vector, template))
+            for template in templates
+            if template.size == vector.size
+        ]
+        if compatible:
+            scores.append((identity, max(compatible)))
+    return tuple(sorted(scores, key=lambda item: (-item[1], item[0])))
+
+
+def evaluate_open_set_protocol(
+    gallery_embeddings: Mapping[
+        str,
+        Iterable[Sequence[float] | np.ndarray],
+    ],
+    known_probes: Mapping[
+        str,
+        Iterable[Sequence[float] | np.ndarray],
+    ],
+    unknown_probes: Iterable[Sequence[float] | np.ndarray],
+    *,
+    target_fpir: float = 0.01,
+    rank: int = 1,
+    threshold: float | None = None,
+    calibration_unknown_probes: Iterable[Sequence[float] | np.ndarray] = (),
+) -> OpenSetProtocolReport:
+    """Evaluate identity/event-disjoint known and unknown probe splits.
+
+    The caller should exclude event/session/camera leakage when constructing
+    the split. If no threshold is supplied, it is calibrated from
+    calibration_unknown_probes; for a compact exploratory run unknown_probes
+    are used as the calibration population when that argument is empty.
+    """
+
+    if not 0.0 <= target_fpir <= 1.0:
+        raise ValueError("target_fpir must be in [0, 1]")
+    if int(rank) < 1:
+        raise ValueError("rank must be positive")
+    rank = int(rank)
+    gallery = _gallery_representatives(gallery_embeddings)
+    known_rows: list[tuple[str, tuple[tuple[str, float], ...]]] = []
+    for identity, probes in known_probes.items():
+        for probe in probes:
+            ranking = _rank_gallery(probe, gallery)
+            if ranking:
+                known_rows.append((str(identity), ranking))
+    unknown_rows = [
+        ranking
+        for probe in unknown_probes
+        if (ranking := _rank_gallery(probe, gallery))
+    ]
+    calibration_rows = [
+        ranking
+        for probe in calibration_unknown_probes
+        if (ranking := _rank_gallery(probe, gallery))
+    ]
+    calibration_scores = [ranking[0][1] for ranking in calibration_rows]
+    if not calibration_scores:
+        calibration_scores = [ranking[0][1] for ranking in unknown_rows]
+    effective_threshold = (
+        float(threshold)
+        if threshold is not None
+        else threshold_at_fpir(calibration_scores, target_fpir)
+    )
+    known_correct = 0
+    known_rejected = 0
+    for identity, ranking in known_rows:
+        accepted = bool(
+            np.isfinite(effective_threshold)
+            and ranking[0][1] >= effective_threshold
+        )
+        if not accepted:
+            known_rejected += 1
+        elif identity in {item[0] for item in ranking[:rank]}:
+            known_correct += 1
+    unknown_accepted = sum(
+        bool(
+            np.isfinite(effective_threshold)
+            and ranking[0][1] >= effective_threshold
+        )
+        for ranking in unknown_rows
+    )
+    return OpenSetProtocolReport(
+        rank=rank,
+        target_fpir=float(target_fpir),
+        threshold=effective_threshold,
+        known_probe_count=len(known_rows),
+        unknown_probe_count=len(unknown_rows),
+        known_correct_count=known_correct,
+        known_rejected_count=known_rejected,
+        unknown_accepted_count=unknown_accepted,
+        calibration_unknown_count=len(calibration_scores),
+    )
 
 
 def max_formal_similarity(

@@ -99,6 +99,7 @@ class VerifierWindow:
         self.source_kind = tk.StringVar(value="camera")
         self.camera_index = tk.StringVar(value="0")
         self.video_path = tk.StringVar()
+        self.video_repeat_count = tk.StringVar(value="1")
         self.camera_id = tk.StringVar(value="camera-1")
         self.identity_id = tk.StringVar(value="P1")
         self.candidate_id = tk.StringVar()
@@ -156,13 +157,20 @@ class VerifierWindow:
         self.browse_button.grid(row=0, column=5, padx=4)
         ttk.Label(controls, text="来源 ID").grid(row=0, column=6, padx=(12, 4))
         ttk.Entry(controls, textvariable=self.camera_id, width=16).grid(row=0, column=7, padx=4)
-        ttk.Button(controls, text="开始", command=self.start).grid(row=0, column=8, padx=(12, 4))
-        ttk.Button(controls, text="停止", command=self.stop).grid(row=0, column=9, padx=(4, 8))
+        ttk.Label(controls, text="视频重复学习").grid(row=0, column=8, padx=(12, 4))
+        self.repeat_count_entry = ttk.Entry(
+            controls,
+            textvariable=self.video_repeat_count,
+            width=6,
+        )
+        self.repeat_count_entry.grid(row=0, column=9, padx=4)
+        ttk.Button(controls, text="开始", command=self.start).grid(row=0, column=10, padx=(12, 4))
+        ttk.Button(controls, text="停止", command=self.stop).grid(row=0, column=11, padx=(4, 8))
         ttk.Label(
             controls,
             textvariable=self.backend_status,
             foreground="#315a7d",
-        ).grid(row=1, column=0, columnspan=10, padx=8, pady=(0, 7), sticky="w")
+        ).grid(row=1, column=0, columnspan=12, padx=8, pady=(0, 7), sticky="w")
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, padx=10, pady=6, sticky="nsew")
@@ -487,6 +495,7 @@ class VerifierWindow:
         state = "normal" if enabled else "disabled"
         self.file_entry.configure(state=state)
         self.browse_button.configure(state=state)
+        self.repeat_count_entry.configure(state=state)
 
     def _browse_video(self) -> None:
         """打开系统文件选择器，并将选中的路径复制到表单。"""
@@ -507,7 +516,19 @@ class VerifierWindow:
             path = self.video_path.get().strip()
             if not path:
                 raise ValueError("请先选择视频文件")
-            return SourceSpec("file", path, Path(path).name, candidate_id)
+            try:
+                repeat_count = int(self.video_repeat_count.get().strip())
+            except ValueError as error:
+                raise ValueError("视频重复学习次数必须是正整数") from error
+            if repeat_count < 1:
+                raise ValueError("视频重复学习次数必须是正整数")
+            return SourceSpec(
+                "file",
+                path,
+                Path(path).name,
+                candidate_id,
+                repeat_count,
+            )
         try:
             index = int(self.camera_index.get().strip())
         except ValueError as error:
@@ -520,7 +541,12 @@ class VerifierWindow:
         try:
             spec = self._source_spec()
             self.worker.start(spec)
-            self.status.set(f"正在打开：{spec.label}")
+            repeat_text = (
+                f"（自动重复学习 {spec.repeat_count} 次）"
+                if spec.kind == "file" and spec.repeat_count > 1
+                else ""
+            )
+            self.status.set(f"正在打开：{spec.label}{repeat_text}")
         except Exception as error:
             messagebox.showerror("无法开始", str(error))
 

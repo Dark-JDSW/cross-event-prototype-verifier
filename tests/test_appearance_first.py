@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 
 from cross_event_verifier import (
     AutomationPolicy,
     CrossEventVerifier,
+    Decision,
     DecisionKind,
     FeatureBundle,
+    GaitReadinessReport,
     GaitReadinessState,
     Observation,
     TrackQuality,
     VerifierConfig,
+    VerificationState,
 )
 from cross_event_verifier.appearance_first import (
     AppearanceFirstGaitEnrollmentController,
@@ -119,6 +123,7 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertEqual(decision3.identity_id, "P1")
         self.assertEqual(len(verifier.load_gait_enrollment_events("P1")), 1)
         self.assertEqual(status3.gait_event_count, 1)
+        self.assertGreater(status3.gait_stable_sample_count, 0)
         self.assertEqual(status3.readiness_state, GaitReadinessState.LEARNING.value)
 
         # Same session's later windows cannot produce a second independent event.
@@ -180,6 +185,11 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertTrue(
             any("继续吸收本会话步态样本" in status.message for status in statuses)
         )
+        self.assertGreater(
+            statuses[-1].gait_stable_sample_count,
+            before.sample_count,
+        )
+        self.assertIn("累计稳定步态样本", statuses[-1].message)
         verifier.close()
 
     def test_short_gait_cannot_reidentify_a_visual_track(self) -> None:
@@ -266,6 +276,56 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertIsNone(decision.identity_id)
         verifier.close()
 
+    def test_bound_decision_does_not_return_gait_before_appearance_conflict(self) -> None:
+        """内部绑定决策也必须先暴露外观冲突，再考虑正式步态。"""
+
+        verifier = CrossEventVerifier()
+        controller = AppearanceFirstGaitEnrollmentController(verifier)
+        observation = _appearance_only_observation(
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            2.0,
+            gait=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            valid_pose_frames=45,
+        )
+        appearance_conflict = Decision(
+            kind=DecisionKind.CONFLICT,
+            state=VerificationState.ISOLATED_CANDIDATE,
+            reasons=("appearance_conflicts_with_bound_identity",),
+        )
+        gait_match = Decision(
+            kind=DecisionKind.FORMAL_MATCH,
+            state=VerificationState.CONFIRMED_IDENTITY,
+            identity_id="P1",
+            reasons=("gait_prototype_match",),
+        )
+        with (
+            patch.object(
+                verifier,
+                "match_appearance_identity",
+                return_value=appearance_conflict,
+            ),
+            patch.object(
+                verifier,
+                "match_gait_identity",
+                return_value=gait_match,
+            ) as gait_identity,
+            patch.object(
+                controller,
+                "_readiness",
+                return_value=GaitReadinessReport("P1", GaitReadinessState.READY),
+            ),
+        ):
+            decision = controller._bound_decision(
+                observation,
+                "P1",
+                (),
+            )
+
+        self.assertEqual(decision.kind, DecisionKind.CONFLICT)
+        self.assertIsNone(decision.identity_id)
+        gait_identity.assert_not_called()
+        verifier.close()
+
     def test_bound_identity_absorbs_a_new_view_as_an_appearance_prototype(self) -> None:
         """连续 Track 的新视角应扩展 P1，而不是生成 P2。"""
 
@@ -300,6 +360,98 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertEqual(verifier.formal_identities, ("P1",))
         appearance_prototypes = verifier.memory.formal_prototypes("P1", "appearance")
         self.assertGreaterEqual(len(appearance_prototypes), 2)
+        verifier.close()
+
+    def test_strong_gait_can_rebind_a_new_track_after_clothing_change(self) -> None:
+        """换衣后的新 Track 应优先回连已有身份，而不是创建新的 OSNet ID。"""
+
+        verifier = CrossEventVerifier()
+        verifier.register_identity(
+            "P1",
+            FeatureBundle(appearance=np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+        )
+        controller = AppearanceFirstGaitEnrollmentController(
+            verifier,
+            AutomationPolicy(minimum_track_frames=1),
+        )
+        changed_clothes = _appearance_only_observation(
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            2.0,
+            gait=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            valid_pose_frames=45,
+        )
+        changed_clothes = replace(
+            changed_clothes,
+            track_id="new-track",
+            metadata={
+                "appearance_change_suspected": True,
+            },
+        )
+        with patch.object(controller, "_gait_assignments", return_value={0: 0}):
+            decision, _ = controller.verify_batch(
+                [changed_clothes],
+                candidate_ids=["cam:appearance-session:new-track"],
+            )[0]
+
+        self.assertEqual(decision.identity_id, "P1")
+        self.assertNotEqual(decision.kind, DecisionKind.VISUAL_IDENTITY_CREATED)
+        self.assertEqual(verifier.formal_identities, ("P1",))
+        verifier.close()
+
+    def test_one_accepted_gait_event_can_relink_a_new_track(self) -> None:
+        """尚未 READY 的已有身份也可由长质量步态回连新换衣 Track。"""
+
+        verifier, controller = self._controller()
+        for timestamp in (1.0, 2.0, 3.0):
+            controller.verify(
+                _observation(
+                    "event-a",
+                    np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                    timestamp,
+                ),
+                candidate_id="cam:event-a:track-7",
+            )
+        self.assertEqual(len(verifier.load_gait_enrollment_events("P1")), 1)
+        controller.reset_tracks(discard_unpreserved=True)
+
+        changed_clothes = replace(
+            _observation(
+                "event-b",
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                4.0,
+            ),
+            track_id="new-track",
+            features=FeatureBundle(
+                appearance=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                gait=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            ),
+            quality=replace(
+                _quality(),
+                frame_count=45,
+                valid_pose_frames=45,
+            ),
+        )
+        decision, _ = controller.verify_batch(
+            [changed_clothes],
+            candidate_ids=["cam:event-b:track-7"],
+        )[0]
+
+        self.assertEqual(decision.identity_id, "P1")
+        self.assertIn("gait_relinked_visual_identity", decision.reasons)
+        self.assertEqual(verifier.formal_identities, ("P1",))
+        verifier.close()
+
+    def test_verify_batch_rejects_duplicate_candidate_ids(self) -> None:
+        verifier, controller = self._controller()
+        observation = _appearance_only_observation(
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "candidate_ids must be unique"):
+            controller.verify_batch(
+                [observation, observation],
+                candidate_ids=["duplicate", "duplicate"],
+            )
         verifier.close()
 
     def test_simultaneous_bound_tracks_cannot_share_an_identity(self) -> None:

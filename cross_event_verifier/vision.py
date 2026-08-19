@@ -13,13 +13,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from math import hypot
-from typing import Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import cv2
 import numpy as np
 
 from .adapters import occlusion_scores
-from .types import FeatureBundle, TrackQuality
+from .types import CleanSubTracklet, FeatureBundle, TrackQuality
 
 
 Box = tuple[int, int, int, int]
@@ -38,6 +38,14 @@ class VisionTrack:
     detection_confidence: float
     features: FeatureBundle
     quality: TrackQuality
+    clean_subtracklet: CleanSubTracklet | None = None
+    # Optional model/router metadata.  Keeping it outside FeatureBundle avoids
+    # mixing action logits with identity embeddings while allowing V1 action
+    # gates to consume an explicit, versioned prediction.  The production
+    # adapter may also expose ``appearance_similarity_to_previous`` and
+    # ``appearance_change_suspected``; those are soft, auditable clothing/
+    # appearance-drift signals and must not be treated as identity decisions.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 class VisionAdapter(Protocol):

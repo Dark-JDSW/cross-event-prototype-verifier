@@ -423,6 +423,31 @@ class VideoVerifierPipeline:
                 item.track_id,
                 active_count=len(vision_tracks),
             )
+            clean_subtracklet = item.clean_subtracklet
+            observation_metadata = dict(getattr(item, "metadata", {}) or {})
+            observation_metadata.update({
+                "source": "standalone-gui",
+                "vision_adapter": type(self.vision).__name__,
+                "vision_backend": str(
+                    getattr(self.vision, "backend_status", "unknown")
+                ),
+                "track_box": tuple(item.box),
+                "active_track_count": len(vision_tracks),
+                "candidate_key": candidate_id,
+            })
+            if clean_subtracklet is not None:
+                # This is a control-plane boundary, not a model input.  It
+                # prevents downstream gait windows from joining samples that
+                # the production adapter has deliberately separated.
+                observation_metadata.update(
+                    {
+                        "subtracklet_id": clean_subtracklet.subtracklet_id,
+                        "subtracklet_segment_id": clean_subtracklet.segment_id,
+                        "subtracklet_boundary_reasons": tuple(
+                            clean_subtracklet.boundary_reasons
+                        ),
+                    }
+                )
             prepared.append(
                 (
                     item,
@@ -498,16 +523,7 @@ class VideoVerifierPipeline:
                             )
                         ),
                         calibration_version=self.verifier.config.calibration_version,
-                        metadata={
-                            "source": "standalone-gui",
-                            "vision_adapter": type(self.vision).__name__,
-                            "vision_backend": str(
-                                getattr(self.vision, "backend_status", "unknown")
-                            ),
-                            "track_box": tuple(item.box),
-                            "active_track_count": len(vision_tracks),
-                            "candidate_key": candidate_id,
-                        },
+                        metadata=observation_metadata,
                     ),
                 )
             )
@@ -565,11 +581,21 @@ class VideoVerifierPipeline:
         if history:
             previous = history[-1].quality
             current = item.quality
+            previous_subtracklet = history[-1].clean_subtracklet
+            current_subtracklet = item.clean_subtracklet
             # 生产适配器会在 ID 切换后清除时序步态状态。手工登记历史也要这样做，
             # 防止新人物继承旧轨迹的强快照。
             if (
                 current.id_switches > previous.id_switches
                 or current.frame_count < previous.frame_count
+                or (
+                    current_subtracklet is not None
+                    and (
+                        previous_subtracklet is None
+                        or current_subtracklet.subtracklet_id
+                        != previous_subtracklet.subtracklet_id
+                    )
+                )
             ):
                 history.clear()
         history.append(item)
@@ -677,6 +703,14 @@ class VideoVerifierPipeline:
                 "vision_adapter": type(self.vision).__name__,
                 "gait_quality": gait_quality,
                 "source_frame_count": snapshot.quality.frame_count,
+                **(
+                    {
+                        "subtracklet_id": snapshot.clean_subtracklet.subtracklet_id,
+                        "subtracklet_segment_id": snapshot.clean_subtracklet.segment_id,
+                    }
+                    if snapshot.clean_subtracklet is not None
+                    else {}
+                ),
             },
         )
         decision = self.verifier.enroll_gait_identity(
@@ -752,6 +786,14 @@ class VideoVerifierPipeline:
             metadata={
                 "source": "standalone-gui-manual-visual-enrollment",
                 "vision_adapter": type(self.vision).__name__,
+                **(
+                    {
+                        "subtracklet_id": snapshot.clean_subtracklet.subtracklet_id,
+                        "subtracklet_segment_id": snapshot.clean_subtracklet.segment_id,
+                    }
+                    if snapshot.clean_subtracklet is not None
+                    else {}
+                ),
             },
         )
         state_key = self._candidate_id_for_track(snapshot.track_id, active_count=1)

@@ -20,7 +20,9 @@ from uuid import uuid4
 
 import numpy as np
 
+from .actions import ActionRouter
 from .assignment import gated_global_assignment
+from .aggregation import weighted_unit_mean
 from .absorption import AppearanceAbsorptionManager
 from .calibration import (
     DEFAULT_APPEARANCE_CALIBRATOR,
@@ -40,11 +42,13 @@ from .types import (
     CandidateRecord,
     Decision,
     DecisionKind,
+    EvidenceSummary,
     FeatureBundle,
     GaitEnrollmentEvent,
     GaitQualityBand,
     GaitReadinessReport,
     Observation,
+    Prototype,
     PromotionResult,
     ScoreBreakdown,
     VerificationState,
@@ -905,6 +909,7 @@ class CrossEventVerifier:
         event_key: str,
         stability: float,
         sample_count: int,
+        aggregated_gait_quality: float | None = None,
         update_existing_event: bool = False,
     ) -> Decision:
         """把一个视觉身份下的独立步态事件写入其步态原型集合。
@@ -914,6 +919,9 @@ class CrossEventVerifier:
         一次性外观请求。GaitGraph2 权重保持只读，写入的只是其输出向量。
         传入 ``update_existing_event=True`` 时，同一采集会话的后续稳定窗口
         会更新该事件代表向量，但不会增加独立事件数量。
+        ``aggregated_gait_quality`` 用于质量加权时序窗口：它代表整个稳定
+        窗口的有效质量，而不是最后一帧的质量。未提供时保持旧 API，按
+        ``observation.quality`` 计算。
         """
 
         normalized = observation.normalized()
@@ -921,16 +929,35 @@ class CrossEventVerifier:
             raise ValueError(f"unknown visual identity: {identity_id}")
         if not normalized.features.has_gait:
             raise ValueError("gait prototype enrollment requires a gait feature")
-        gait_quality = normalized.quality.gait_availability(
-            self.config.minimum_frames,
-            self.config.minimum_gait_cycles,
-        )
-        gait_band = normalized.quality.gait_quality_band(
-            minimum_frames=self.config.minimum_frames,
-            minimum_gait_cycles=self.config.minimum_gait_cycles,
-            partial_threshold=self.config.partial_gait_quality,
-            strong_threshold=self.config.strong_gait_quality,
-        )
+        action_prediction = ActionRouter.from_metadata(normalized.metadata)
+        if action_prediction is not None and not ActionRouter().allows_walk(action_prediction):
+            raise ValueError(
+                "gait prototype enrollment requires a strong WALK action prediction"
+            )
+        if aggregated_gait_quality is None:
+            gait_quality = normalized.quality.gait_availability(
+                self.config.minimum_frames,
+                self.config.minimum_gait_cycles,
+            )
+            gait_band = normalized.quality.gait_quality_band(
+                minimum_frames=self.config.minimum_frames,
+                minimum_gait_cycles=self.config.minimum_gait_cycles,
+                partial_threshold=self.config.partial_gait_quality,
+                strong_threshold=self.config.strong_gait_quality,
+            )
+        else:
+            if not np.isfinite(float(aggregated_gait_quality)):
+                raise ValueError("aggregated gait quality must be finite")
+            gait_quality = float(np.clip(aggregated_gait_quality, 0.0, 1.0))
+            gait_band = (
+                GaitQualityBand.STRONG
+                if gait_quality >= self.config.strong_gait_quality
+                else (
+                    GaitQualityBand.PARTIAL
+                    if gait_quality >= self.config.partial_gait_quality
+                    else GaitQualityBand.INVALID
+                )
+            )
         if gait_band != GaitQualityBand.STRONG:
             raise ValueError(
                 "gait prototype enrollment requires STRONG gait quality: "
@@ -1001,6 +1028,7 @@ class CrossEventVerifier:
                 tta_mode=normalized.tta_mode,
                 coordinate_contract=normalized.coordinate_contract,
                 embedding_dimensions=dict(normalized.embedding_dimensions),
+                action_type="WALK",
             )
         memory_snapshot = self.memory.snapshot(identity_id)
         db_snapshot = self.store.snapshot_identity(
@@ -1009,36 +1037,71 @@ class CrossEventVerifier:
         )
         try:
             with self.store.transaction():
-                updates = self.memory.add_formal(
-                    identity_id,
-                    FeatureBundle(gait=event.vector),
-                    gait_quality=gait_quality,
-                    camera_id=normalized.camera_id,
-                    view_angle=normalized.quality.view_angle,
-                    source_event_id=normalized.event_id,
-                    model_version=normalized.model_version,
-                    feature_schema=normalized.feature_schema,
-                    artifact_sha256=normalized.artifact_sha256,
-                    preprocess_version=normalized.preprocess_version,
-                    joint_format=normalized.joint_format,
-                    sequence_length=normalized.sequence_length,
-                    tta_mode=normalized.tta_mode,
-                    coordinate_contract=normalized.coordinate_contract,
-                    embedding_dimensions=dict(normalized.embedding_dimensions),
-                    enforce_append_gate=False,
-                )
-                if not any(item.modality == "gait" for item in updates):
-                    raise ValueError("gait prototype update produced no gait memory update")
-                self.store.save_prototypes(
-                    list(self.memory.formal_prototypes(identity_id)),
-                    replace_identity=identity_id,
-                    zone="formal",
-                )
                 if not self.store.save_gait_enrollment_event(
                     event,
                     replace_existing=existing_event is not None,
                 ):
                     raise ValueError("gait enrollment event already exists")
+                events = self.load_gait_enrollment_events(identity_id)
+                event_weights = np.asarray(
+                    [
+                        max(float(item.quality) * float(item.stability), 0.05)
+                        for item in events
+                    ],
+                    dtype=np.float32,
+                )
+                derived_vector = weighted_unit_mean(
+                    [item.vector for item in events],
+                    event_weights,
+                )
+                if derived_vector is None:
+                    raise ValueError("event-derived gait model has no valid vector")
+                total_weight = max(float(event_weights.sum()), 1e-8)
+                derived_quality = float(
+                    np.dot(
+                        event_weights,
+                        np.asarray([item.quality for item in events], dtype=np.float32),
+                    )
+                    / total_weight
+                )
+                derived_prototype = Prototype(
+                    identity_id=identity_id,
+                    modality="gait",
+                    vector=derived_vector,
+                    zone="formal",
+                    quality=derived_quality,
+                    camera_id=event.camera_id,
+                    view_angle=event.view_angle,
+                   source_event_id=event.event_id,
+                    prototype_id=f"{identity_id}:gait:derived:{uuid4().hex}",
+                    model_version=event.model_version,
+                    feature_schema=event.feature_schema,
+                    artifact_sha256=event.artifact_sha256,
+                    preprocess_version=event.preprocess_version,
+                    joint_format=event.joint_format,
+                    sequence_length=event.sequence_length,
+                    tta_mode=event.tta_mode,
+                    coordinate_contract=event.coordinate_contract,
+                    embedding_dimensions=dict(event.embedding_dimensions),
+                )
+                self.memory.replace_formal_modality(
+                    identity_id,
+                    "gait",
+                    (derived_prototype,),
+                )
+                self.store.save_prototypes(
+                    list(self.memory.formal_prototypes(identity_id)),
+                    replace_identity=identity_id,
+                    zone="formal",
+                )
+                self.store.save_derived_gait_model(
+                    identity_id=identity_id,
+                    vector=derived_vector,
+                    quality=derived_quality,
+                    support_count=len(events),
+                    source_event_ids=[item.event_id for item in events],
+                    contract_event=event,
+                )
                 self.store.save_observation(normalized, candidate_id=None)
                 self.store.audit(
                     (
@@ -1053,6 +1116,8 @@ class CrossEventVerifier:
                         "sample_count": int(event.sample_count),
                         "stability": stability,
                         "quality": gait_quality,
+                        "derived_model_support_count": len(events),
+                        "derived_model_prototype_id": derived_prototype.prototype_id,
                     },
                 )
             self.rebuild_index()
@@ -1186,6 +1251,31 @@ class CrossEventVerifier:
             return 0.5
         return 0.20
 
+    def _view_evidence(
+        self,
+        observation: Observation,
+        identity_id: str,
+        modality: str,
+    ) -> float:
+        """Estimate whether the query view is represented by the gallery."""
+
+        query_view = observation.quality.view_angle
+        prototypes = self.memory.formal_prototypes(identity_id, modality)
+        if not query_view or not prototypes:
+            return 0.5
+        known_views = {
+            str(item.view_angle).strip().lower()
+            for item in prototypes
+            if item.view_angle
+        }
+        if not known_views:
+            return 0.5
+        return (
+            1.0
+            if str(query_view).strip().lower() in known_views
+            else 0.35
+        )
+
     def _score_identity(self, observation: Observation, identity_id: str) -> ScoreBreakdown:
         """在两个生物特征分支上独立评估一个正式身份。"""
         features = observation.features.normalized()
@@ -1224,6 +1314,39 @@ class CrossEventVerifier:
             self.config.minimum_frames,
             self.config.minimum_gait_cycles,
         ) if gait_similarity is not None else 0.0
+        appearance_dispersion = self.memory.modality_dispersion(
+            identity_id,
+            "appearance",
+        )
+        gait_events = self.load_gait_enrollment_events(identity_id)
+        if len(gait_events) >= 2:
+            event_distances = [
+                1.0 - float(np.dot(left.vector, right.vector))
+                for index, left in enumerate(gait_events)
+                for right in gait_events[index + 1 :]
+                if left.vector.shape == right.vector.shape
+            ]
+            gait_dispersion = (
+                float(np.mean(event_distances))
+                if event_distances
+                else self.memory.modality_dispersion(identity_id, "gait")
+            )
+        else:
+            gait_dispersion = self.memory.modality_dispersion(identity_id, "gait")
+        appearance_support = self.memory.source_event_count(
+            identity_id,
+            "appearance",
+        )
+        gait_event_count = len(gait_events)
+        # A directly trusted formal gait prototype has one explicit support
+        # even before the event-history projection is populated. Event-derived
+        # models retain the actual independent-event count.
+        gait_support = gait_event_count or (1 if gait_proto is not None else 0)
+        view_evidence = self._view_evidence(
+            observation,
+            identity_id,
+            "gait" if gait_similarity is not None else "appearance",
+        )
         fusion = fuse_calibrated_scores(
             appearance_similarity=appearance_similarity,
             gait_similarity=gait_similarity,
@@ -1253,6 +1376,11 @@ class CrossEventVerifier:
             gait_quality=gait_quality,
             appearance_prototype_id=appearance_proto.prototype_id if appearance_proto else None,
             gait_prototype_id=gait_proto.prototype_id if gait_proto else None,
+            appearance_prototype_dispersion=appearance_dispersion,
+            gait_prototype_dispersion=gait_dispersion,
+            appearance_event_support_count=appearance_support,
+            gait_event_support_count=gait_support,
+            view_evidence=view_evidence,
         )
 
     def rank(self, observation: Observation) -> tuple[ScoreBreakdown, ...]:
@@ -1480,6 +1608,12 @@ class CrossEventVerifier:
             quality >= self.config.strong_gait_quality
             and probability >= self.config.strong_gait_probability
             and margin >= self.config.strong_gait_margin
+            and winner.gait_event_support_count
+            >= self.config.minimum_gait_event_support_for_strong_match
+            and winner.gait_prototype_dispersion
+            <= self.config.maximum_formal_gait_dispersion
+            and winner.view_evidence
+            >= self.config.minimum_view_evidence_for_strong_match
         ):
             return Decision(
                 kind=DecisionKind.FORMAL_MATCH,
@@ -1573,6 +1707,12 @@ class CrossEventVerifier:
             (winner.gait_probability or 0.0) >= self.config.strong_gait_probability
             and winner.gait_quality >= self.config.strong_gait_quality
             and margin >= self.config.strong_gait_margin
+            and winner.gait_event_support_count
+            >= self.config.minimum_gait_event_support_for_strong_match
+            and winner.gait_prototype_dispersion
+            <= self.config.maximum_formal_gait_dispersion
+            and winner.view_evidence
+            >= self.config.minimum_view_evidence_for_strong_match
         ):
             return winner, margin
         return None, margin
@@ -1785,6 +1925,99 @@ class CrossEventVerifier:
             if features.has_gait and self.memory.formal_prototypes(identity_id, "gait"):
                 return True
         return False
+
+    @staticmethod
+    def _attach_evidence_summary(
+        decision: Decision,
+        ranking: Sequence[ScoreBreakdown],
+    ) -> Decision:
+        """Expose multi-evidence signals alongside the public decision."""
+
+        selected = next(
+            (
+                item
+                for item in ranking
+                if decision.identity_id is not None
+                and item.identity_id == decision.identity_id
+            ),
+            None,
+        )
+        selected = selected or (ranking[0] if ranking else None)
+        alternatives = [
+            item
+            for item in ranking
+            if selected is None or item.identity_id != selected.identity_id
+        ]
+        second = max(
+            alternatives,
+            key=lambda item: item.fused_probability,
+            default=None,
+        )
+        signals: list[str] = []
+        if selected is None:
+            signals.append("no_ranked_evidence")
+        else:
+            if selected.gait_probability is not None:
+                signals.append("gait_evidence_present")
+            if selected.appearance_probability is not None:
+                signals.append("appearance_evidence_present")
+            if selected.gait_event_support_count > 1:
+                signals.append("independent_event_support")
+            elif selected.gait_probability is not None:
+                signals.append("single_event_or_direct_template")
+            if selected.gait_prototype_dispersion > 0.0:
+                signals.append("gait_intra_class_dispersion_observed")
+            if selected.appearance_prototype_dispersion > 0.0:
+                signals.append("appearance_intra_class_dispersion_observed")
+            if selected.view_evidence < 0.5:
+                signals.append("view_not_represented")
+            if selected.conflict:
+                signals.append("branch_conflict")
+        summary = EvidenceSummary(
+            top_identity_id=selected.identity_id if selected else None,
+            fused_score=selected.fused_probability if selected else decision.score,
+            second_fused_score=second.fused_probability if second else None,
+            margin=decision.margin,
+            gait_probability=selected.gait_probability if selected else None,
+            gait_quality=selected.gait_quality if selected else 0.0,
+            gait_event_support_count=(
+                selected.gait_event_support_count if selected else 0
+            ),
+            gait_prototype_dispersion=(
+                selected.gait_prototype_dispersion if selected else 0.0
+            ),
+            appearance_event_support_count=(
+                selected.appearance_event_support_count if selected else 0
+            ),
+            appearance_prototype_dispersion=(
+                selected.appearance_prototype_dispersion if selected else 0.0
+            ),
+            view_evidence=selected.view_evidence if selected else 0.5,
+            signals=tuple(signals),
+        )
+        return replace(decision, evidence_summary=summary)
+
+    @staticmethod
+    def _evidence_summary_payload(decision: Decision) -> dict[str, Any]:
+        """Flatten the public evidence summary into an audit-safe payload."""
+
+        summary = decision.evidence_summary
+        if summary is None:
+            return {}
+        return {
+            "top_identity_id": summary.top_identity_id,
+            "fused_score": summary.fused_score,
+            "second_fused_score": summary.second_fused_score,
+            "margin": summary.margin,
+            "gait_probability": summary.gait_probability,
+            "gait_quality": summary.gait_quality,
+            "gait_event_support_count": summary.gait_event_support_count,
+           "gait_prototype_dispersion": summary.gait_prototype_dispersion,
+            "appearance_event_support_count": summary.appearance_event_support_count,
+            "appearance_prototype_dispersion": summary.appearance_prototype_dispersion,
+           "view_evidence": summary.view_evidence,
+            "signals": summary.signals,
+        }
 
     def _decision_from_ranking(
         self,
@@ -2245,6 +2478,7 @@ class CrossEventVerifier:
                 )
             # Do not hide the raw alternatives from the caller or audit log.
             decision = replace(decision, ranking=ranking)
+        decision = self._attach_evidence_summary(decision, ranking)
         # 正式结果可以更新正式图库。其他所有结果都进入隔离区，只能通过证据
         # 累积和下面的晋升策略继续推进。
         if decision.kind in {
@@ -2324,6 +2558,7 @@ class CrossEventVerifier:
                     "event_id": observation.event_id,
                     "score": decision.score,
                     "margin": decision.margin,
+                    "evidence": self._evidence_summary_payload(decision),
                 },
             )
             return replace(decision, appearance_request_id=request_id)
@@ -2421,6 +2656,7 @@ class CrossEventVerifier:
             "feature_schema": observation.feature_schema,
             "calibration_version": observation.calibration_version,
             "threshold_version": observation.threshold_version,
+            "evidence": self._evidence_summary_payload(decision),
         }
         if evidence_payload["gait_anchor"]:
             candidate.metadata.setdefault("gait_anchor_events", []).append(observation.event_id)

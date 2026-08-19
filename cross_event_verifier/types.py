@@ -165,6 +165,58 @@ class EmbeddingContract:
 
 
 @dataclass(frozen=True)
+class CleanSubTracklet:
+    """一次硬轨迹边界之后可供步态分支使用的子轨迹摘要。
+
+    ``frame_start`` 和 ``frame_end`` 是当前保留窗口的首尾帧（含首尾），
+    ``boundary_reasons`` 说明前一个子轨迹为何被关闭，不把新子轨迹的帧
+    自动判为污染；``quality_reasons`` 只描述当前窗口。姿态序列仍由视觉
+    适配器内部持有，避免每帧把大数组复制到所有下游调用方。
+    """
+
+    source_track_id: int
+    segment_id: int
+    frame_start: int
+    frame_end: int
+    frame_count: int
+    valid_pose_frames: int
+    valid_leg_frames: int
+    quality_score: float = 0.0
+    boundary_reasons: tuple[str, ...] = ()
+    quality_reasons: tuple[str, ...] = ()
+    view_coverage: tuple[str, ...] = ()
+
+    @property
+    def subtracklet_id(self) -> str:
+        """返回稳定的 ``track_id:segment_id`` 审计键。"""
+
+        return f"{self.source_track_id}:{self.segment_id}"
+
+    @property
+    def real_pose_coverage(self) -> float:
+        """返回当前窗口真实有效姿态帧的覆盖率。"""
+
+        if self.frame_count <= 0:
+            return 0.0
+        return float(
+            np.clip(self.valid_pose_frames / max(self.frame_count, 1), 0.0, 1.0)
+        )
+
+    @property
+    def is_clean(self) -> bool:
+        """当前窗口是否没有已知的硬污染原因。"""
+
+        hard_reasons = {
+            "box_truncated",
+            "invalid_box",
+            "legs_invisible",
+            "track_id_switch",
+            "track_gap",
+        }
+        return not any(reason in hard_reasons for reason in self.quality_reasons)
+
+
+@dataclass(frozen=True)
 class FeatureBundle:
     """视觉适配器提供的归一化外观和步态嵌入。
 
@@ -692,6 +744,29 @@ class ScoreBreakdown:
     appearance_prototype_id: str | None = None
     gait_prototype_id: str | None = None
     conflict: bool = False
+    appearance_prototype_dispersion: float = 0.0
+    gait_prototype_dispersion: float = 0.0
+    appearance_event_support_count: int = 0
+    gait_event_support_count: int = 0
+    view_evidence: float = 0.5
+
+
+@dataclass(frozen=True)
+class EvidenceSummary:
+    """Evidence exposed by the multi-signal decision engine."""
+
+    top_identity_id: str | None = None
+    fused_score: float | None = None
+    second_fused_score: float | None = None
+    margin: float | None = None
+    gait_probability: float | None = None
+    gait_quality: float = 0.0
+    gait_event_support_count: int = 0
+    gait_prototype_dispersion: float = 0.0
+    appearance_event_support_count: int = 0
+    appearance_prototype_dispersion: float = 0.0
+    view_evidence: float = 0.5
+    signals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -708,6 +783,25 @@ class Decision:
     challenge_prompt: str | None = None
     evidence_id: str | None = None
     appearance_request_id: str | None = None
+    evidence_summary: EvidenceSummary | None = None
+
+    @property
+    def open_set_label(self) -> str:
+        """Collapse internal workflow kinds to KNOWN/AMBIGUOUS/UNKNOWN."""
+
+        if self.kind in {
+            DecisionKind.FORMAL_MATCH,
+            DecisionKind.APPEARANCE_RESPONSE_ACCEPTED,
+        } and self.state == VerificationState.CONFIRMED_IDENTITY:
+            return "KNOWN"
+        if self.kind in {
+            DecisionKind.AMBIGUOUS,
+            DecisionKind.CONFLICT,
+            DecisionKind.DEFERRED,
+            DecisionKind.NEED_MORE_DATA,
+        }:
+            return "AMBIGUOUS"
+        return "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -749,6 +843,10 @@ class GaitEnrollmentEvent:
     tta_mode: str = "unknown"
     coordinate_contract: str = "unknown"
     embedding_dimensions: Mapping[str, int] = field(default_factory=dict)
+    # V1 keeps the legacy gait table explicitly WALK-only.  Future action
+    # banks will use their own action-conditioned contract instead of silently
+    # mixing non-WALK vectors into this event stream.
+    action_type: str = "WALK"
 
     def __post_init__(self) -> None:
         """保证事件代表向量满足与 Prototype 相同的数值不变量。"""
@@ -770,6 +868,12 @@ class GaitEnrollmentEvent:
             "embedding_dimensions",
             MappingProxyType(dimensions),
         )
+        action_type = str(self.action_type or "WALK").strip().upper()
+        if action_type != "WALK":
+            raise ValueError(
+                "gait enrollment events are WALK-only; route other actions to an action bank"
+            )
+        object.__setattr__(self, "action_type", action_type)
 
 
 @dataclass(frozen=True)

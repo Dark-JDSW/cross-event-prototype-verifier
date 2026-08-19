@@ -93,6 +93,59 @@ class PrototypeMemory:
             return tuple(values.get(modality, ()))
         return tuple(proto for group in values.values() for proto in group)
 
+    def modality_dispersion(self, identity_id: str, modality: str) -> float:
+        """Return mean pairwise cosine distance for one formal modality."""
+
+        prototypes = self.formal_prototypes(identity_id, modality)
+        if len(prototypes) < 2:
+            return 0.0
+        distances: list[float] = []
+        for index, left in enumerate(prototypes):
+            for right in prototypes[index + 1 :]:
+                if left.vector.shape != right.vector.shape:
+                    continue
+                distances.append(1.0 - self._similarity(left.vector, right.vector))
+        return float(np.mean(distances)) if distances else 0.0
+
+    def source_event_count(self, identity_id: str, modality: str) -> int:
+        """Count distinct source events represented by formal prototypes."""
+
+        sources = {
+            str(proto.source_event_id)
+            for proto in self.formal_prototypes(identity_id, modality)
+            if proto.source_event_id
+        }
+        return len(sources)
+
+    def replace_formal_modality(
+        self,
+        identity_id: str,
+        modality: str,
+        prototypes: Iterable[Prototype],
+    ) -> None:
+        """Replace one formal modality with a derived prototype set.
+
+        This is the seam used by event-derived models.  It avoids routing a
+        derived identity model through the ordinary EMA append path, while
+        leaving the existing memory policy intact for direct observations.
+        """
+
+        if modality not in {"appearance", "gait"}:
+            raise ValueError(f"unsupported modality: {modality}")
+        values = list(prototypes)
+        for prototype in values:
+            if prototype.identity_id != identity_id:
+                raise ValueError("prototype identity does not match replacement identity")
+            if prototype.modality != modality:
+                raise ValueError("prototype modality does not match replacement modality")
+            if prototype.zone != "formal":
+                raise ValueError("derived formal prototypes must use the formal zone")
+        group = self.formal.setdefault(identity_id, {})
+        if values:
+            group[modality] = values
+        else:
+            group.pop(modality, None)
+
     def quarantine_prototypes(self, candidate_id: str, modality: str | None = None) -> tuple[Prototype, ...]:
         """读取某个候选人的隔离原型。"""
         values = self.quarantine.get(candidate_id, {})

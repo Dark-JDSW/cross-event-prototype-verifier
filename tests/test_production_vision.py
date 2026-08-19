@@ -15,6 +15,7 @@ from cross_event_verifier.gait_graph import (
 from cross_event_verifier.production_vision import (
     ProductionVisionAdapter,
     ProductionVisionConfig,
+    ProductionVisionError,
     _RtmposeEstimator,
     _canonical_pose,
 )
@@ -46,6 +47,32 @@ class _FakeTruncatedDetector(_FakeDetector):
         return detections
 
 
+class _GapDetector:
+    def __init__(self, _config):
+        self.calls = 0
+
+    def track(self, _frame):
+        self.calls += 1
+        if self.calls == 2:
+            return ()
+        item = type("Detection", (), {})()
+        item.track_id = 7
+        item.box = (20, 10, 100, 190)
+        item.confidence = 0.93
+        return (item,)
+
+    def reset(self):
+        pass
+
+
+class _JumpingDetector(_FakeDetector):
+    def track(self, _frame):
+        detections = super().track(_frame)
+        if self.calls > 1:
+            detections[0].box = (350, 10, 430, 190)
+        return detections
+
+
 class _FakePose:
     providers = ("FakeExecutionProvider",)
 
@@ -60,6 +87,11 @@ class _FakePose:
         return [points.copy() for _ in boxes]
 
 
+class _ShortPose(_FakePose):
+    def extract(self, _frame, _boxes):
+        return []
+
+
 class _FakeAppearance:
     def __init__(self, _path, _device):
         self.batch_sizes = []
@@ -68,6 +100,15 @@ class _FakeAppearance:
         self.batch_sizes.append(len(boxes))
         vector = np.zeros(512, dtype=np.float32)
         vector[0] = 1.0
+        return [vector.copy() for _ in boxes]
+
+
+class _DriftingAppearance(_FakeAppearance):
+    def extract(self, _frame, boxes):
+        self.batch_sizes.append(len(boxes))
+        self.calls = getattr(self, "calls", 0) + 1
+        vector = np.zeros(512, dtype=np.float32)
+        vector[0 if self.calls == 1 else 1] = 1.0
         return [vector.copy() for _ in boxes]
 
 
@@ -125,6 +166,89 @@ class ProductionVisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProductionVisionConfig(device="cpu")
 
+    def test_production_process_rejects_invalid_frame_shape(self) -> None:
+        with patch(
+            "cross_event_verifier.production_vision.production_readiness",
+            return_value=(True, ()),
+        ):
+            adapter = ProductionVisionAdapter()
+        with self.assertRaisesRegex(ValueError, r"shape \(height, width, 3\)"):
+            adapter.process(np.zeros((100, 100), dtype=np.uint8))
+
+    def test_process_at_rejects_non_finite_timestamp(self) -> None:
+        with patch(
+            "cross_event_verifier.production_vision.production_readiness",
+            return_value=(True, ()),
+        ):
+            adapter = ProductionVisionAdapter()
+        with self.assertRaisesRegex(ValueError, "timestamp must be finite"):
+            adapter.process_at(
+                np.zeros((100, 100, 3), dtype=np.uint8),
+                timestamp=float("nan"),
+            )
+
+    def test_production_process_rejects_misaligned_pose_output(self) -> None:
+        frame = np.zeros((200, 240, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _FakeDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _ShortPose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter()
+            with self.assertRaisesRegex(
+                ProductionVisionError,
+                "RTMPose 输出数量与检测框数量不一致",
+            ):
+                adapter.process(frame)
+
+    def test_continuous_track_reports_appearance_drift_without_forcing_id_switch(self) -> None:
+        config = ProductionVisionConfig(
+            detector_inference_stride=2,
+            appearance_stride=1,
+            gait_sequence_length=8,
+            minimum_pose_frames=8,
+        )
+        frame = np.zeros((200, 240, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _FakeDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _DriftingAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            first = adapter.process(frame)
+            second = adapter.process(frame)
+
+        self.assertFalse(first[0].metadata["appearance_change_suspected"])
+        self.assertTrue(second[0].metadata["appearance_change_suspected"])
+        self.assertAlmostEqual(
+            float(second[0].metadata["appearance_similarity_to_previous"]),
+            0.0,
+            places=6,
+        )
+        self.assertEqual(second[0].quality.id_switches, 0)
+
     def test_gait_pose_keeps_full_frame_coordinates(self) -> None:
         """GaitGraph2 receives GREW-style image coordinates, not box coordinates."""
         points = np.zeros((17, 3), dtype=np.float32)
@@ -137,6 +261,119 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertIsNotNone(canonical)
         np.testing.assert_allclose(canonical[:, 0], 300.0)
         np.testing.assert_allclose(canonical[:, 1], 200.0)
+
+    def test_production_track_exposes_clean_subtracklet_summary(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+            appearance_stride=30,
+        )
+        frame = np.zeros((200, 240, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _FakeDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            tracks = adapter.process(frame)
+
+        summary = tracks[0].clean_subtracklet
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary.subtracklet_id, "7:0")
+        self.assertEqual(summary.frame_start, 1)
+        self.assertEqual(summary.frame_end, 1)
+        self.assertEqual(summary.frame_count, 1)
+        self.assertEqual(summary.valid_pose_frames, 1)
+        self.assertGreater(summary.real_pose_coverage, 0.99)
+
+    def test_track_gap_starts_new_clean_subtracklet_without_old_pose_slots(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+            appearance_stride=30,
+            maximum_track_gap_seconds=0.10,
+            state_retention_seconds=1.0,
+        )
+        frame = np.zeros((200, 240, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _GapDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            first = adapter.process_at(frame, timestamp=0.0)
+            self.assertEqual(first[0].clean_subtracklet.segment_id, 0)
+            self.assertEqual(adapter.process_at(frame, timestamp=0.05), ())
+            recovered = adapter.process_at(frame, timestamp=0.50)
+
+        summary = recovered[0].clean_subtracklet
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary.segment_id, 1)
+        self.assertEqual(summary.boundary_reasons, ("track_gap",))
+        self.assertEqual(summary.frame_start, 3)
+        self.assertEqual(summary.frame_count, 1)
+        self.assertEqual(len(adapter.states[7].poses), 1)
+
+    def test_abrupt_jump_starts_new_subtracklet_and_drops_old_gait_window(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+            appearance_stride=30,
+        )
+        frame = np.zeros((200, 600, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _JumpingDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            adapter.process(frame)
+            jumped = adapter.process(frame)
+
+        summary = jumped[0].clean_subtracklet
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary.segment_id, 1)
+        self.assertEqual(summary.boundary_reasons, ("track_id_switch",))
+        self.assertEqual(summary.frame_count, 1)
+        self.assertEqual(summary.valid_pose_frames, 0)
+        self.assertEqual(len(adapter.states[7].poses), 1)
+        self.assertEqual(jumped[0].quality.id_switches, 1)
 
     def test_production_adapter_applies_hot_thresholds_without_model_reload(self) -> None:
         with patch(

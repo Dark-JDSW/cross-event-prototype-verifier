@@ -25,6 +25,11 @@ class VerifierConfig:
     minimum_matching_quality: float = 0.38
     partial_gait_quality: float = 0.35
     maximum_write_occlusion: float = 0.40
+    # A quality-weighted gait window may include partial observations, but the
+    # accumulated contribution must still reach this fraction of the nominal
+    # sample mass before it can produce a stable template.
+    minimum_weighted_gait_mass: float = 0.70
+    allow_partial_gait_samples: bool = True
 
     # 开放集决策策略。这些是校准概率而不是原始余弦相似度，应使用部署验证
     # 数据进行调节。
@@ -53,6 +58,9 @@ class VerifierConfig:
     strong_gait_probability: float = 0.90
     strong_gait_quality: float = 0.70
     strong_gait_margin: float = 0.08
+    maximum_formal_gait_dispersion: float = 0.60
+    minimum_gait_event_support_for_strong_match: int = 1
+    minimum_view_evidence_for_strong_match: float = 0.30
     strong_appearance_probability: float = 0.90
     strong_appearance_quality: float = 0.70
     # Only a high-quality appearance below this raw cosine is a hard visual
@@ -148,6 +156,7 @@ class VerifierConfig:
             "minimum_matching_quality": self.minimum_matching_quality,
             "partial_gait_quality": self.partial_gait_quality,
             "maximum_write_occlusion": self.maximum_write_occlusion,
+            "minimum_weighted_gait_mass": self.minimum_weighted_gait_mass,
             "accept_threshold": self.accept_threshold,
             "defer_threshold": self.defer_threshold,
             "margin_threshold": self.margin_threshold,
@@ -161,6 +170,8 @@ class VerifierConfig:
             "strong_gait_probability": self.strong_gait_probability,
             "strong_gait_quality": self.strong_gait_quality,
             "strong_gait_margin": self.strong_gait_margin,
+            "maximum_formal_gait_dispersion": self.maximum_formal_gait_dispersion,
+            "minimum_view_evidence_for_strong_match": self.minimum_view_evidence_for_strong_match,
             "strong_appearance_probability": self.strong_appearance_probability,
             "strong_appearance_quality": self.strong_appearance_quality,
             "appearance_conflict_similarity": self.appearance_conflict_similarity,
@@ -194,6 +205,10 @@ class VerifierConfig:
             )
         if self.minimum_frames < 1:
             raise ValueError("minimum_frames must be positive")
+        if self.minimum_gait_event_support_for_strong_match < 1:
+            raise ValueError(
+                "minimum_gait_event_support_for_strong_match must be positive"
+            )
         if self.gait_learning_min_frames < 1:
             raise ValueError("gait_learning_min_frames must be positive")
         if self.gait_identity_min_frames < self.gait_learning_min_frames:

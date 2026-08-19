@@ -22,11 +22,12 @@ from typing import Sequence
 import cv2
 import numpy as np
 
+from .actions import conservative_walk_prediction
 from .adapters import occlusion_scores
 from .gait_graph import TemporalGaitEncoder
 from .model_assets import tensor_state_fingerprint
 from .osnet_ain import load_osnet_ain
-from .types import FeatureBundle, TrackQuality
+from .types import CleanSubTracklet, FeatureBundle, TrackQuality
 from .vision import Box, VisionTrack
 
 
@@ -69,6 +70,7 @@ class ProductionVisionConfig:
     gait_sequence_length: int = 60
     detector_inference_stride: int = 1
     appearance_stride: int = 6
+    appearance_change_suspect_similarity: float = 0.55
     gait_inference_stride: int = 3
     low_light_threshold: float = 100.0
     low_light_check_interval: int = 12
@@ -87,6 +89,7 @@ class ProductionVisionConfig:
             "output_confidence",
             "detector_iou",
             "keypoint_confidence",
+            "appearance_change_suspect_similarity",
         ):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
@@ -481,6 +484,18 @@ class _RtmposeEstimator:
         except Exception as error:
             raise ProductionVisionError(f"RTMPose 推理失败：{error}") from error
         self.last_latency_ms = (time.perf_counter() - started) * 1000.0
+        simcc_x = np.asarray(simcc_x)
+        simcc_y = np.asarray(simcc_y)
+        if (
+            simcc_x.ndim != 3
+            or simcc_y.ndim != 3
+            or simcc_x.shape[0] < count
+            or simcc_y.shape[0] < count
+        ):
+            raise ProductionVisionError(
+                "RTMPose 输出张量形状无效："
+                f"x={simcc_x.shape}, y={simcc_y.shape}"
+            )
         simcc_x, simcc_y = simcc_x[:count], simcc_y[:count]
         positions_x, positions_y, confidence = self._decode_simcc(simcc_x, simcc_y)
         for row, destination_index in enumerate(indexes):
@@ -516,6 +531,7 @@ class _RtmposeEstimator:
 
 class _OsnetAppearanceExtractor:
     """批量处理 OSNet-AIN 裁剪图，并返回 L2 归一化外观向量。"""
+
     output_dimension = 512
     def __init__(self, path: Path, device: str | None) -> None:
         """在选定的 Torch 设备上加载一次 OSNet-AIN。"""
@@ -566,6 +582,11 @@ class _OsnetAppearanceExtractor:
                 features = feature_tensor.float().cpu().numpy()
         except Exception as error:
             raise ProductionVisionError(f"OSNet-AIN 推理失败：{error}") from error
+        if features.ndim != 2 or features.shape != (len(indexes), self.output_dimension):
+            raise ProductionVisionError(
+                "OSNet-AIN 输出维度无效："
+                f"actual={features.shape}, expected={(len(indexes), self.output_dimension)}"
+            )
         for row, destination_index in enumerate(indexes):
             vector = features[row].astype(np.float32)
             norm = float(np.linalg.norm(vector))
@@ -590,9 +611,15 @@ class _TrackState:
     last_valid_timestamp: float | None = None
     appearance: np.ndarray | None = None
     last_appearance_frame: int | None = None
+    appearance_similarity_to_previous: float | None = None
+    appearance_change_suspected: bool = False
     gait: np.ndarray | None = None
     last_gait_frame: int | None = None
     id_switches: int = 0
+    segment_id: int = 0
+    segment_start_frame: int = 0
+    segment_boundary_reasons: tuple[str, ...] = ()
+    views: deque[str | None] = field(default_factory=lambda: deque(maxlen=60))
 
 
 def _box_valid(box: Box) -> bool:
@@ -954,12 +981,11 @@ class ProductionVisionAdapter:
         self.enhancer.interval = max(1, candidate.low_light_check_interval)
         if reset_gait:
             for state in self.states.values():
-                state.poses.clear()
-                state.timestamps.clear()
-                state.valid_pose_frames = 0
-                state.valid_leg_frames = 0
-                state.gait = None
-                state.last_gait_frame = None
+                self._start_new_subtracklet(
+                    state,
+                    self.frame_index,
+                    ("runtime_parameter_change",),
+                )
 
     def reset(self) -> None:
         """清除跟踪器状态、时序窗口和缓存的轨迹输出。"""
@@ -1048,6 +1074,34 @@ class ProductionVisionAdapter:
                 self.latest.pop(track_id, None)
 
     @staticmethod
+    def _start_new_subtracklet(
+        state: _TrackState,
+        frame_index: int,
+        reasons: Sequence[str],
+        *,
+        clear_appearance: bool = False,
+    ) -> None:
+        """关闭旧时序窗口，并从当前帧开始一个新的干净子轨迹。"""
+
+        state.segment_id += 1
+        state.segment_start_frame = int(frame_index)
+        state.segment_boundary_reasons = tuple(dict.fromkeys(str(item) for item in reasons))
+        state.poses.clear()
+        state.timestamps.clear()
+        state.boxes.clear()
+        state.views.clear()
+        state.valid_pose_frames = 0
+        state.valid_leg_frames = 0
+        state.last_valid_timestamp = None
+        state.gait = None
+        state.last_gait_frame = None
+        state.appearance_similarity_to_previous = None
+        state.appearance_change_suspected = False
+        if clear_appearance:
+            state.appearance = None
+            state.last_appearance_frame = None
+
+    @staticmethod
     def _append_missing_slot(state: _TrackState, timestamp: float) -> None:
         """在短暂漏检期间保留一个带掩码的时间槽。"""
 
@@ -1055,6 +1109,7 @@ class ProductionVisionAdapter:
             return
         state.poses.append(np.zeros((17, 3), dtype=np.float32))
         state.timestamps.append(float(timestamp))
+        state.views.append(None)
         state.valid_pose_frames = sum(
             bool(np.any(item[:, 2] > 0.0)) for item in state.poses
         )
@@ -1071,7 +1126,10 @@ class ProductionVisionAdapter:
     ) -> tuple[VisionTrack, ...]:
         """按输入源时间戳处理一帧，保留 ``process`` 的兼容入口。"""
         previous = self._current_timestamp
-        self._current_timestamp = time.time() if timestamp is None else float(timestamp)
+        resolved_timestamp = time.time() if timestamp is None else float(timestamp)
+        if not np.isfinite(resolved_timestamp):
+            raise ValueError("timestamp must be finite")
+        self._current_timestamp = resolved_timestamp
         try:
             return self.process(frame_bgr)
         finally:
@@ -1084,10 +1142,21 @@ class ProductionVisionAdapter:
         最后输出 ``VisionTrack``。当前检测框异常时会把步态质量强制设为零，
         防止过期的缓存嵌入成为强证据。
         """
-        if frame_bgr is None or frame_bgr.size == 0:
+        if frame_bgr is None:
             return ()
+        if not isinstance(frame_bgr, np.ndarray):
+            raise TypeError("frame_bgr must be a numpy.ndarray")
+        if frame_bgr.size == 0:
+            return ()
+        if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+            raise ValueError("frame_bgr must have shape (height, width, 3)")
         started = time.perf_counter()
         self._load()
+        if any(
+            component is None
+            for component in (self.detector, self.pose, self.appearance, self.gait)
+        ):
+            raise ProductionVisionError("生产视觉模型未完成加载")
         assert self.detector is not None
         assert self.pose is not None
         assert self.appearance is not None
@@ -1109,6 +1178,11 @@ class ProductionVisionAdapter:
 
         boxes = [item.box for item in detections]
         poses = self.pose.extract(inference_frame, boxes)
+        if len(poses) != len(boxes):
+            raise ProductionVisionError(
+                "RTMPose 输出数量与检测框数量不一致："
+                f"poses={len(poses)}, boxes={len(boxes)}"
+            )
         overlaps = occlusion_scores(np.asarray(boxes, dtype=np.float32))
 
         frame_metrics: list[
@@ -1116,39 +1190,42 @@ class ProductionVisionAdapter:
         ] = []
         gait_indexes: list[int] = []
         for index, detection in enumerate(detections):
-            state = self.states.setdefault(
-                detection.track_id,
-                _TrackState(
+            state = self.states.get(detection.track_id)
+            if state is None:
+                state = _TrackState(
                     poses=deque(maxlen=self.config.gait_sequence_length),
                     timestamps=deque(maxlen=self.config.gait_sequence_length),
-                ),
-            )
+                    views=deque(maxlen=self.config.gait_sequence_length),
+                    segment_start_frame=self.frame_index,
+                )
+                self.states[detection.track_id] = state
+            hard_jump = False
             if (
                 state.last_seen_timestamp is not None
                 and timestamp - state.last_seen_timestamp
                 > self.config.maximum_track_gap_seconds
             ):
                 state.track_gap_frames += 1
-                state.poses.clear()
-                state.timestamps.clear()
-                state.gait = None
-                state.last_gait_frame = None
-                state.valid_pose_frames = 0
-                state.valid_leg_frames = 0
+                self._start_new_subtracklet(
+                    state,
+                    self.frame_index,
+                    ("track_gap",),
+                )
             if state.boxes and _abrupt_track_jump(state.boxes[-1], detection.box):
                 state.id_switches += 1
-                state.poses.clear()
-                state.timestamps.clear()
-                state.gait = None
-                state.last_gait_frame = None
-                state.appearance = None
-                state.last_appearance_frame = None
+                hard_jump = True
+                self._start_new_subtracklet(
+                    state,
+                    self.frame_index,
+                    ("track_id_switch",),
+                    clear_appearance=True,
+                )
             state.frame_count += 1
             state.last_seen_frame = self.frame_index
             state.last_seen_timestamp = timestamp
             state.boxes.append(detection.box)
             canonical = _canonical_pose(
-                poses[index],
+                None if hard_jump else poses[index],
                 detection.box,
                 self.config.keypoint_confidence,
             )
@@ -1165,6 +1242,7 @@ class ProductionVisionAdapter:
                 else np.zeros((17, 3), dtype=np.float32)
             )
             state.timestamps.append(float(timestamp))
+            state.views.append(_view_angle(canonical))
             state.valid_pose_frames = sum(
                 bool(np.any(item[:, 2] > 0.0)) for item in state.poses
             )
@@ -1257,6 +1335,31 @@ class ProductionVisionAdapter:
                 state = self.states[detections[destination].track_id]
                 state.last_appearance_frame = state.frame_count
                 if value is not None:
+                    previous = state.appearance
+                    similarity: float | None = None
+                    if previous is not None:
+                        previous_vector = np.asarray(previous, dtype=np.float32).reshape(-1)
+                        current_vector = np.asarray(value, dtype=np.float32).reshape(-1)
+                        previous_norm = float(np.linalg.norm(previous_vector))
+                        current_norm = float(np.linalg.norm(current_vector))
+                        if (
+                            previous_vector.shape == current_vector.shape
+                            and previous_norm > 1e-8
+                            and current_norm > 1e-8
+                        ):
+                            similarity = float(
+                                np.dot(previous_vector, current_vector)
+                                / (previous_norm * current_norm)
+                            )
+                    state.appearance_similarity_to_previous = similarity
+                    state.appearance_change_suspected = bool(
+                        similarity is not None
+                        and similarity < self.config.appearance_change_suspect_similarity
+                        and not {
+                            "track_gap",
+                            "track_id_switch",
+                        }.intersection(state.segment_boundary_reasons)
+                    )
                     state.appearance = value
 
         output: list[VisionTrack] = []
@@ -1338,6 +1441,36 @@ class ProductionVisionAdapter:
                 view_angle=_view_angle(canonical),
                 reasons=tuple(reasons),
             )
+            window_frame_count = len(state.poses)
+            segment = CleanSubTracklet(
+                source_track_id=detection.track_id,
+                segment_id=state.segment_id,
+                frame_start=max(
+                    state.segment_start_frame,
+                    self.frame_index - max(window_frame_count, 1) + 1,
+                ),
+                frame_end=self.frame_index,
+                frame_count=window_frame_count,
+                valid_pose_frames=state.valid_pose_frames,
+                valid_leg_frames=state.valid_leg_frames,
+                quality_score=gait_quality,
+                boundary_reasons=state.segment_boundary_reasons,
+                quality_reasons=tuple(
+                    reason
+                    for reason in reasons
+                    if reason not in {"track_gap", "track_id_switch"}
+                ),
+                view_coverage=tuple(
+                    sorted({view for view in state.views if view is not None})
+                ),
+            )
+            action_prediction = conservative_walk_prediction(
+                walking_ratio=walking_ratio,
+                gait_cycles=gait_cycles,
+                valid_pose_frames=state.valid_pose_frames,
+                valid_leg_frames=state.valid_leg_frames,
+                minimum_frames=self.config.minimum_pose_frames,
+            )
             track = VisionTrack(
                 track_id=detection.track_id,
                 box=detection.box,
@@ -1347,6 +1480,19 @@ class ProductionVisionAdapter:
                     gait=state.gait,
                 ),
                 quality=quality,
+                clean_subtracklet=segment,
+                metadata={
+                    "action_type": action_prediction.action_type.value,
+                    "action_confidence": action_prediction.confidence,
+                    "action_quality": action_prediction.quality.value,
+                    "action_completion": action_prediction.completion,
+                    "action_source": action_prediction.source,
+                    "action_model_version": action_prediction.model_version,
+                    "appearance_similarity_to_previous": (
+                        state.appearance_similarity_to_previous
+                    ),
+                    "appearance_change_suspected": state.appearance_change_suspected,
+                },
             )
             output.append(track)
             self.latest[detection.track_id] = track

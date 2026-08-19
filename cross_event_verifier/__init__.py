@@ -7,15 +7,24 @@
 
 from .automation import AutomationPolicy, AutomationStage, AutomationStatus
 from .appearance_first import AppearanceFirstGaitEnrollmentController
+from .actions import (
+    ActionPrediction,
+    ActionQuality,
+    ActionRouter,
+    ActionType,
+    conservative_walk_prediction,
+)
 from .config import VerifierConfig
 from .engine import CrossEventVerifier
 from .gait_readiness import GaitReadinessEvaluator
 from .evaluation import (
     EncoderEvaluation,
+    OpenSetProtocolReport,
     VerificationMetrics,
     compare_encoder_embeddings,
     d_prime,
     evaluate_encoder_embeddings,
+    evaluate_open_set_protocol,
     equal_error_rate,
     fnir_at_fpir,
     max_formal_similarity,
@@ -25,9 +34,11 @@ from .evaluation import (
 from .types import (
     AppearanceAbsorptionRequest,
     CandidateRecord,
+    CleanSubTracklet,
     Decision,
     DecisionKind,
     EmbeddingContract,
+    EvidenceSummary,
     FeatureBundle,
     AppearanceIdentityBinding,
     GaitEnrollmentEvent,
@@ -42,10 +53,16 @@ from .types import (
 
 __all__ = [
     "CandidateRecord",
+    "CleanSubTracklet",
     "AppearanceAbsorptionRequest",
     "AutomationPolicy",
     "AutomationStage",
     "AutomationStatus",
+    "ActionPrediction",
+    "ActionQuality",
+    "ActionRouter",
+    "ActionType",
+    "conservative_walk_prediction",
     "AppearanceFirstGaitEnrollmentController",
     "AppearanceIdentityBinding",
     "CrossEventVerifier",
@@ -53,6 +70,7 @@ __all__ = [
     "Decision",
     "DecisionKind",
     "EmbeddingContract",
+    "EvidenceSummary",
     "FeatureBundle",
     "GaitEnrollmentEvent",
     "GaitQualityBand",
@@ -65,9 +83,11 @@ __all__ = [
     "VerifierConfig",
     "VerificationMetrics",
     "EncoderEvaluation",
+    "OpenSetProtocolReport",
     "compare_encoder_embeddings",
     "d_prime",
     "evaluate_encoder_embeddings",
+    "evaluate_open_set_protocol",
     "equal_error_rate",
     "fnir_at_fpir",
     "max_formal_similarity",

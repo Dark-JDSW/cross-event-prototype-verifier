@@ -31,6 +31,18 @@ class SourceSpec:
     value: int | str
     label: str
     candidate_id: str | None = None
+    repeat_count: int = 1
+
+    def __post_init__(self) -> None:
+        """校验输入源重复次数，避免把同一文件误当成多个独立事件。"""
+        if (
+            isinstance(self.repeat_count, bool)
+            or not isinstance(self.repeat_count, int)
+            or self.repeat_count < 1
+        ):
+            raise ValueError("repeat_count must be a positive integer")
+        if self.kind == "camera" and self.repeat_count != 1:
+            raise ValueError("camera sources cannot be repeated")
 
 
 class OpenCvCapture:
@@ -319,58 +331,94 @@ class FrameWorker:
     def _run(self, spec: SourceSpec, candidate_id: str | None) -> None:
         """持续采集、处理并发布帧，直到停止或输入结束。"""
         capture: OpenCvCapture | None = None
+        session_id = f"{spec.kind}-{int(time.time() * 1000)}"
         try:
-            capture = OpenCvCapture(spec)
-            capture.open()
-            session_id = f"{spec.kind}-{int(time.time() * 1000)}"
-            self.pipeline.set_source(
-                spec.label,
-                capture_session_id=session_id,
-                candidate_id=candidate_id,
-            )
-            session_start = time.time()
             last_maintenance = time.monotonic()
-            fps_text = f"{capture.fps:.1f} FPS" if capture.fps > 1.0 else "实时输入"
-            backend_status = str(
-                getattr(
-                    self.pipeline.vision,
-                    "backend_status",
-                    type(self.pipeline.vision).__name__,
-                )
-            )
-            self._put(
-                StatusMessage(
-                    "info",
-                    (
-                        f"已打开：{spec.label} | {capture.width}×{capture.height} | "
-                        f"{fps_text} | {backend_status}"
-                    ),
-                )
-            )
-            while not self._stop.is_set():
-                self._drain_commands()
-                ok, frame = capture.read()
-                if not ok:
-                    self._put(StatusMessage("ended", "视频已结束"))
+            for repeat_index in range(spec.repeat_count):
+                if self._stop.is_set():
                     break
-                started = time.perf_counter()
-                if spec.kind == "file" and capture.capture is not None:
-                    position_ms = float(
-                        capture.capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0
+                capture = OpenCvCapture(spec)
+                capture.open()
+                self.pipeline.set_source(
+                    spec.label,
+                    capture_session_id=session_id,
+                    candidate_id=candidate_id,
+                )
+                session_start = time.time()
+                fps_text = (
+                    f"{capture.fps:.1f} FPS" if capture.fps > 1.0 else "实时输入"
+                )
+                backend_status = str(
+                    getattr(
+                        self.pipeline.vision,
+                        "backend_status",
+                        type(self.pipeline.vision).__name__,
                     )
-                    frame_timestamp = float(session_start + position_ms / 1000.0)
-                else:
-                    frame_timestamp = time.time()
-                result = self.pipeline.process_frame(frame, timestamp=frame_timestamp)
-                if time.monotonic() - last_maintenance >= 30.0:
-                    removed_candidates = self.pipeline.verifier.maintenance(now=time.time())
-                    self.pipeline.automation.discard_candidates(removed_candidates)
-                    last_maintenance = time.monotonic()
-                self._put(FrameMessage(result))
-                if spec.kind == "file" and capture.fps > 1.0:
-                    remaining = (1.0 / capture.fps) - (time.perf_counter() - started)
-                    if remaining > 0:
-                        self._stop.wait(min(remaining, 0.20))
+                )
+                repeat_text = (
+                    f" | 重复学习 {repeat_index + 1}/{spec.repeat_count}"
+                    if spec.kind == "file" and spec.repeat_count > 1
+                    else ""
+                )
+                self._put(
+                    StatusMessage(
+                        "info",
+                        (
+                            f"已打开：{spec.label} | {capture.width}×{capture.height} | "
+                            f"{fps_text}{repeat_text} | {backend_status}"
+                        ),
+                    )
+                )
+                try:
+                    while not self._stop.is_set():
+                        self._drain_commands()
+                        ok, frame = capture.read()
+                        if not ok:
+                            if repeat_index + 1 < spec.repeat_count:
+                                self._put(
+                                    StatusMessage(
+                                        "info",
+                                        (
+                                            f"第 {repeat_index + 1}/{spec.repeat_count} 次学习完成，"
+                                            "准备重复播放同一视频"
+                                        ),
+                                    )
+                                )
+                            else:
+                                self._put(StatusMessage("ended", "视频已结束"))
+                            break
+                        started = time.perf_counter()
+                        if spec.kind == "file" and capture.capture is not None:
+                            position_ms = float(
+                                capture.capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0
+                            )
+                            frame_timestamp = float(
+                                session_start + position_ms / 1000.0
+                            )
+                        else:
+                            frame_timestamp = time.time()
+                        result = self.pipeline.process_frame(
+                            frame,
+                            timestamp=frame_timestamp,
+                        )
+                        if time.monotonic() - last_maintenance >= 30.0:
+                            removed_candidates = self.pipeline.verifier.maintenance(
+                                now=time.time()
+                            )
+                            self.pipeline.automation.discard_candidates(
+                                removed_candidates
+                            )
+                            last_maintenance = time.monotonic()
+                        self._put(FrameMessage(result))
+                        if spec.kind == "file" and capture.fps > 1.0:
+                            remaining = (1.0 / capture.fps) - (
+                                time.perf_counter() - started
+                            )
+                            if remaining > 0:
+                                self._stop.wait(min(remaining, 0.20))
+                finally:
+                    capture.release()
+                    capture = None
         except CaptureError as error:
             self._put(StatusMessage("error", str(error)))
         except Exception as error:  # 保持 GUI 存活并报告工作线程错误

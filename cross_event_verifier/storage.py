@@ -243,10 +243,58 @@ class SqliteStore:
                     tta_mode TEXT NOT NULL DEFAULT 'unknown',
                     coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
                     embedding_dimensions_json TEXT NOT NULL DEFAULT '{}',
+                    action_type TEXT NOT NULL DEFAULT 'WALK',
                     PRIMARY KEY(identity_id, event_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_gait_enrollment_events_identity
                     ON gait_enrollment_events(identity_id, created_at);
+                CREATE TABLE IF NOT EXISTS gait_enrollment_event_revisions (
+                    revision_id TEXT PRIMARY KEY,
+                    identity_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    event_id TEXT NOT NULL,
+                    camera_id TEXT NOT NULL,
+                    capture_session_id TEXT NOT NULL,
+                    track_id TEXT NOT NULL,
+                    vector BLOB NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    stability REAL NOT NULL,
+                    quality REAL NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    view_angle TEXT,
+                    action_type TEXT NOT NULL DEFAULT 'WALK',
+                    created_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(identity_id, event_key, revision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_gait_event_revisions_identity
+                    ON gait_enrollment_event_revisions(identity_id, event_key, revision);
+                CREATE TABLE IF NOT EXISTS derived_gait_models (
+                    model_id TEXT PRIMARY KEY,
+                    identity_id TEXT NOT NULL,
+                    modality TEXT NOT NULL DEFAULT 'gait',
+                    generation INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    quality REAL NOT NULL,
+                    support_count INTEGER NOT NULL,
+                    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                    model_version TEXT NOT NULL DEFAULT 'unconfigured',
+                    feature_schema TEXT NOT NULL DEFAULT 'unconfigured-v1',
+                    artifact_sha256 TEXT NOT NULL DEFAULT 'unverified',
+                    preprocess_version TEXT NOT NULL DEFAULT 'unversioned-v1',
+                    joint_format TEXT NOT NULL DEFAULT 'unknown',
+                    sequence_length INTEGER,
+                    tta_mode TEXT NOT NULL DEFAULT 'unknown',
+                    coordinate_contract TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_dimensions_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(identity_id, modality, generation)
+                );
+                CREATE INDEX IF NOT EXISTS idx_derived_gait_models_identity
+                    ON derived_gait_models(identity_id, modality, active, generation);
                 CREATE TABLE IF NOT EXISTS snapshots (
                     snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     identity_id TEXT NOT NULL,
@@ -318,6 +366,8 @@ class SqliteStore:
                 ("end_timestamp", "REAL"),
             ):
                 self._ensure_column("automation_gait_events", column, definition)
+            for table in ("gait_enrollment_events", "gait_enrollment_event_revisions"):
+                self._ensure_column(table, "action_type", "TEXT NOT NULL DEFAULT 'WALK'")
             self.connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
                 "version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
@@ -330,7 +380,11 @@ class SqliteStore:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?)",
                 (time.time(),),
             )
-            self.connection.execute("PRAGMA user_version = 3")
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, ?)",
+                (time.time(),),
+            )
+            self.connection.execute("PRAGMA user_version = 4")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         """为旧版本数据库执行小型增量迁移。"""
@@ -399,6 +453,8 @@ class SqliteStore:
             "evidence",
             "automation_gait_events",
             "gait_enrollment_events",
+            "gait_enrollment_event_revisions",
+            "derived_gait_models",
             "snapshots",
             "audit_log",
         )
@@ -945,6 +1001,10 @@ class SqliteStore:
     ) -> bool:
         """保存事件；同一事件可更新代表向量，但不会增加事件数量。"""
 
+        if str(event.action_type).strip().upper() != "WALK":
+            raise ValueError(
+                "gait enrollment storage is WALK-only; action-conditioned events need a separate bank"
+            )
         packed, dimension = _pack_vector(event.vector)
         if packed is None or dimension is None:
             raise ValueError("gait enrollment event vector must be finite and non-zero")
@@ -954,6 +1014,71 @@ class SqliteStore:
                 "gait enrollment event dimension does not satisfy embedding contract"
             )
         with self._write_scope():
+            existing = self.connection.execute(
+                """
+                SELECT 1 FROM gait_enrollment_events
+                WHERE identity_id=? AND event_key=?
+                """,
+                (event.identity_id, event.event_key),
+            ).fetchone()
+            if existing is not None and not replace_existing:
+                return False
+            revision = int(
+                self.connection.execute(
+                    """
+                    SELECT COALESCE(MAX(revision), 0) + 1
+                    FROM gait_enrollment_event_revisions
+                    WHERE identity_id=? AND event_key=?
+                    """,
+                    (event.identity_id, event.event_key),
+                ).fetchone()[0]
+            )
+            revision_id = f"{event.identity_id}:{event.event_key}:r{revision}"
+            revision_payload = json.dumps(
+                {
+                    "model_version": event.model_version,
+                    "feature_schema": event.feature_schema,
+                    "calibration_version": event.calibration_version,
+                    "artifact_sha256": event.artifact_sha256,
+                    "preprocess_version": event.preprocess_version,
+                    "joint_format": event.joint_format,
+                    "sequence_length": event.sequence_length,
+                    "tta_mode": event.tta_mode,
+                    "coordinate_contract": event.coordinate_contract,
+                    "embedding_dimensions": dict(event.embedding_dimensions),
+                    "action_type": event.action_type,
+                },
+                ensure_ascii=False,
+                default=_json_default,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO gait_enrollment_event_revisions(
+                    revision_id,identity_id,event_key,revision,event_id,camera_id,
+                    capture_session_id,track_id,vector,dimension,stability,quality,
+                    sample_count,view_angle,action_type,created_at,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    revision_id,
+                    event.identity_id,
+                    event.event_key,
+                    revision,
+                    event.event_id,
+                    event.camera_id,
+                    event.capture_session_id,
+                    event.track_id,
+                    sqlite3.Binary(packed),
+                    dimension,
+                    float(event.stability),
+                    float(event.quality),
+                    int(event.sample_count),
+                    event.view_angle,
+                    event.action_type,
+                    float(event.created_at),
+                    revision_payload,
+                ),
+            )
             operation = "INSERT OR REPLACE" if replace_existing else "INSERT OR IGNORE"
             cursor = self.connection.execute(
                 f"""
@@ -963,7 +1088,8 @@ class SqliteStore:
                     model_version,feature_schema,calibration_version,artifact_sha256,
                     preprocess_version,joint_format,sequence_length,tta_mode,
                     coordinate_contract,embedding_dimensions_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ,action_type
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     event.identity_id,
@@ -989,9 +1115,195 @@ class SqliteStore:
                     event.tta_mode,
                     event.coordinate_contract,
                     json.dumps(dict(event.embedding_dimensions), ensure_ascii=False),
+                    event.action_type,
                 ),
             )
             return cursor.rowcount > 0
+
+    def load_gait_enrollment_event_revisions(
+        self,
+        identity_id: str | None = None,
+        event_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load immutable revisions behind the current event projection."""
+
+        with self._lock:
+            clauses: list[str] = []
+            parameters: list[object] = []
+            if identity_id is not None:
+                clauses.append("identity_id=?")
+                parameters.append(identity_id)
+            if event_key is not None:
+                clauses.append("event_key=?")
+                parameters.append(event_key)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = self.connection.execute(
+                f"""
+                SELECT * FROM gait_enrollment_event_revisions
+                {where}
+                ORDER BY identity_id,event_key,revision
+                """,
+                tuple(parameters),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            vector = _unpack_vector(row["vector"], row["dimension"])
+            if vector is None:
+                continue
+            result.append(
+                {
+                    "revision_id": row["revision_id"],
+                    "identity_id": row["identity_id"],
+                    "event_key": row["event_key"],
+                    "revision": int(row["revision"]),
+                    "event_id": row["event_id"],
+                    "camera_id": row["camera_id"],
+                    "capture_session_id": row["capture_session_id"],
+                    "track_id": row["track_id"],
+                    "vector": vector,
+                    "stability": float(row["stability"]),
+                    "quality": float(row["quality"]),
+                    "sample_count": int(row["sample_count"]),
+                    "view_angle": row["view_angle"],
+                    "action_type": str(row["action_type"] or "WALK"),
+                    "created_at": float(row["created_at"]),
+                    "payload": json.loads(row["payload_json"] or "{}"),
+                }
+            )
+        return result
+
+    def save_derived_gait_model(
+        self,
+        *,
+        identity_id: str,
+        vector: np.ndarray,
+        quality: float,
+        support_count: int,
+        source_event_ids: list[str],
+        contract_event: GaitEnrollmentEvent,
+    ) -> str:
+        """Persist a new immutable generation of an event-derived gait model."""
+
+        packed, dimension = _pack_vector(vector)
+        if packed is None or dimension is None:
+            raise ValueError("derived gait model vector must be finite and non-zero")
+        with self._write_scope():
+            row = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(generation), 0) + 1
+                FROM derived_gait_models
+                WHERE identity_id=? AND modality='gait'
+                """,
+                (identity_id,),
+            ).fetchone()
+            generation = int(row[0])
+            self.connection.execute(
+                """
+                UPDATE derived_gait_models
+                SET active=0
+                WHERE identity_id=? AND modality='gait'
+                """,
+                (identity_id,),
+            )
+            model_id = f"{identity_id}:gait:g{generation}"
+            self.connection.execute(
+                """
+                INSERT INTO derived_gait_models(
+                    model_id,identity_id,modality,generation,vector,dimension,
+                    quality,support_count,source_event_ids_json,model_version,
+                    feature_schema,artifact_sha256,preprocess_version,joint_format,
+                    sequence_length,tta_mode,coordinate_contract,
+                    embedding_dimensions_json,created_at,active
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                """,
+                (
+                    model_id,
+                    identity_id,
+                    "gait",
+                    generation,
+                    sqlite3.Binary(packed),
+                    dimension,
+                    float(quality),
+                    int(support_count),
+                    json.dumps(list(source_event_ids), ensure_ascii=False),
+                    contract_event.model_version,
+                    contract_event.feature_schema,
+                    contract_event.artifact_sha256,
+                    contract_event.preprocess_version,
+                    contract_event.joint_format,
+                    contract_event.sequence_length,
+                    contract_event.tta_mode,
+                    contract_event.coordinate_contract,
+                    json.dumps(
+                        dict(contract_event.embedding_dimensions),
+                        ensure_ascii=False,
+                    ),
+                    float(time.time()),
+                ),
+            )
+        return model_id
+
+    def load_derived_gait_models(
+        self,
+        identity_id: str | None = None,
+        *,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Load materialised event-derived gait model generations."""
+
+        with self._lock:
+            clauses = ["modality='gait'"]
+            parameters: list[object] = []
+            if identity_id is not None:
+                clauses.append("identity_id=?")
+                parameters.append(identity_id)
+            if active_only:
+                clauses.append("active=1")
+            rows = self.connection.execute(
+                f"""
+                SELECT * FROM derived_gait_models
+                WHERE {' AND '.join(clauses)}
+                ORDER BY identity_id,generation
+                """,
+                tuple(parameters),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            vector = _unpack_vector(row["vector"], row["dimension"])
+            if vector is None:
+                continue
+            result.append(
+                {
+                    "model_id": row["model_id"],
+                    "identity_id": row["identity_id"],
+                    "modality": row["modality"],
+                    "generation": int(row["generation"]),
+                    "vector": vector,
+                    "quality": float(row["quality"]),
+                    "support_count": int(row["support_count"]),
+                    "source_event_ids": json.loads(
+                        row["source_event_ids_json"] or "[]"
+                    ),
+                    "model_version": row["model_version"],
+                    "feature_schema": row["feature_schema"],
+                    "artifact_sha256": row["artifact_sha256"],
+                    "preprocess_version": row["preprocess_version"],
+                    "joint_format": row["joint_format"],
+                    "sequence_length": (
+                        int(row["sequence_length"])
+                        if row["sequence_length"] is not None
+                        else None
+                    ),
+                    "tta_mode": row["tta_mode"],
+                    "coordinate_contract": row["coordinate_contract"],
+                    "embedding_dimensions": dict(
+                        json.loads(row["embedding_dimensions_json"] or "{}")
+                    ),
+                    "created_at": float(row["created_at"]),
+                    "active": bool(row["active"]),
+                }
+            )
+        return result
 
     def load_gait_enrollment_events(
         self,
@@ -1047,6 +1359,7 @@ class SqliteStore:
                     embedding_dimensions=dict(
                         json.loads(row["embedding_dimensions_json"] or "{}")
                     ),
+                    action_type=str(row["action_type"] or "WALK"),
                 )
             )
         return events
@@ -1057,6 +1370,14 @@ class SqliteStore:
         with self._write_scope():
             self.connection.execute(
                 "DELETE FROM gait_enrollment_events WHERE identity_id=?",
+                (identity_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM gait_enrollment_event_revisions WHERE identity_id=?",
+                (identity_id,),
+            )
+            self.connection.execute(
+                "DELETE FROM derived_gait_models WHERE identity_id=?",
                 (identity_id,),
             )
 

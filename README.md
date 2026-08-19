@@ -9,11 +9,11 @@
       ↓
 YOLO11L 人物检测 → ByteTrack 多目标轨迹
       ├──────────────→ OSNet-AIN 512 维外观特征 → 视觉身份 P1/P2 绑定
-      └→ RTMPose 17 点姿态 → GaitGraph2 384 维时序步态特征 → 步态样本
+      └→ RTMPose 17 点姿态 → GaitGraph2 384 维时序步态特征 → 质量加权步态样本
                                   ↓                         ↓
-                    视觉身份全局一对一指派       独立步态事件/步态原型审核
-                                  ↓
-                  步态学习中 / 步态暂可用 / 步态就绪 / 步态冲突
+                    视觉身份全局一对一指派       独立步态事件/事件修订历史
+                                  ↓                         ↓
+                 多证据开放集判决与步态就绪
                                   ↓
                  步态主检索 + OSNet 候选关联 / formal 多原型 SQLite 图库
 ```
@@ -34,7 +34,7 @@ YOLO11L 人物检测 → ByteTrack 多目标轨迹
 | 持久化与检索 | SQLite、NumPy 向量索引；可选 FAISS | 保存 formal/quarantine 图库、模型协议、审核记录和多原型检索数据 |
 | 交互与命令行 | Tkinter、`python -m cross_event_verifier` | GUI、`doctor`、模型下载、演示和生产管线入口 |
 
-生产链路中，OSNet 的 512 维外观向量不会直接输入 GaitGraph2。OSNet 负责确认视觉身份和关联 Track；RTMPose 的时序姿态才是 GaitGraph2 的输入。GaitGraph2 权重只读加载，系统学习的是写入 SQLite 的步态样本、步态事件和步态原型集合，而不是在线修改模型参数。
+生产链路中，OSNet 的 512 维外观向量不会直接输入 GaitGraph2。OSNet 负责确认视觉身份和关联 Track；RTMPose 的时序姿态才是 GaitGraph2 的输入。GaitGraph2 权重只读加载，系统学习的是写入 SQLite 的步态样本、步态事件和由事件派生的身份模型，而不是在线修改模型参数。
 
 ## 更新日志
 - V1.00
@@ -52,6 +52,13 @@ YOLO11L 人物检测 → ByteTrack 多目标轨迹
   - 给GUI加了个一键删库按钮，方便删库跑路
   - 可能(?)小幅优化了性能开销
 
+- V1.15
+  - 针对换衣问题增加步态回连机制与身份创建等待窗口，现在它真能用了
+  - 加入了重复学习功能，不用反复操作那个死难看的GUI了
+  - 增加动作路由和隔离机制
+  - 增加外观多原型学习机制
+  - 预留了学习更多姿态的入口，但缺少能用的数据集
+  - 优化性能，现在真不卡了
 ## 先运行起来
 
 ```powershell
@@ -60,6 +67,10 @@ python -m cross_event_verifier doctor
 python -m cross_event_verifier gui
 ```
 
+GUI 选择视频文件时，“视频重复学习”默认为 1；设置为大于 1 的正整数后，系统会自动
+重复播放同一视频。重复播放共用同一个采集会话键，因此会累计该事件的步态样本，但不会
+伪造多个独立事件；摄像头输入不支持重复播放。
+
 如果模型文件不在本机，先看“模型资产与云端迁移”一节，从私有云端同步完成后再运行 `doctor`。
 
 ## 证据规则
@@ -67,8 +78,8 @@ python -m cross_event_verifier gui
 - 视觉身份由 OSNet 外观匹配、人工确认或外部采集任务确定并获得 `P1`、`P2` 标签；视觉身份已确认不等于步态已经就绪。
 - 自动生成的 `P` 是系统内部视觉身份标签，不是 OSNet 从图像中推断出的真实姓名；需要语义姓名时仍应由人工或外部采集任务提供映射。
 - 已确认视觉身份的 Track 才能贡献步态样本。RTMPose 姿态序列经 GaitGraph2 编码后，按质量和稳定性审核为步态样本。
-- 同一次采集会话/挑战中的多个窗口只计为一个步态事件；通过独立性、稳定性和模型协议检查后，事件代表向量写入该视觉身份的步态原型集合。同一会话后续通过质量门的步态样本仍会继续更新这个事件代表向量和对应步态原型，但不会把事件数重复增加。
-- 步态原型不会在线修改 GaitGraph2 权重；系统学习的是该视觉身份的原型图库，后续可用 GaitGraph2 向量检索该身份。
+- 同一次采集会话/挑战中的多个窗口只计为一个步态事件；通过独立性、稳定性和模型协议检查后，事件事实会追加到 SQLite 修订历史。同一会话后续窗口可以生成新的事件修订，但不会增加独立事件数；该视觉身份的步态模型由当前事件集合重新派生。
+- 步态原型不会在线修改 GaitGraph2 权重；系统学习的是该视觉身份的事件事实和原型图库，后续可用 GaitGraph2 向量检索该身份。
 - 步态就绪需要足够的独立事件、条件覆盖、内部一致性、留出验证和开放集检查；在此之前状态分别为“步态学习中”或“步态暂可用”。
 - 步态冲突会暂停写入并清空当前窗口，不会把冲突事件强行并入视觉身份。
 - OSNet 可以负责 Track 的初始身份绑定和候选续接，但不能把任意外观向量直接输入 GaitGraph2；两个模型仍使用各自的输入契约。
@@ -79,8 +90,8 @@ python -m cross_event_verifier gui
 - 高质量外观明确反对当前视觉身份时，GaitGraph2 不得覆盖该反证；未绑定 Track 也不能凭一个步态窗口直接重新绑定正式身份。
 - 25 个真实有效姿态帧只允许进入步态事件学习候选；只有达到更长真实窗口、运动周期和姿态覆盖门后，步态才可承担正式身份检索。
 - 只有视觉绑定或步态事件两侧都达到各自质量门且无法解释时才算“证据冲突”。单帧异常会清空当前窗口并重采集，独立事件冲突则暂停该身份的步态写入。
-- 步态质量 `Q_gait` 与身份相似度 `S_gait` 分开处理：质量分为 `INVALID`、`PARTIAL`、`STRONG`。`PARTIAL` 只进入等待/隔离区，不能作为“不是该身份”的负证据；严重 ID switch、腿部完全不可见、框截断或序列不足才会硬拒绝。
-- 旧版正式验证 API 在多个 formal gait 原型 Top-1/Top-2 间隔不足时返回 `AMBIGUOUS`；OSNet-first 的步态学习则要求新事件与既有事件保持一致，不能用冲突向量污染该视觉身份。
+- 步态质量 `Q_gait` 与身份相似度 `S_gait` 分开处理：质量分为 `INVALID`、`PARTIAL`、`STRONG`。默认允许 `PARTIAL` 以较低权重参与窗口聚合，但不能作为“不是该身份”的负证据；严重 ID switch、腿部完全不可见、框截断或序列不足仍会硬拒绝并清空窗口。
+- 正式验证会综合 Top-2 margin、类内步态离散度、独立事件支持数、质量、视角和分支冲突；结果可通过 `Decision.open_set_label` 映射为 `KNOWN`、`AMBIGUOUS` 或 `UNKNOWN`。冲突向量不能污染该视觉身份。
 - 同一视觉身份的步态原型写入受事件键、模型协议、稳定性和近重复门控保护；同会话重复窗口只更新当前采样窗口，不重复增加事件。
 - 触碰画面边界、人体框异常、下肢关键点不足、遮挡严重或轨迹跳变时，不允许产生强步态/强外观证据。
 - 多人同框使用全局一对一身份指派，一个正式身份不会在同一帧分配给多个 Track。
@@ -93,10 +104,10 @@ T 临时 Track
   → 连续稳定 OSNet 外观样本
   → 确认/创建视觉身份 P（仅 appearance）
   → 该 Track 的 RTMPose → GaitGraph2 步态样本
-  → 同会话样本聚合为一个步态事件
-  → 事件审核通过后写入 P 的 gait prototype
+  → 质量加权窗口聚合与独立事件审核
+  → 事件修订历史 → 该视觉身份的 gait model
   → 多个独立事件、覆盖度、留出和开放集检查
-  → 步态暂可用 / 步态就绪，未来以 GaitGraph2 主检索
+  → 步态暂可用 / 步态就绪，继续以 GaitGraph2 主检索
 ```
 
 ## Windows下环境安装
@@ -174,7 +185,12 @@ GUI 操作要点：
 | 视觉身份稳定样本数 | `8` | OSNet 自动生成视觉身份编号前需要的连续稳定外观样本数量 |
 | 视觉身份稳定度 | `0.90` | OSNet 样本与视觉身份外观中心的最低一致性 |
 | 视觉身份开放集相似度 | `0.90` | 新建视觉身份前，若 OSNet 与已有身份的原始相似度达到此值则继续等待绑定，避免重复编号 |
-| 外观冲突余弦门 | `0.35` | 高质量外观低于此原始余弦时，禁止 GaitGraph2 覆盖已绑定视觉身份；跨视角恢复依靠连续 Track 和多原型 |
+| 质量加权最小样本质量总量 | `0.70` | 窗口质量权重总量至少达到稳定样本数乘此比例，才允许形成稳定步态中心 |
+| 允许 PARTIAL 样本贡献 | `true` | 允许 PARTIAL 以较低权重参与聚合；严重断轨/缺失帧仍会清窗 |
+| 正式步态最大类内离散度 | `0.60` | 事件间离散度高于此值时不作为强步态确认依据 |
+| 强确认最少事件支持数 | `1` | 强步态确认需要的独立事件/可信 formal 模板支持数 |
+| 最低视角证据 | `0.30` | 当前视角证据低于此值时不允许强步态确认 |
+| 外观冲突余弦门 | `0.35` | 高质量外观低于此原始余弦时，禁止 GaitGraph2 覆盖当前绑定；跨视角恢复依靠连续 Track 和多原型 |
 | 步态暂可用事件数 | `2` | 同一视觉身份进入“步态暂可用”前需要的独立步态事件数 |
 | 步态就绪事件数 | `3` | 进入“步态就绪”前至少需要的独立步态事件数，之后还要检查覆盖度、留出和开放集 |
 | 步态条件覆盖数 | `2` | 步态就绪要求覆盖的摄像头/视角条件数量 |
@@ -199,9 +215,18 @@ GUI 操作要点：
   轨迹首次成熟或距离上次推理达到该间隔时刷新；同一帧到期的所有 Track 会合并
   为一个 GPU 批次。周期性刷新同样优先避开 YOLO 帧；首次成熟特征不会延迟。
 
-生产 GaitGraph2 输入使用 RTMPose 的原始全帧坐标，并采用与 OpenGait GREW
-检查点一致的 COCO 图归一化；检测框只用于质量和行走指标，不再把姿态缩放到框内。
-因此更换模型输入格式或继续使用旧库时，必须先清空旧的 gait 原型。
+生产 GaitGraph2 不接收整幅 RGB 图像、YOLO crop 或人体掩码。YOLO/ByteTrack
+在整幅画面上生成并关联人体框；RTMPose 使用每个框的仿射 crop 做 top-down
+姿态推理，再把 COCO17 关键点映射回原图坐标。当前 canonical pose 只做有限值和
+置信度过滤，保留原始全帧坐标，随后以 `(T, 17, 3)` 姿态序列输入 GaitGraph2。
+因此 `image_size=736` 是 detector 输入尺寸，不是 gait 输入尺寸；更换姿态坐标
+契约或继续使用旧库时，必须使用新模型/新版本标识并隔离旧 gait gallery。
+
+生产适配器会把长时间 Track gap、突发框跳变和运行时步态参数变化视为硬时序边界，
+清空旧姿态/步态窗口并递增 `segment_id`。每个 `VisionTrack` 同时提供
+`clean_subtracklet` 摘要，包含有效帧区间、真实姿态帧数、下肢帧数、视角覆盖和边界
+原因；因此后续 gait 分支只能在当前 clean sub-tracklet 内取样，不能跨越污染区间复用
+旧序列。该摘要不改变 GaitGraph2 的 raw full-frame `(T, 17, 3)` 输入契约。
 
 步态学习和步态身份检索使用不同的真实帧门：GaitGraph2 可以在至少 25 个真实有效
 姿态帧后生成一个学习候选，但固定长度重采样不会增加真实运动信息；当前查询至少需要
@@ -261,12 +286,6 @@ python -m cross_event_verifier gui --vision-backend demo
 | `osnet_ain_x1_0_dg.pth` | 外观 ReID | 512 维 L2 归一化向量 |
 | `gaitgraph2_grew_state.pt` | 时序步态 | 60 帧重采样、384 维 L2 归一化向量 |
 
-模型大小和哈希记录在 `models/manifest.json`；清单同时锁定经过验证的
-`ultralytics==8.3.163` 运行时和 YOLO 模型发布版本。运行时仅加载本项目内的
-文件，不访问 `videotracker`。GaitGraph2 权重已转换为只包含张量的安全 state
-dict，运行时使用 `weights_only=True` 加载。
-
-说明：ONNX Runtime 的 CUDA EP 会把主卷积/推理算子放到 GPU；RTMPose 图中的少量 shape/布局辅助算子可能由 ORT 的内置 CPU EP 处理。强行禁用这类图级 CPU 节点会使该 ONNX 模型无法创建，因此项目不把它误报为“100% 每个算子 GPU”，但也不会允许 RTMPose 在 CUDA provider 不存在时整体退回 CPU。
 
 ## 模型资产与云端迁移
 
@@ -331,6 +350,33 @@ git push origin main
 ```
 
 上面是有外部写入影响的人工确认步骤，脚本不会替你执行。更适合生产部署的做法是使用私有对象存储，并给运行机器发放只读、短期有效的下载 URL；密钥不要写进 README、代码或 SQLite。
+
+## 离线开放集评测
+
+生产阈值不应只依据闭集 Rank-1 或单个余弦分数调节。`evaluation.py` 提供
+`evaluate_open_set_protocol()`，用于在 gallery、known probes 和 unknown probes
+之间计算 Rank-k、FNIR、FPIR、known rejection 与 unknown acceptance。阈值应在独立
+calibration unknown 集上确定；如果省略该集合，函数会把 unknown probes 作为小规模
+探索性校准集，不应直接当作最终验收结果。
+
+建议固定 identity/event/session-disjoint 的拆分，并至少报告 FNIR@1%FPIR、
+FNIR@0.1%FPIR、Rank-1/Rank-20、最大冒认相似度、UNKNOWN→KNOWN、KNOWN→UNKNOWN、
+AMBIGUOUS 比例、冲突率和自动注册误接纳率。连续帧或同一采集会话的多个窗口不能
+被当作相互独立的注册事件。
+
+```python
+from cross_event_verifier import evaluate_open_set_protocol
+
+report = evaluate_open_set_protocol(
+    gallery_embeddings={"P1": (gallery_p1,), "P2": (gallery_p2,)},
+    known_probes={"P1": (probe_p1,), "P2": (probe_p2,)},
+    unknown_probes=(unknown_probe,),
+    calibration_unknown_probes=(calibration_unknown_probe,),
+    target_fpir=0.01,
+    rank=1,
+)
+print(report.fnir, report.fpir, report.threshold)
+```
 
 ## Python API
 
@@ -406,10 +452,10 @@ pipeline.set_source(
 
 ```text
 cross_event_verifier/
-├── engine.py、config.py、calibration.py、fusion.py、assignment.py
-│                         # 身份验证、开放集决策与分数校准
-├── gait_graph.py、osnet_ain.py、memory.py、stability.py
-│                         # 步态/外观表征与正式原型记忆
+├── engine.py、config.py、calibration.py、fusion.py、assignment.py、evaluation.py
+│                         # 身份验证、多证据开放集决策与离线评测
+├── gait_graph.py、aggregation.py、osnet_ain.py、memory.py、stability.py
+│                         # GaitGraph2、质量聚合、外观表征与派生原型记忆
 ├── production_vision.py、vision.py、vision_factory.py、adapters.py
 │                         # YOLO、ByteTrack、RTMPose 与视觉适配器
 ├── pipeline.py、automation.py、appearance_first.py、gait_readiness.py
@@ -436,13 +482,14 @@ scripts/
 ## 验证
 
 ```powershell
+python -m pytest -q
 python -m unittest discover -s tests -v
 python -m compileall cross_event_verifier tests
 python -m cross_event_verifier demo
 python -m cross_event_verifier doctor
 ```
 
-测试覆盖质量门控、校准与动态融合、开放集拒识、全局指派、OSNet 视觉身份绑定、步态样本/事件/原型去重、步态就绪判定、新人物不粘连旧 ID、运行时参数事务、GUI 参数页、人工登记、防污染图库、SQLite 回滚、混合特征维度迁移，以及生产适配器的批量步态编码、推理间隔和时序特征输出。
+测试覆盖质量门控、质量加权聚合、校准与动态融合、多证据开放集拒识（含 FNIR/FPIR）、全局指派、OSNet 建议权、步态样本/事件/修订/派生模型、步态就绪判定、新人物不粘连旧 ID、运行时参数事务、GUI 参数页、人工登记、防污染图库、SQLite 回滚、混合特征维度迁移，以及生产适配器的批量步态编码、推理间隔和时序特征输出。
 
 ## 常见问题
 
@@ -455,23 +502,24 @@ python -m cross_event_verifier doctor
 - 步态已有向量但没有用于身份确认：这是安全门控的预期行为；确认正式身份检索还需达到 45 个真实有效姿态帧和 0.75 姿态覆盖率，插值到 60 帧不算真实帧。
 - 高质量外观与步态指向不同身份：系统会进入冲突/隔离，不会自动选择分数更高的一侧；先检查 Track 是否发生 ID switch，再进行人工复核。
 - 同一人转为侧面/背面后没有生成新 P：连续可靠 Track 会保持视觉身份，并在累计稳定样本后将新视角写入该 P 的多原型外观图库。
-- 步态事件显示为“已计数”：表示当前会话已经产生一个事件，但后续稳定窗口仍会继续吸收为该事件的步态样本；只有切换采集会话、摄像头或视角后，独立事件数才会增加。显示“近重复”则表示该窗口与其他已保存事件过近，不会新增事件。
-- 步态状态为“冲突”：独立事件之间的一致性不足，系统已暂停写入该视觉身份的步态原型，需要复核 Track 是否发生切换以及姿态输入契约是否一致。
+- 步态事件显示为“已计数”：表示当前会话已经产生一个事件；后续窗口可以追加该事件的修订，但不会增加独立事件数。该视觉身份的步态模型会依据事件事实重新派生。
+- 步态状态为“冲突”：独立事件之间的离散度或分支证据不足，系统会暂停写入并清空当前窗口，需要复核 Track 是否发生切换以及姿态输入契约是否一致。
 - 需要只排查摄像头或 GUI：使用 `--vision-backend demo`；该模式强制禁止自动注册，不应拿来建立正式图库。
 
 ## 精度与许可边界
 
-- 默认阈值和开放集 max-impostor 上限只能作为可运行起点。部署前应使用目标摄像头数据按 FAR/FPIR 拟合分支校准器，并评估换衣、遮挡、逆光、拥挤和跨镜头条件；生产可设置 `VerifierConfig(require_calibrated_scores=True)` 强制拒绝启发式校准。
-- P2 的模型域差异暂不通过替换模型解决。`cross_event_verifier.evaluation` 提供 `compare_encoder_embeddings()`，可将同一批标注序列的 `HRNet`/`RTMPose` embedding 分别送入，记录 genuine/impostor similarity、max-impostor、d-prime 和 FNIR@FPIR；当前生产模型不会因此自动改变。
+- 默认阈值和开放集 max-impostor 上限只能作为可运行起点。部署前应使用目标摄像头数据按 FAR/FPIR 和 FNIR@FPIR 协议拟合分支校准器，并评估换衣、遮挡、逆光、拥挤和跨镜头条件；生产可设置 `VerifierConfig(require_calibrated_scores=True)` 强制拒绝启发式校准。
+- 当前不通过替换模型解决 GaitGraph2 的域差异。`cross_event_verifier.evaluation` 提供 `compare_encoder_embeddings()` 和 `evaluate_open_set_protocol()`，可记录 genuine/impostor similarity、max-impostor、d-prime、Rank-k、FNIR@FPIR 和 FPIR；当前生产模型不会因此自动改变。
+- 方案二的姿态归一化和 2D→3D 姿态迁移暂不进入生产链路；当前 GaitGraph2 继续使用版本化的 2D raw full-frame 坐标契约。方案一的 GPGait++、SkeletonGait++、PSGait-like 分支属于后续 P2 研究，待模型资产、输入链路和目标域 A/B 协议齐备后再评估。
 - 视觉身份自动编号要求连续稳定的 OSNet 外观样本；步态学习还要求完整人体和有效行走序列。只看到上半身时不会产生可靠步态原型。
 - Ultralytics 代码/模型涉及 AGPL-3.0 或企业许可；OpenGait 官方资源声明限学术用途。商业部署前必须完成对应授权或替换模型。完整第三方归属与许可提示见 `THIRD_PARTY_NOTICES.md`。
 
-##仍需目标数据验证：
+## 仍需目标数据验证
 - RTMPose-S 姿态分布是否适合 GREW GaitGraph2，以及默认开放集上限是否满足目标 FAR/FPIR。
 - 24/30/60 FPS、遮挡、拥挤和低照度下的真实 P95 延迟、ID switch 与 FNIR。
-- GUI丑死了!下个版本就改！
-- 遮挡场景仍需继续评估吞吐量与轨迹精度的平衡
-- ***电脑涨价太猛，我买不起新显卡了***
+- GUI 外观与交互仍待下一版本优化。
+- 遮挡场景仍需继续评估吞吐量与轨迹精度的平衡。
+- 本地硬件差异可能影响冷启动和吞吐量，部署前应按目标设备重新测量。
 
 ## 写在最后
-- 本项目已在华硕天选Air2025 H350版本上运行成功，该机型性能低于其他同配置机型，故加载时间稍长
+- 本项目曾在华硕天选 Air 2025 H350 版本上运行；不同设备的加载时间和吞吐量请以 `doctor` 与目标数据实测为准。

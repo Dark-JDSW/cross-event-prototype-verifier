@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 import numpy as np
 
+from .actions import ActionPrediction, ActionRouter, ActionType
 from .assignment import gated_global_assignment
+from .aggregation import (
+    gait_quality_weight,
+    weighted_cosine_stability,
+    weighted_unit_mean,
+)
 from .automation import AutomationPolicy, AutomationStage, AutomationStatus
 from .engine import CrossEventVerifier
 from .types import (
@@ -29,9 +35,14 @@ class _AppearanceFirstTrackState:
 
     appearance_samples: deque[np.ndarray]
     gait_samples: deque[np.ndarray]
+    gait_sample_weights: deque[float]
+    gait_sample_qualities: deque[float] = field(default_factory=deque)
     identity_id: str | None = None
     gait_window_start_timestamp: float | None = None
     conflict: bool = False
+    subtracklet_id: str | None = None
+    action_type: ActionType | None = None
+    action_gate_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,6 +50,7 @@ class _StableGaitSample:
     vector: np.ndarray
     stability: float
     sample_count: int
+    gait_quality: float
 
 
 class AppearanceFirstGaitEnrollmentController:
@@ -60,6 +72,7 @@ class AppearanceFirstGaitEnrollmentController:
         self._states: dict[str, _AppearanceFirstTrackState] = {}
         self._manual_request_id: str | None = None
         self._readiness_cache: dict[str, GaitReadinessReport] = {}
+        self._action_router = ActionRouter()
 
     @property
     def registration_enabled(self) -> bool:
@@ -91,9 +104,12 @@ class AppearanceFirstGaitEnrollmentController:
 
         for state in self._states.values():
             state.appearance_samples.clear()
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             state.conflict = False
+            state.subtracklet_id = None
+            state.action_type = None
+            state.action_gate_active = False
         self._readiness_cache.clear()
 
     def reset_tracks(
@@ -111,9 +127,12 @@ class AppearanceFirstGaitEnrollmentController:
             }
         for state in self._states.values():
             state.appearance_samples.clear()
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             state.conflict = False
+            state.subtracklet_id = None
+            state.action_type = None
+            state.action_gate_active = False
 
     def discard_candidate(self, candidate_id: str) -> None:
         """清除一个短期采集任务的视觉绑定窗口。"""
@@ -137,7 +156,7 @@ class AppearanceFirstGaitEnrollmentController:
 
         state = self._states.setdefault(
             candidate_id,
-            _AppearanceFirstTrackState(deque(), deque()),
+            _AppearanceFirstTrackState(deque(), deque(), deque()),
         )
         state.identity_id = identity_id
         self._manual_request_id = request_id
@@ -163,14 +182,87 @@ class AppearanceFirstGaitEnrollmentController:
         return f"event:{observation.event_id}"
 
     @staticmethod
-    def _unit_mean(samples: deque[np.ndarray]) -> np.ndarray | None:
-        if not samples:
+    def _clear_gait_window(state: _AppearanceFirstTrackState) -> None:
+        state.gait_samples.clear()
+        state.gait_sample_weights.clear()
+        state.gait_sample_qualities.clear()
+
+    @staticmethod
+    def _sync_subtracklet(
+        state: _AppearanceFirstTrackState,
+        observation: Observation,
+    ) -> None:
+        """在生产子轨迹切换时丢弃尚未完成的旧步态/外观窗口。"""
+
+        value = observation.metadata.get("subtracklet_id")
+        current = str(value) if value not in (None, "") else None
+        if current is None:
+            return
+        if state.subtracklet_id is not None and state.subtracklet_id != current:
+            state.appearance_samples.clear()
+            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+            state.action_type = None
+            state.action_gate_active = False
+        state.subtracklet_id = current
+
+    @staticmethod
+    def _resolve_action(
+        state: _AppearanceFirstTrackState,
+        observation: Observation,
+    ) -> ActionPrediction | None:
+        """更新显式动作路由状态；旧调用没有动作元数据时保持兼容。"""
+
+        prediction = ActionRouter.from_metadata(observation.metadata)
+        if prediction is None:
             return None
-        vector = np.mean(np.stack(tuple(samples), axis=0), axis=0)
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-8:
-            return None
-        return (vector / norm).astype(np.float32)
+        if state.action_gate_active and state.action_type != prediction.action_type:
+            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+        state.action_type = prediction.action_type
+        state.action_gate_active = True
+        return prediction
+
+    @staticmethod
+    def _unit_mean(
+        samples: deque[np.ndarray],
+        weights: deque[float] | None = None,
+    ) -> np.ndarray | None:
+        return weighted_unit_mean(
+            samples,
+            tuple(weights) if weights is not None else None,
+        )
+
+    def _try_enroll_gait_prototype(
+        self,
+        identity_id: str,
+        observation: Observation,
+        *,
+        event_key: str,
+        stability: float,
+        sample_count: int,
+        gait_quality: float,
+        update_existing_event: bool = False,
+    ) -> bool:
+        """写入步态事件；质量门槛变化时返回 False 并等待下一窗口。"""
+
+        try:
+            self.verifier.enroll_gait_prototype(
+                identity_id,
+                observation,
+                event_key=event_key,
+                stability=stability,
+                sample_count=sample_count,
+                aggregated_gait_quality=gait_quality,
+                update_existing_event=update_existing_event,
+            )
+        except ValueError as error:
+            if not str(error).startswith(
+                "gait prototype enrollment requires STRONG gait quality:"
+            ):
+                raise
+            return False
+        return True
 
     def _state(self, key: str) -> _AppearanceFirstTrackState:
         return self._states.setdefault(
@@ -178,6 +270,7 @@ class AppearanceFirstGaitEnrollmentController:
             _AppearanceFirstTrackState(
                 appearance_samples=deque(),
                 gait_samples=deque(),
+                gait_sample_weights=deque(),
             ),
         )
 
@@ -197,11 +290,13 @@ class AppearanceFirstGaitEnrollmentController:
         score_matrix = np.zeros((len(observations), len(identities)), dtype=np.float32)
         quality_matrix = np.zeros_like(score_matrix)
         for row, ranking in enumerate(rankings):
+            scores_by_identity = {
+                str(item.identity_id): item
+                for item in ranking
+                if getattr(item, "identity_id", None) is not None
+            }
             for column, identity_id in enumerate(identities):
-                score = next(
-                    (item for item in ranking if item.identity_id == identity_id),
-                    None,
-                )
+                score = scores_by_identity.get(identity_id)
                 if score is not None:
                     score_matrix[row, column] = float(score.appearance_probability or 0.0)
                     quality_matrix[row, column] = float(score.appearance_quality)
@@ -218,13 +313,16 @@ class AppearanceFirstGaitEnrollmentController:
         self,
         observations: Sequence[Observation],
     ) -> dict[int, int]:
-        """对已经步态就绪的身份执行 GaitGraph2 全局一对一检索。"""
+        """对已有真实步态事件的身份执行受质量门控的全局回连。
 
-        identities = [
-            identity_id
-            for identity_id in self.verifier.formal_identities
-            if self._readiness(identity_id).state == GaitReadinessState.READY
-        ]
+        ``READY`` 仍然是步态独立承担正式检索的状态，但换源/换衣后的
+        Track 回连不应要求身份已经收集满三个独立事件。这里仅接受已经
+        写入至少一个真实步态事件且没有处于 ``CONFLICT`` 的身份；当前
+        查询仍必须通过 ``match_gait_identity(..., require_identity_quality=True)``
+        的长序列、质量、概率、margin 和支持度门槛。
+        """
+
+        identities = self._gait_relink_identities()
         if not identities or not observations:
             return {}
         decisions = [
@@ -247,11 +345,13 @@ class AppearanceFirstGaitEnrollmentController:
         score_matrix = np.zeros((len(observations), len(identities)), dtype=np.float32)
         quality_matrix = np.zeros_like(score_matrix)
         for row, ranking in enumerate(rankings):
+            scores_by_identity = {
+                str(item.identity_id): item
+                for item in ranking
+                if getattr(item, "identity_id", None) is not None
+            }
             for column, identity_id in enumerate(identities):
-                score = next(
-                    (item for item in ranking if item.identity_id == identity_id),
-                    None,
-                )
+                score = scores_by_identity.get(identity_id)
                 if score is not None:
                     score_matrix[row, column] = float(score.gait_probability or 0.0)
                     quality_matrix[row, column] = float(score.gait_quality)
@@ -263,11 +363,46 @@ class AppearanceFirstGaitEnrollmentController:
             margin_threshold=self.verifier.config.strong_gait_margin,
         )
 
+    def _gait_relink_identities(self) -> tuple[str, ...]:
+        """返回已有可接受步态事件且没有冲突的正式身份。"""
+
+        return tuple(
+            identity_id
+            for identity_id in self.verifier.formal_identities
+            if self._readiness(identity_id).state != GaitReadinessState.CONFLICT
+            and self.verifier.load_gait_enrollment_events(identity_id)
+        )
+
+    def _visual_creation_wait_reason(self, observation: Observation) -> str | None:
+        """在行为回连尚未有机会运行时暂缓创建新的视觉身份。
+
+        生产 GaitGraph2 是滑动窗口编码器，外观身份的默认八帧确认可能在
+        第一段完整步态窗口出现之前结束。若图库已有可回连的步态事件，先
+        保留外观采样，但把“创建新 ID”推迟到一个真实长序列之后，给跨衣物
+        回连一次机会。没有可回连身份时不增加新人的首个 ID 延迟。
+        """
+
+        if not self._gait_relink_identities():
+            return None
+        grace_frames = max(
+            self.verifier.config.gait_identity_min_frames,
+            int(self.verifier.config.sequence_length or 0),
+        )
+        observed_frames = max(
+            int(observation.quality.frame_count),
+            int(observation.quality.valid_pose_frames),
+        )
+        if observed_frames >= grace_frames:
+            return None
+        return f"等待步态回连窗口 {observed_frames}/{grace_frames}"
+
     def _collect_appearance(
         self,
         state: _AppearanceFirstTrackState,
         observation: Observation,
         ranking: Sequence,
+        *,
+        allow_registration: bool = True,
     ) -> tuple[str | None, str, float]:
         """累积 OSNet 样本，必要时创建一个新的视觉身份编号。"""
 
@@ -319,6 +454,8 @@ class AppearanceFirstGaitEnrollmentController:
         ]
         if raw_similarities and max(raw_similarities) >= self.verifier.config.appearance_identity_novelty_threshold:
             return None, "外观接近已有视觉身份，等待更可靠绑定", quality
+        if not allow_registration:
+            return None, "视觉身份创建暂缓，等待步态回连窗口", quality
         if not self._registration_enabled:
             return None, "自动创建视觉身份已关闭", quality
 
@@ -363,6 +500,12 @@ class AppearanceFirstGaitEnrollmentController:
         """
 
         if not observation.features.has_appearance:
+            return False
+        # A continuous ByteTrack track can legitimately change appearance after
+        # a clothing change.  ProductionVisionAdapter marks that observation
+        # explicitly; keep the existing hard contradiction rule for all other
+        # callers and for uncertain/new tracks.
+        if bool(observation.metadata.get("appearance_change_suspected")):
             return False
         quality = observation.quality.appearance_availability(
             self.verifier.config.detection_confidence_floor
@@ -485,11 +628,23 @@ class AppearanceFirstGaitEnrollmentController:
         if not observation.features.has_gait:
             return None, "等待 GaitGraph2 步态样本", band
         if band == GaitQualityBand.INVALID:
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             return None, "步态样本 INVALID，等待完整下肢和行走周期", band
         if band == GaitQualityBand.PARTIAL:
-            return None, "步态样本 PARTIAL，仅等待不写入步态原型", band
+            if not self.verifier.config.allow_partial_gait_samples:
+                return None, "步态样本 PARTIAL，仅等待不写入步态原型", band
+        gait_quality = quality.gait_availability(
+            self.verifier.config.gait_learning_min_frames,
+            self.verifier.config.minimum_gait_cycles,
+        )
+        sample_weight = gait_quality_weight(
+            gait_quality,
+            band,
+            strong_threshold=self.verifier.config.strong_gait_quality,
+        )
+        if sample_weight <= 0.0:
+            return None, "步态质量贡献为零，等待更完整序列", band
         # An event is counted once per session, but its later windows still
         # belong to the same person's learning stream.  The update decision is
         # made after a stable window is formed, so short/noisy samples are not
@@ -497,37 +652,97 @@ class AppearanceFirstGaitEnrollmentController:
         if not state.gait_samples:
             state.gait_window_start_timestamp = observation.timestamp
         vector = np.asarray(observation.features.normalized().gait, dtype=np.float32)
-        reference = self._unit_mean(state.gait_samples)
+        reference = self._unit_mean(
+            state.gait_samples,
+            state.gait_sample_weights,
+        )
         if reference is not None:
             if reference.shape != vector.shape:
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = observation.timestamp
             else:
                 similarity = float(np.dot(reference, vector))
                 if similarity < self.policy.minimum_sample_similarity:
-                    state.gait_samples.clear()
+                    self._clear_gait_window(state)
                     state.gait_window_start_timestamp = observation.timestamp
                     state.gait_samples.append(vector.copy())
+                    state.gait_sample_weights.append(sample_weight)
+                    state.gait_sample_qualities.append(gait_quality)
                     return None, f"步态样本波动，重新采集（相似度 {similarity:.2f}）", band
         state.gait_samples.append(vector.copy())
+        state.gait_sample_weights.append(sample_weight)
+        state.gait_sample_qualities.append(gait_quality)
         while len(state.gait_samples) > self.policy.gait_sample_window:
             state.gait_samples.popleft()
+            state.gait_sample_weights.popleft()
+            state.gait_sample_qualities.popleft()
         required = self.policy.minimum_stable_gait_samples
-        if len(state.gait_samples) < required:
-            return None, f"步态样本采集中 {len(state.gait_samples)}/{required}", band
-        centroid = self._unit_mean(state.gait_samples)
+        sample_mass = float(sum(state.gait_sample_weights))
+        required_mass = required * self.verifier.config.minimum_weighted_gait_mass
+        if len(state.gait_samples) < required or sample_mass < required_mass:
+            return (
+                None,
+                (
+                    f"步态样本采集中 {len(state.gait_samples)}/{required}"
+                    f"（质量权重 {sample_mass:.2f}/{required_mass:.2f}）"
+                ),
+                band,
+            )
+        centroid = self._unit_mean(
+            state.gait_samples,
+            state.gait_sample_weights,
+        )
         if centroid is None:
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             return None, "步态样本聚合失败，重新采集", band
-        stability = float(
-            np.mean([float(np.dot(item, centroid)) for item in state.gait_samples])
+        stability = weighted_cosine_stability(
+            state.gait_samples,
+            centroid,
+            state.gait_sample_weights,
+        )
+        quality_values = np.asarray(tuple(state.gait_sample_qualities), dtype=np.float32)
+        weight_values = np.asarray(tuple(state.gait_sample_weights), dtype=np.float32)
+        total_weight = float(weight_values.sum())
+        if (
+            quality_values.shape[0] != len(state.gait_samples)
+            or weight_values.shape[0] != len(state.gait_samples)
+            or total_weight <= 1e-8
+        ):
+            self._clear_gait_window(state)
+            return None, "步态质量聚合失败，重新采集", GaitQualityBand.INVALID
+        aggregate_quality = float(
+            np.clip(
+                np.dot(weight_values, quality_values) / total_weight,
+                0.0,
+                1.0,
+            )
+        )
+        aggregate_band = (
+            GaitQualityBand.STRONG
+            if aggregate_quality >= self.verifier.config.strong_gait_quality
+            else (
+                GaitQualityBand.PARTIAL
+                if aggregate_quality >= self.verifier.config.partial_gait_quality
+                else GaitQualityBand.INVALID
+            )
         )
         if stability < self.policy.minimum_gait_stability:
-            return None, f"步态事件稳定度 {stability:.2f} 不足", band
+            return None, f"步态事件稳定度 {stability:.2f} 不足", aggregate_band
+        if aggregate_band != GaitQualityBand.STRONG:
+            return (
+                None,
+                f"步态聚合质量 {aggregate_quality:.2f}，等待 STRONG",
+                aggregate_band,
+            )
         return (
-            _StableGaitSample(centroid, stability, len(state.gait_samples)),
-            f"步态事件稳定（{stability:.2f}）",
-            band,
+            _StableGaitSample(
+                centroid,
+                stability,
+                len(state.gait_samples),
+                aggregate_quality,
+            ),
+            f"步态事件稳定（{stability:.2f}，质量 {aggregate_quality:.2f}）",
+            aggregate_band,
         )
 
     def _readiness(self, identity_id: str) -> GaitReadinessReport:
@@ -551,13 +766,27 @@ class AppearanceFirstGaitEnrollmentController:
         progress: float = 0.0,
         gait_quality_band: GaitQualityBand | None = None,
         auto_registered: bool = False,
+        action_prediction: ActionPrediction | None = None,
+        stage_override: AutomationStage | None = None,
     ) -> AutomationStatus:
+        action_type = (
+            action_prediction.action_type.value if action_prediction is not None else None
+        )
+        action_confidence = (
+            action_prediction.confidence if action_prediction is not None else None
+        )
+        action_quality = (
+            action_prediction.quality.value if action_prediction is not None else None
+        )
         if identity_id is None:
             return AutomationStatus(
-                AutomationStage.WAIT_MORE_DATA,
+                stage_override or AutomationStage.WAIT_MORE_DATA,
                 message,
                 progress=float(np.clip(progress, 0.0, 1.0)),
                 gait_quality_band=gait_quality_band.value if gait_quality_band else None,
+                action_type=action_type,
+                action_confidence=action_confidence,
+                action_quality=action_quality,
             )
         report = report or self._readiness(identity_id)
         state = report.state
@@ -578,7 +807,7 @@ class AppearanceFirstGaitEnrollmentController:
             )
             progress = max(progress, event_progress)
         return AutomationStatus(
-            stage,
+            stage_override or stage,
             message,
             progress=float(np.clip(progress, 0.0, 1.0)),
             identity_id=identity_id,
@@ -587,7 +816,11 @@ class AppearanceFirstGaitEnrollmentController:
             readiness_state=state.value,
             gait_event_count=report.accepted_event_count,
             gait_prototype_count=report.accepted_prototype_count,
+            gait_stable_sample_count=report.stable_sample_count,
             visual_identity_confirmed=True,
+            action_type=action_type,
+            action_confidence=action_confidence,
+            action_quality=action_quality,
         )
 
     def register_visual_identity(
@@ -641,6 +874,8 @@ class AppearanceFirstGaitEnrollmentController:
         observation: Observation,
         identity_id: str,
         ranking: Sequence,
+        *,
+        allow_gait: bool = True,
     ) -> Decision:
         """输出当前 Track 的视觉身份确认结果。"""
 
@@ -654,7 +889,16 @@ class AppearanceFirstGaitEnrollmentController:
             )
         else:
             appearance_decision = None
-        if observation.features.has_gait:
+        # A bound Track may only use gait after the current appearance branch
+        # has been checked.  Otherwise a formal gait match could return before
+        # a strong appearance contradiction was surfaced to the caller.
+        if (
+            appearance_decision is not None
+            and appearance_decision.kind == DecisionKind.CONFLICT
+            and not bool(observation.metadata.get("appearance_change_suspected"))
+        ):
+            return appearance_decision
+        if allow_gait and observation.features.has_gait:
             report = self._readiness(identity_id)
             if report.state == GaitReadinessState.READY:
                 gait_decision = self.verifier.match_gait_identity(
@@ -687,15 +931,24 @@ class AppearanceFirstGaitEnrollmentController:
         assigned_identity: str | None,
         appearance_identity: str | None = None,
         cannot_link_identity_ids: frozenset[str] = frozenset(),
+        gait_relinked_identity: str | None = None,
     ) -> tuple[Decision, AutomationStatus]:
         state = self._state(state_key)
+        self._sync_subtracklet(state, observation)
+        action_prediction = self._resolve_action(state, observation)
+        was_unbound = state.identity_id is None
         bound_identity = state.identity_id or assigned_identity
+        is_gait_relink = bool(
+            was_unbound
+            and gait_relinked_identity is not None
+            and gait_relinked_identity == bound_identity
+        )
         if (
             bound_identity is not None
             and bound_identity in cannot_link_identity_ids
         ):
             state.conflict = True
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.appearance_samples.clear()
             return (
                 Decision(
@@ -718,9 +971,10 @@ class AppearanceFirstGaitEnrollmentController:
                 ranking,
                 bound_identity,
             )
+            and not is_gait_relink
         ):
             state.conflict = True
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.appearance_samples.clear()
             return (
                 Decision(
@@ -742,7 +996,7 @@ class AppearanceFirstGaitEnrollmentController:
             and assigned_identity != appearance_identity
         ):
             state.conflict = True
-            state.gait_samples.clear()
+            self._clear_gait_window(state)
             state.appearance_samples.clear()
             return (
                 Decision(
@@ -760,7 +1014,7 @@ class AppearanceFirstGaitEnrollmentController:
         if assigned_identity is not None:
             if state.identity_id is not None and state.identity_id != assigned_identity:
                 state.conflict = True
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.appearance_samples.clear()
                 return (
                     Decision(
@@ -806,11 +1060,15 @@ class AppearanceFirstGaitEnrollmentController:
                 state.identity_id = visual_decision.identity_id
                 base_decision = visual_decision
             elif observation.features.has_appearance:
+                wait_reason = self._visual_creation_wait_reason(observation)
                 created_identity, message, appearance_quality = self._collect_appearance(
                     state,
                     observation,
                     ranking,
+                    allow_registration=wait_reason is None,
                 )
+                if wait_reason is not None and created_identity is None:
+                    message = wait_reason
                 if created_identity is not None:
                     state.identity_id = created_identity
                     auto_registered = True
@@ -858,7 +1116,20 @@ class AppearanceFirstGaitEnrollmentController:
 
         identity_id = state.identity_id
         if base_decision is None:
-            base_decision = self._bound_decision(observation, identity_id, ranking)
+            base_decision = self._bound_decision(
+                observation,
+                identity_id,
+                ranking,
+                allow_gait=(
+                    not state.action_gate_active
+                    or self._action_router.allows_walk(action_prediction)
+                ),
+            )
+        if is_gait_relink:
+            base_decision = replace(
+                base_decision,
+                reasons=base_decision.reasons + ("gait_relinked_visual_identity",),
+            )
         appearance_update, appearance_message, _ = (
             (None, "", 0.0)
             if auto_registered
@@ -868,6 +1139,44 @@ class AppearanceFirstGaitEnrollmentController:
             base_decision = replace(
                 base_decision,
                 reasons=base_decision.reasons + ("appearance_prototype_absorbed",),
+            )
+        if state.action_gate_active and not self._action_router.allows_walk(action_prediction):
+            self._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+            status_prediction = action_prediction or ActionPrediction(
+                ActionType.UNKNOWN,
+                confidence=0.0,
+                quality="INVALID",
+                source="missing_after_explicit_routing",
+                model_version="action-router-v1",
+            )
+            reason = ActionRouter().quarantine_reason(action_prediction)
+            report = self._readiness(identity_id)
+            return (
+                replace(
+                    base_decision,
+                    reasons=base_decision.reasons + ("action_quarantine", reason),
+                ),
+                self._status(
+                    identity_id,
+                    report,
+                    message=(
+                        f"{identity_id}：动作 {status_prediction.action_type.value} "
+                        "已隔离，不写入 WALK/GaitGraph2 步态图库"
+                    ),
+                    gait_quality_band=(
+                        observation.quality.gait_quality_band(
+                            minimum_frames=self.verifier.config.gait_learning_min_frames,
+                            minimum_gait_cycles=self.verifier.config.minimum_gait_cycles,
+                            partial_threshold=self.verifier.config.partial_gait_quality,
+                            strong_threshold=self.verifier.config.strong_gait_quality,
+                        )
+                        if observation.features.has_gait
+                        else None
+                    ),
+                    action_prediction=status_prediction,
+                    stage_override=AutomationStage.ACTION_QUARANTINE,
+                ),
             )
         stable, gait_message, gait_band = self._collect_gait(
             state,
@@ -889,7 +1198,7 @@ class AppearanceFirstGaitEnrollmentController:
                 if stable.vector.shape == event.vector.shape
             ]
             if event_already_counted:
-                self.verifier.enroll_gait_prototype(
+                enrollment_written = self._try_enroll_gait_prototype(
                     identity_id,
                     replace(
                         observation,
@@ -905,28 +1214,32 @@ class AppearanceFirstGaitEnrollmentController:
                     event_key=event_key,
                     stability=stable.stability,
                     sample_count=stable.sample_count,
+                    gait_quality=stable.gait_quality,
                     update_existing_event=True,
                 )
-                self._readiness_cache.pop(identity_id, None)
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = None
-                auto_registered = True
-                report = self._readiness(identity_id)
-                gait_message = (
-                    "本步态事件已计数，继续吸收本会话步态样本"
-                    f"（累计 {report.stable_sample_count} 个）"
-                )
-                base_decision = replace(
-                    base_decision,
-                    reasons=base_decision.reasons + ("gait_prototype_updated",),
-                )
+                if enrollment_written:
+                    self._readiness_cache.pop(identity_id, None)
+                    auto_registered = True
+                    report = self._readiness(identity_id)
+                    gait_message = (
+                        "本步态事件已计数，继续吸收本会话步态样本"
+                        f"（累计 {report.stable_sample_count} 个）"
+                    )
+                    base_decision = replace(
+                        base_decision,
+                        reasons=base_decision.reasons + ("gait_prototype_updated",),
+                    )
+                else:
+                    gait_message = "步态质量门槛变化，暂缓写入并继续采集"
             elif other_event_similarities and max(other_event_similarities) >= self.verifier.config.gait_duplicate_event_similarity:
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = None
                 gait_message = "步态事件与已有事件近重复，不重复计数"
             elif other_event_similarities and max(other_event_similarities) < self.verifier.config.gait_event_min_similarity:
                 state.conflict = True
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = None
                 report = self._readiness(identity_id)
                 return (
@@ -955,22 +1268,26 @@ class AppearanceFirstGaitEnrollmentController:
                         "gait_stability": stable.stability,
                     },
                 )
-                self.verifier.enroll_gait_prototype(
+                enrollment_written = self._try_enroll_gait_prototype(
                     identity_id,
                     enrollment,
                     event_key=event_key,
                     stability=stable.stability,
                     sample_count=stable.sample_count,
+                    gait_quality=stable.gait_quality,
                 )
-                self._readiness_cache.pop(identity_id, None)
-                state.gait_samples.clear()
+                self._clear_gait_window(state)
                 state.gait_window_start_timestamp = None
-                auto_registered = True
-                report = self._readiness(identity_id)
-                base_decision = replace(
-                    base_decision,
-                    reasons=base_decision.reasons + ("gait_prototype_enrolled",),
-                )
+                if enrollment_written:
+                    self._readiness_cache.pop(identity_id, None)
+                    auto_registered = True
+                    report = self._readiness(identity_id)
+                    base_decision = replace(
+                        base_decision,
+                        reasons=base_decision.reasons + ("gait_prototype_enrolled",),
+                    )
+                else:
+                    gait_message = "步态质量门槛变化，暂缓写入并继续采集"
 
         message = f"{identity_id}：{gait_message}"
         if appearance_message:
@@ -979,9 +1296,12 @@ class AppearanceFirstGaitEnrollmentController:
             message = f"{identity_id}：步态就绪，可由 GaitGraph2 主检索"
         elif report.accepted_event_count:
             message = (
-                f"{identity_id}：步态学习 {report.accepted_event_count}/"
-                f"{self.verifier.config.gait_ready_min_events}，{gait_message}"
+                f"{identity_id}：独立步态事件 {report.accepted_event_count}/"
+                f"{self.verifier.config.gait_ready_min_events}，"
+                f"累计稳定步态样本 {report.stable_sample_count}，{gait_message}"
             )
+        elif gait_message.startswith("步态质量门槛变化"):
+            message = f"{identity_id}：{gait_message}"
         else:
             message = f"{identity_id}：视觉身份已确认，等待步态样本"
         return (
@@ -993,6 +1313,7 @@ class AppearanceFirstGaitEnrollmentController:
                 progress=1.0 if report.state == GaitReadinessState.READY else 0.0,
                 gait_quality_band=gait_band,
                 auto_registered=auto_registered,
+                action_prediction=action_prediction,
             ),
         )
 
@@ -1021,23 +1342,40 @@ class AppearanceFirstGaitEnrollmentController:
             raise ValueError("candidate_ids must align with observations")
         if not observations:
             return ()
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate_ids must be unique within a verification batch")
         normalized = [item.normalized() for item in observations]
         rankings, assigned = self._appearance_assignments(normalized)
+        gait_assigned = self._gait_assignments(normalized)
         identities = list(self.verifier.formal_identities)
         appearance_ids = {
             row: identities[column]
             for row, column in assigned.items()
             if column < len(identities)
         }
-        # OSNet-first 的全局指派只负责视觉身份。GaitGraph2 可以在已绑定
-        # Track 的身份范围内做主检索，但不能把未绑定 Track 直接改写成正式 P。
-        # 这条 seam 还保留了 Track 状态作为短期 must-link。
+        gait_ids = {
+            row: identities[column]
+            for row, column in gait_assigned.items()
+            if column < len(identities)
+        }
+        gait_relinked_ids = {
+            row: identity_id
+            for row, identity_id in gait_ids.items()
+            if self._readiness(identity_id).state != GaitReadinessState.READY
+        }
+        # OSNet-first 的全局指派优先处理视觉身份；当轨迹因换装或短暂跟踪
+        # 重建而失去外观连续性时，已 READY 的 GaitGraph2 可以作为独立行为
+        # 证据回连到已有身份。Track 状态仍作为短期 must-link，避免跨身份串联。
         state_identities = {
             index: self._state(candidate_id).identity_id
             for index, candidate_id in enumerate(candidate_ids)
         }
         proposed = {
-            index: appearance_ids.get(index) or state_identities.get(index)
+            index: (
+                appearance_ids.get(index)
+                or gait_ids.get(index)
+                or state_identities.get(index)
+            )
             for index in range(len(normalized))
         }
         identity_counts: dict[str, int] = {}
@@ -1054,9 +1392,12 @@ class AppearanceFirstGaitEnrollmentController:
                 item,
                 state_key=candidate_id,
                 ranking=rankings[index],
-                assigned_identity=appearance_ids.get(index),
-                appearance_identity=None,
+                assigned_identity=(
+                    gait_ids.get(index) or appearance_ids.get(index)
+                ),
+                appearance_identity=appearance_ids.get(index),
                 cannot_link_identity_ids=cannot_link_identity_ids,
+                gait_relinked_identity=gait_relinked_ids.get(index),
             )
             for index, (item, candidate_id) in enumerate(zip(normalized, candidate_ids))
         )
