@@ -50,16 +50,12 @@ def _coco_adjacency(max_hop: int = 3) -> np.ndarray:
     for distance in range(max_hop, -1, -1):
         hop_distance[reachable[distance]] = distance
 
-    # OpenGait normalizes the *union* of all nodes reachable within
-    # ``max_hop`` and only then partitions that normalized matrix by hop. It
-    # is not the one-hop degree normalization used by a vanilla ST-GCN.
-    reachable_within_hops = np.isfinite(hop_distance)
-    degree = reachable_within_hops.sum(axis=0)
+    degree = adjacency.sum(axis=0)
     inverse_degree = np.zeros((nodes, nodes), dtype=np.float32)
     for index, value in enumerate(degree):
         if value > 0:
-            inverse_degree[index, index] = float(value) ** -1
-    normalized = reachable_within_hops.astype(np.float32) @ inverse_degree
+            inverse_degree[index, index] = value ** -1
+    normalized = adjacency @ inverse_degree
     result = np.zeros((max_hop + 1, nodes, nodes), dtype=np.float32)
     for hop in range(max_hop + 1):
         result[hop][hop_distance == hop] = normalized[hop_distance == hop]
@@ -396,41 +392,17 @@ class GaitGraph2Encoder(nn.Module):
 
 
 def _fill_missing(sequence: np.ndarray) -> np.ndarray:
-    """按时间轴填补空关节，同时保留缺失置信度掩码。
-
-    旧实现只在当前帧用帧中心替换空点；更严重的是上游直接删除整帧，
-    让帧间差分把遮挡当成连续运动。这里先对每个关节沿真实保留的帧槽
-    做线性插值，再对整段完全缺失的关节使用 OpenGait 风格的局部中心。
-    置信度列不被伪造，因此质量门仍能看到原始缺失。
-    """
+    """使用该帧可见关节中心填补缺失关节坐标。"""
     result = np.asarray(sequence, dtype=np.float32).copy()
-    if result.ndim != 3 or result.shape[0] == 0:
-        return result
-    time_axis = np.arange(result.shape[0], dtype=np.float32)
-    has_any_valid = np.zeros(result.shape[1], dtype=bool)
-    for joint in range(result.shape[1]):
-        valid = result[:, joint, 2] > 0.0
-        if valid.any():
-            has_any_valid[joint] = True
-            for channel in (0, 1):
-                result[:, joint, channel] = np.interp(
-                    time_axis,
-                    time_axis[valid],
-                    result[valid, joint, channel],
-                ).astype(np.float32)
     for frame in result:
-        # A joint observed elsewhere in the window already has a temporal
-        # interpolation.  Only a joint that is missing for the entire window
-        # needs the OpenGait-style local-center fallback.
-        empty = (frame[:, 2] <= 0.0) & ~has_any_valid
-        if not empty.any():
-            continue
-        valid = ~empty
+        valid = (frame[:, 2] > 0) & np.isfinite(frame).all(axis=1)
         if valid.any():
-            center = frame[valid].mean(axis=0)
-            frame[empty, 0] = center[0]
-            frame[empty, 1] = center[1]
-        frame[empty, 2] = 0.0
+            center = frame[valid, :2].mean(axis=0)
+        else:
+            center = np.zeros(2, dtype=np.float32)
+        invalid = ~valid
+        frame[invalid, :2] = center
+        frame[invalid, 2] = 0.0
     return result
 
 
@@ -438,26 +410,8 @@ def _fixed_length(sequence: np.ndarray, length: int) -> np.ndarray:
     """将姿态窗口重采样为模型要求的固定时序长度。"""
     if len(sequence) == length:
         return sequence
-    source_axis = np.arange(len(sequence), dtype=np.float32)
-    target_axis = np.linspace(0, len(sequence) - 1, length, dtype=np.float32)
-    flattened = sequence.reshape(len(sequence), -1)
-    resized = np.stack(
-        [
-            np.interp(target_axis, source_axis, flattened[:, column])
-            for column in range(flattened.shape[1])
-        ],
-        axis=1,
-    )
-    # Coordinates may be interpolated across a missing slot, but confidence is
-    # a validity mask rather than a continuous signal.  Nearest-neighbour
-    # sampling keeps a missing pose masked instead of manufacturing a partial
-    # confidence value during fixed-length resampling.
-    if sequence.shape[-1] >= 3:
-        nearest = np.rint(target_axis).astype(np.int64)
-        resized[:, 2::sequence.shape[-1]] = flattened[
-            nearest, 2::sequence.shape[-1]
-        ]
-    return resized.reshape(length, *sequence.shape[1:]).astype(np.float32)
+    indexes = np.rint(np.linspace(0, len(sequence) - 1, length)).astype(np.int64)
+    return sequence[indexes]
 
 
 def gait_graph_multi_input(sequence: np.ndarray) -> np.ndarray:
@@ -489,7 +443,7 @@ class TemporalGaitEncoder:
     """加载 GREW 检查点并编码滚动姿态序列。
 
     ``encode`` 将时序重采样、缺失关键点处理、可选测试时增强、设备放置和
-    L2 归一化隐藏在一个小接口后，该接口由生产视觉适配器使用。
+    L2 归一化隐藏在一个小接口后，该接口由参与者 B 的生产适配器使用。
     """
 
     def __init__(
@@ -522,45 +476,15 @@ class TemporalGaitEncoder:
         return 384 if self.use_tta else 128
 
     def encode(self, poses: Sequence[np.ndarray] | np.ndarray) -> np.ndarray | None:
-        """编码一个姿态窗口；窗口不可用时返回 ``None``。"""
-        return self.encode_batch([poses])[0]
-
-    def encode_batch(
-        self,
-        pose_sequences: Sequence[Sequence[np.ndarray] | np.ndarray],
-    ) -> list[np.ndarray | None]:
-        """一次编码多个姿态窗口，并保持结果与输入顺序对齐。
-
-        无效窗口在对应位置返回 ``None``，其余窗口的原始、时间反转和水平翻转
-        变体会合并为一个模型批次。这样生产适配器无需了解 TTA 分组、设备传输
-        和输出归一化细节，也不会为每个 Track 单独启动一次 GPU 前向。
-        """
-
-        output: list[np.ndarray | None] = [None] * len(pose_sequences)
-        variants: list[np.ndarray] = []
-        valid_indexes: list[int] = []
-        for index, poses in enumerate(pose_sequences):
-            try:
-                sequence = np.asarray(poses, dtype=np.float32)
-            except (TypeError, ValueError):
-                continue
-            if (
-                sequence.ndim != 3
-                or sequence.shape[1:] != (17, 3)
-                or len(sequence) < 25
-            ):
-                continue
-            sequence = _fixed_length(sequence, self.sequence_length)
-            variants.append(gait_graph_multi_input(sequence))
-            if self.use_tta:
-                variants.append(gait_graph_multi_input(sequence[::-1].copy()))
-                variants.append(
-                    gait_graph_multi_input(sequence[:, _COCO_FLIP].copy())
-                )
-            valid_indexes.append(index)
-        if not variants:
-            return output
-
+        """编码姿态窗口；窗口不可用时返回 ``None``。"""
+        sequence = np.asarray(poses, dtype=np.float32)
+        if sequence.ndim != 3 or sequence.shape[1:] != (17, 3) or len(sequence) < 25:
+            return None
+        sequence = _fixed_length(sequence, self.sequence_length)
+        variants = [gait_graph_multi_input(sequence)]
+        if self.use_tta:
+            variants.append(gait_graph_multi_input(sequence[::-1].copy()))
+            variants.append(gait_graph_multi_input(sequence[:, _COCO_FLIP].copy()))
         batch = torch.from_numpy(np.stack(variants)).to(self.device)
         with torch.inference_mode():
             if self.device.type == "cuda":
@@ -568,12 +492,9 @@ class TemporalGaitEncoder:
                     embeddings = self.model(batch)
             else:
                 embeddings = self.model(batch)
-        grouped = embeddings.float().cpu().numpy().reshape(len(valid_indexes), -1)
-        for destination, vector in zip(valid_indexes, grouped):
-            norm = float(np.linalg.norm(vector))
-            if norm > 1e-8:
-                output[destination] = (vector / norm).astype(np.float32)
-        return output
+        vector = embeddings.float().cpu().numpy().reshape(-1)
+        norm = float(np.linalg.norm(vector))
+        return (vector / norm).astype(np.float32) if norm > 1e-8 else None
 
 
 __all__ = [

@@ -10,13 +10,13 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
-from .types import AppearanceAbsorptionRequest
+from ..types import AppearanceAbsorptionRequest
 
 
 class AppearanceAbsorptionManager:
     """签发、校验、消费和恢复一次性授权。
 
-    管理器有意只保存在内存中。在线编排层通过 SQLite 持久化数据类字段，并在
+    管理器有意只保存在内存中。参与者 C 通过 SQLite 持久化数据类字段，并在
     验证器启动时恢复它们，使该策略类不依赖具体的存储实现。
     """
 
@@ -33,8 +33,6 @@ class AppearanceAbsorptionManager:
         gait_probability: float,
         gait_quality: float,
         candidate_id: str | None = None,
-        camera_id: str | None = None,
-        track_id: str | None = None,
         now: float | None = None,
         metadata: dict[str, object] | None = None,
     ) -> AppearanceAbsorptionRequest:
@@ -49,8 +47,6 @@ class AppearanceAbsorptionManager:
             gait_quality=float(gait_quality),
             issued_at=now,
             expires_at=now + self.ttl_seconds,
-            camera_id=camera_id,
-            track_id=track_id,
             metadata=dict(metadata or {}),
         )
         self._requests[request.request_id] = request
@@ -95,8 +91,6 @@ class AppearanceAbsorptionManager:
         identity_id: str,
         event_id: str,
         candidate_id: str | None,
-        camera_id: str | None = None,
-        track_id: str | None = None,
         now: float | None = None,
     ) -> tuple[bool, str, AppearanceAbsorptionRequest | None]:
         """校验响应并返回 ``(accepted, reason, request)``。
@@ -119,15 +113,6 @@ class AppearanceAbsorptionManager:
             return False, "appearance_request_identity_mismatch", request
         if request.candidate_id is not None and request.candidate_id != candidate_id:
             return False, "appearance_request_candidate_mismatch", request
-        # A request issued by the automatic track path carries both the stable
-        # candidate and the short-lived tracker binding.  Candidate IDs are the
-        # primary cross-session boundary; camera/track checks close the same
-        # frame/session substitution hole when a candidate is accidentally
-        # reused by two simultaneous tracks.
-        if request.camera_id is not None and request.camera_id != camera_id:
-            return False, "appearance_request_camera_mismatch", request
-        if request.track_id is not None and request.track_id != track_id:
-            return False, "appearance_request_track_mismatch", request
         if request.issued_by_event_id == event_id:
             return False, "appearance_request_same_event", request
         return True, "appearance_request_valid", request
@@ -146,11 +131,6 @@ class AppearanceAbsorptionManager:
     def restore(self, request: AppearanceAbsorptionRequest) -> None:
         """在验证器恢复持久化状态时恢复一个请求。"""
         self._requests[request.request_id] = request
-
-    def discard(self, request_id: str) -> None:
-        """删除尚未提交的内存令牌，用于上层事务回滚。"""
-
-        self._requests.pop(request_id, None)
 
     def all(self) -> tuple[AppearanceAbsorptionRequest, ...]:
         """返回所有请求，包括已消费和已过期的审计记录。"""

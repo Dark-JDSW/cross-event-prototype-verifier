@@ -7,14 +7,13 @@ Tk 只负责展示。``FrameWorker`` 执行采集和推理，``VideoVerifierPipe
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
 import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
 
-from .engine import CrossEventVerifier
+from ..participant_a.engine import CrossEventVerifier
 from .media import (
     FrameMessage,
     FrameWorker,
@@ -27,10 +26,7 @@ from .automation import AutomationPolicy
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterState
 from .storage import SqliteStore
-from .vision_factory import build_vision_adapter
-
-
-GUI_POLL_INTERVAL_MS = 16
+from ..participant_b.vision_factory import build_vision_adapter
 
 
 def _frame_to_photo(
@@ -91,7 +87,6 @@ class VerifierWindow:
             self.verifier,
             self.vision,
             automation_policy=AutomationPolicy(enabled=automatic_capable),
-            appearance_first=True,
         )
         self.worker = FrameWorker(self.pipeline)
         self._photo: tk.PhotoImage | None = None
@@ -101,7 +96,6 @@ class VerifierWindow:
         self.video_path = tk.StringVar()
         self.camera_id = tk.StringVar(value="camera-1")
         self.identity_id = tk.StringVar(value="P1")
-        self.candidate_id = tk.StringVar()
         self.automatic_registration = tk.BooleanVar(value=automatic_capable)
         self.automation_status = tk.StringVar(
             value=(
@@ -123,7 +117,7 @@ class VerifierWindow:
 
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(GUI_POLL_INTERVAL_MS, self._poll_messages)
+        self.root.after(50, self._poll_messages)
 
     def _build_layout(self) -> None:
         """构造输入源控件、监控页、登记面板和状态栏。"""
@@ -185,54 +179,9 @@ class VerifierWindow:
         )
         self.video_label.grid(row=0, column=0, sticky="nsew")
 
-        # 右侧控件总高度会随 Track 列表和状态文案变化，不能直接把它放进
-        # 固定高度的监控页。使用一个独立的画布视口承载右栏，窗口较矮时仍
-        # 可以通过滚动条访问“外观吸收”和图库区域，而不会被父 Frame 裁掉。
-        side_content_width = 520
-        side_viewport = ttk.Frame(body, width=side_content_width + 18)
-        side_viewport.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
-        side_viewport.grid_propagate(False)
-        side_viewport.columnconfigure(0, weight=1)
-        side_viewport.rowconfigure(0, weight=1)
-        side_canvas = tk.Canvas(
-            side_viewport,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        side_canvas.grid(row=0, column=0, sticky="nsew")
-        side_scrollbar = ttk.Scrollbar(
-            side_viewport,
-            orient="vertical",
-            command=side_canvas.yview,
-        )
-        side_scrollbar.grid(row=0, column=1, sticky="ns")
-        side_canvas.configure(yscrollcommand=side_scrollbar.set)
-        side = ttk.Frame(side_canvas, width=side_content_width)
-        side_window = side_canvas.create_window(
-            (0, 0),
-            window=side,
-            anchor="nw",
-            width=side_content_width,
-        )
-
-        def update_side_scrollregion(_event: tk.Event[tk.Misc] | None = None) -> None:
-            """根据右栏实际内容更新画布可滚动范围。"""
-
-            side_canvas.configure(scrollregion=side_canvas.bbox("all"))
-
-        def resize_side_window(event: tk.Event[tk.Misc]) -> None:
-            """让右栏内容保持固定设计宽度，不因滚动条出现而水平溢出。"""
-
-            side_canvas.itemconfigure(
-                side_window,
-                width=max(side_content_width, int(event.width)),
-            )
-
-        side.bind("<Configure>", update_side_scrollregion)
-        side_canvas.bind("<Configure>", resize_side_window)
-        # 将画布和滚动条保留为属性，便于后续主题或无障碍交互扩展。
-        self.side_canvas = side_canvas
-        self.side_scrollbar = side_scrollbar
+        side = ttk.Frame(body, width=520)
+        side.grid(row=0, column=1, padx=(10, 0), sticky="ns")
+        side.grid_propagate(False)
         ttk.Label(side, text="当前目标", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
         self.track_tree = ttk.Treeview(
             side,
@@ -266,32 +215,19 @@ class VerifierWindow:
         ).grid(row=1, column=0, columnspan=2, padx=6, pady=(2, 8), sticky="w")
         ttk.Label(enrollment, text="人工身份 ID").grid(row=2, column=0, padx=6, pady=8)
         ttk.Entry(enrollment, textvariable=self.identity_id, width=18).grid(row=2, column=1, padx=6, pady=8)
-        ttk.Label(enrollment, text="跨事件候选键").grid(row=3, column=0, padx=6, pady=8)
-        ttk.Entry(enrollment, textvariable=self.candidate_id, width=18).grid(
-            row=3,
-            column=1,
-            padx=6,
-            pady=8,
-        )
-        ttk.Label(
-            enrollment,
-            text="视觉身份尚未完成时，临时 Track 换视频/摄像头仍需保持不变；已有 P 会由 OSNet 自动重新绑定。",
-            wraplength=470,
-        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
         ttk.Button(
             enrollment,
             text="人工登记选中目标（兜底）",
             command=self.register_selected,
-        ).grid(row=5, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="ew")
+        ).grid(row=3, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="ew")
         ttk.Label(
             enrollment,
-            text="当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GaitGraph2 原型。",
+            text="自动流程只用强步态建号；外观必须经一次性请求后才会吸收。",
             wraplength=470,
-        ).grid(row=6, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
+        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
 
         request_box = ttk.LabelFrame(side, text="外观吸收（自动；此处为人工兜底）")
         request_box.pack(fill="x", pady=(14, 0))
-        self.appearance_request_box = request_box
         ttk.Label(request_box, text="请求令牌").grid(row=0, column=0, padx=6, pady=8)
         ttk.Entry(request_box, textvariable=self.appearance_request_id, width=22).grid(
             row=0,
@@ -321,11 +257,6 @@ class VerifierWindow:
         gallery.pack(fill="x", pady=(14, 0))
         self.gallery_label = ttk.Label(gallery, text="无")
         self.gallery_label.pack(anchor="w", padx=8, pady=8)
-        ttk.Button(
-            gallery,
-            text="清除现有 ID（重新建库）",
-            command=self.clear_existing_ids,
-        ).pack(fill="x", padx=8, pady=(0, 8))
 
         self._build_parameter_page(parameter_page)
 
@@ -502,18 +433,17 @@ class VerifierWindow:
 
     def _source_spec(self) -> SourceSpec:
         """校验输入源控件，并将其转换为工作线程使用的 ``SourceSpec``。"""
-        candidate_id = self.candidate_id.get().strip() or None
         if self.source_kind.get() == "file":
             path = self.video_path.get().strip()
             if not path:
                 raise ValueError("请先选择视频文件")
-            return SourceSpec("file", path, Path(path).name, candidate_id)
+            return SourceSpec("file", path, Path(path).name)
         try:
             index = int(self.camera_index.get().strip())
         except ValueError as error:
             raise ValueError("摄像头设备号必须是整数") from error
         label = self.camera_id.get().strip() or f"camera-{index}"
-        return SourceSpec("camera", index, label, candidate_id)
+        return SourceSpec("camera", index, label)
 
     def start(self) -> None:
         """校验所选摄像头或文件输入源后开始采集。"""
@@ -543,7 +473,7 @@ class VerifierWindow:
             return
         self.worker.set_automatic_registration(enabled)
         self.automation_status.set(
-            "自动注册：开启，OSNet 将先确认视觉身份，随后学习步态原型"
+            "自动注册：开启，稳定强步态将自动生成 P 身份"
             if enabled
             else "自动注册：关闭；识别和外观令牌响应仍继续"
         )
@@ -558,41 +488,6 @@ class VerifierWindow:
         track_id = int(selected[0]) if selected else None
         self.worker.register_identity(identity_id, track_id)
         self.status.set("登记请求已排队，将在采集线程安全执行")
-
-    def clear_existing_ids(self) -> None:
-        """备份后清空全部身份数据，供重新识别/建库。"""
-
-        if not messagebox.askyesno(
-            "确认清除身份",
-            "将清除全部视觉身份、步态原型、事件和审计记录。\n"
-            "清除前会自动创建数据库备份，是否继续？",
-            icon="warning",
-        ):
-            return
-        self.worker.stop()
-        store = self.verifier.store
-        backup_path: Path | None = None
-        if store.path != ":memory:":
-            database = Path(store.path)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup_path = database.with_name(
-                f"{database.stem}-before-clear-{stamp}{database.suffix}"
-            )
-            store.backup_to(str(backup_path))
-        try:
-            self.pipeline.clear_gallery()
-        except Exception as error:
-            messagebox.showerror("清除失败", f"身份数据未完成清除：{error}")
-            return
-        for item in self.track_tree.get_children():
-            self.track_tree.delete(item)
-        self.gallery_label.configure(text="无")
-        self.pending_requests.set("无")
-        self.automation_status.set("自动注册：开启，等待人物进入画面")
-        self.status.set(
-            "已清除全部身份数据"
-            + (f"；备份：{backup_path.name}" if backup_path is not None else "")
-        )
 
     def apply_appearance_request(self) -> None:
         """排队一次性外观令牌，可选绑定到选中的 Track。"""
@@ -673,17 +568,13 @@ class VerifierWindow:
 
     def _poll_messages(self) -> None:
         """取出工作线程消息，并安排下一次 Tk 轮询。"""
-        latest_frame: FrameMessage | None = None
         while True:
             try:
                 message = self.worker.messages.get_nowait()
             except queue.Empty:
                 break
             if isinstance(message, FrameMessage):
-                # 工作线程在高负载时会丢弃旧帧，但轮询开始前仍可能积压多条
-                # FrameMessage。只渲染最新帧，避免 Tk 连续转换/绘制已经过时的
-                # 画面，造成额外背压和可见延迟。
-                latest_frame = message
+                self._update_frame(message.result)
             elif isinstance(message, RegistrationMessage):
                 self.status.set(message.text)
                 if message.success:
@@ -699,9 +590,7 @@ class VerifierWindow:
                     messagebox.showerror("参数应用失败", message.text)
             elif isinstance(message, StatusMessage):
                 self.status.set(message.text)
-        if latest_frame is not None:
-            self._update_frame(latest_frame.result)
-        self.root.after(GUI_POLL_INTERVAL_MS, self._poll_messages)
+        self.root.after(50, self._poll_messages)
 
     def close(self) -> None:
         """停止后台工作、关闭 SQLite，并销毁 Tk 根窗口。"""

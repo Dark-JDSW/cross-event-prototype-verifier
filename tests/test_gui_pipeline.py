@@ -3,23 +3,16 @@
 import unittest
 import tkinter as tk
 from dataclasses import replace
-from pathlib import Path
-import tempfile
 from unittest.mock import patch
 
 import numpy as np
 
 from cross_event_verifier import AutomationPolicy, CrossEventVerifier, FeatureBundle
-from cross_event_verifier.gui import (
-    GUI_POLL_INTERVAL_MS,
-    VerifierWindow,
-    _frame_to_photo,
-)
-from cross_event_verifier.media import FrameWorker, ParameterUpdateMessage, SourceSpec
-from cross_event_verifier.pipeline import VideoVerifierPipeline
-from cross_event_verifier.storage import SqliteStore
+from cross_event_verifier.participant_c.gui import VerifierWindow, _frame_to_photo
+from cross_event_verifier.participant_c.media import FrameWorker, ParameterUpdateMessage, SourceSpec
+from cross_event_verifier.participant_c.pipeline import VideoVerifierPipeline
 from cross_event_verifier.types import TrackQuality
-from cross_event_verifier.vision import OpenCvDemoAdapter, VisionTrack
+from cross_event_verifier.participant_b.vision import OpenCvDemoAdapter, VisionTrack
 
 
 def stable_quality() -> TrackQuality:
@@ -134,29 +127,6 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
-    def test_track_candidate_key_survives_active_count_changes(self) -> None:
-        """同一 Track 增减同框人数时仍保持视觉身份 must-link。"""
-
-        pipeline = VideoVerifierPipeline(
-            CrossEventVerifier(),
-            FakeVision(),
-            appearance_first=True,
-        )
-        pipeline.set_source(
-            "cam-must-link",
-            capture_session_id="must-link-session",
-            candidate_id="enrollment-1",
-        )
-        first = pipeline._candidate_id_for_track(7, active_count=1)
-        after_another_person_enters = pipeline._candidate_id_for_track(7, active_count=2)
-        other_track = pipeline._candidate_id_for_track(8, active_count=2)
-        self.assertEqual(first, "enrollment-1")
-        self.assertEqual(after_another_person_enters, first)
-        self.assertNotEqual(other_track, first)
-
-    def test_gui_poll_interval_supports_sixty_hertz_refresh(self) -> None:
-        self.assertEqual(GUI_POLL_INTERVAL_MS, 16)
-
     def test_camera_frame_converts_to_tk_photo(self) -> None:
         root = tk.Tk()
         root.withdraw()
@@ -169,7 +139,7 @@ class GuiPipelineTests(unittest.TestCase):
 
     def test_gui_has_a_realtime_parameter_page(self) -> None:
         with patch(
-            "cross_event_verifier.gui.build_vision_adapter",
+            "cross_event_verifier.participant_c.gui.build_vision_adapter",
             return_value=FakeVision(),
         ):
             window = VerifierWindow(":memory:", "demo")
@@ -184,49 +154,6 @@ class GuiPipelineTests(unittest.TestCase):
                 str(window.parameter_entries["vision.detector_confidence"].cget("state")),
                 "disabled",
             )
-        finally:
-            window.close()
-
-    def test_small_window_keeps_appearance_absorption_panel_reachable(self) -> None:
-        """最小窗口下外观吸收控件不能被右侧内容挤出可视区域。"""
-
-        with patch(
-            "cross_event_verifier.gui.build_vision_adapter",
-            return_value=FakeVision(),
-        ):
-            window = VerifierWindow(":memory:", "demo")
-        window.root.geometry("980x640")
-        window.root.update()
-
-        def find_by_text(widget: tk.Misc, text: str) -> tk.Misc | None:
-            for child in widget.winfo_children():
-                try:
-                    if child.cget("text") == text:
-                        return child
-                except tk.TclError:
-                    pass
-                found = find_by_text(child, text)
-                if found is not None:
-                    return found
-            return None
-
-        try:
-            request_box = find_by_text(
-                window.root,
-                "外观吸收（自动；此处为人工兜底）",
-            )
-            self.assertIsNotNone(request_box)
-            assert request_box is not None
-            self.assertTrue(request_box.winfo_ismapped())
-            self.assertEqual(request_box.winfo_height(), request_box.winfo_reqheight())
-            window.side_canvas.yview_moveto(1.0)
-            window.root.update()
-            canvas_top = window.side_canvas.winfo_rooty()
-            canvas_bottom = canvas_top + window.side_canvas.winfo_height()
-            box_top = request_box.winfo_rooty()
-            box_bottom = box_top + request_box.winfo_height()
-            self.assertGreater(box_bottom, canvas_top)
-            self.assertLess(box_top, canvas_bottom)
         finally:
             window.close()
 
@@ -288,7 +215,6 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
-                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
@@ -328,110 +254,6 @@ class GuiPipelineTests(unittest.TestCase):
         self.assertEqual(request.status, "consumed")
         verifier.close()
 
-    def test_default_two_event_registration_survives_source_switch_with_stable_candidate(self) -> None:
-        verifier = CrossEventVerifier()
-        pipeline = VideoVerifierPipeline(
-            verifier,
-            FakeVision(),
-            camera_id="cam-auto",
-            automation_policy=AutomationPolicy(
-                minimum_track_frames=1,
-                minimum_stable_gait_samples=3,
-                gait_sample_window=4,
-                minimum_independent_gait_events=2,
-            ),
-        )
-        frame = np.zeros((220, 120, 3), dtype=np.uint8)
-
-        pipeline.set_source(
-            "cam-auto",
-            capture_session_id="event-a",
-            candidate_id="enrollment-1",
-        )
-        for timestamp in (300.0, 301.0, 302.0):
-            result = pipeline.process_frame(frame, timestamp=timestamp)
-        self.assertEqual(
-            result.tracks[0].automation.stage.value,
-            "waiting_independent_event",
-        )
-        self.assertEqual(verifier.formal_identities, ())
-
-        pipeline.set_source(
-            "cam-auto",
-            capture_session_id="event-b",
-            candidate_id="enrollment-1",
-        )
-        for timestamp in (303.0, 304.0, 305.0):
-            result = pipeline.process_frame(frame, timestamp=timestamp)
-
-        self.assertTrue(result.tracks[0].automation.auto_registered)
-        self.assertEqual(result.tracks[0].decision.identity_id, "P1")
-        self.assertEqual(verifier.formal_identities, ("P1",))
-        self.assertEqual(verifier.get_candidate("enrollment-1").state.value, "merged")
-        verifier.close()
-
-    def test_default_two_event_registration_survives_process_restart(self) -> None:
-        frame = np.zeros((220, 120, 3), dtype=np.uint8)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "restart.sqlite3"
-            first = CrossEventVerifier(store=SqliteStore(str(path)))
-            first_pipeline = VideoVerifierPipeline(
-                first,
-                FakeVision(),
-                camera_id="cam-auto",
-                automation_policy=AutomationPolicy(
-                    minimum_track_frames=1,
-                    minimum_stable_gait_samples=3,
-                    gait_sample_window=4,
-                    minimum_independent_gait_events=2,
-                ),
-            )
-            first_pipeline.set_source(
-                "cam-auto",
-                capture_session_id="event-restart-a",
-                candidate_id="enrollment-restart",
-            )
-            for timestamp in (310.0, 311.0, 312.0):
-                result = first_pipeline.process_frame(frame, timestamp=timestamp)
-            self.assertEqual(
-                result.tracks[0].automation.stage.value,
-                "waiting_independent_event",
-            )
-            first.close()
-
-            second = CrossEventVerifier(store=SqliteStore(str(path)))
-            second_pipeline = VideoVerifierPipeline(
-                second,
-                FakeVision(),
-                camera_id="cam-auto",
-                automation_policy=AutomationPolicy(
-                    minimum_track_frames=1,
-                    minimum_stable_gait_samples=3,
-                    gait_sample_window=4,
-                    minimum_independent_gait_events=2,
-                ),
-            )
-            restored_events = second.store.load_gait_event_proposals(
-                "enrollment-restart"
-            )
-            self.assertEqual(len(restored_events), 1)
-            self.assertEqual(restored_events[0]["camera_id"], "cam-auto")
-            self.assertEqual(
-                restored_events[0]["capture_session_id"],
-                "event-restart-a",
-            )
-            second_pipeline.set_source(
-                "cam-auto",
-                capture_session_id="event-restart-b",
-                candidate_id="enrollment-restart",
-            )
-            for timestamp in (313.0, 314.0, 315.0):
-                result = second_pipeline.process_frame(frame, timestamp=timestamp)
-            self.assertTrue(result.tracks[0].automation.auto_registered)
-            self.assertEqual(result.tracks[0].decision.identity_id, "P1")
-            self.assertEqual(second.formal_identities, ("P1",))
-            second.close()
-
     def test_novel_gait_is_registered_when_gallery_already_has_an_identity(self) -> None:
         verifier = CrossEventVerifier()
         verifier.register_identity(
@@ -449,7 +271,6 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
-                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
@@ -484,7 +305,6 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
-                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 190, 3), dtype=np.uint8)
@@ -560,7 +380,6 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
-                minimum_independent_gait_events=1,
             ),
         )
         pipeline.update_runtime_parameters(
@@ -568,9 +387,7 @@ class GuiPipelineTests(unittest.TestCase):
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
         before = pipeline.process_frame(frame, timestamp=260.0)
-        # 自动路径的开放集保护不会把单一身份图库中的陌生轨迹直接标成 P1，
-        # 即使运行时把 novelty threshold 调得过低。
-        self.assertIsNone(before.tracks[0].decision.identity_id)
+        self.assertEqual(before.tracks[0].decision.identity_id, "P1")
 
         pipeline.update_runtime_parameters(
             {"verifier.gait_novelty_threshold": "0.35"}
@@ -593,7 +410,6 @@ class GuiPipelineTests(unittest.TestCase):
                 minimum_track_frames=1,
                 minimum_stable_gait_samples=3,
                 gait_sample_window=4,
-                minimum_independent_gait_events=1,
             ),
         )
         frame = np.zeros((220, 120, 3), dtype=np.uint8)
@@ -619,29 +435,6 @@ class GuiPipelineTests(unittest.TestCase):
         video = SourceSpec("file", "sample.mp4", "sample.mp4")
         self.assertEqual(camera.kind, "camera")
         self.assertEqual(video.value, "sample.mp4")
-
-    def test_clear_gallery_removes_persistent_and_runtime_identity_data(self) -> None:
-        store = SqliteStore(":memory:")
-        verifier = CrossEventVerifier(store=store)
-        verifier.register_identity(
-            "P1",
-            FeatureBundle(
-                appearance=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-                gait=np.array([0.0, 1.0, 0.0], dtype=np.float32),
-            ),
-        )
-        self.assertEqual(verifier.formal_identities, ("P1",))
-
-        verifier.clear_gallery()
-
-        self.assertEqual(verifier.formal_identities, ())
-        self.assertEqual(store.list_candidates(), [])
-        counts = {
-            table: store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("identities", "prototypes", "gait_enrollment_events", "audit_log")
-        }
-        self.assertEqual(counts, {table: 0 for table in counts})
-        verifier.close()
 
     def test_pipeline_keeps_identity_assignment_one_to_one_for_two_people(self) -> None:
         verifier = CrossEventVerifier()

@@ -15,14 +15,3 @@ models/*.pt
 models/*.pth
 models/*.onnx
 models/*.engine
-
-# 本地研究资料、测试视频和架构文档不上传远程仓库
-/docs/
-/repair.md
-/gait_registration_problem_analysis.md
-/步态识别_跨视角ID分裂与短期步态误识别解决方案.md
-/gait_open_set_p0_p1_p2_industry_solutions.md
-/gaitgraph2_pg_low_score_analysis.md
-/MAN.mp4
-/P1.mp4
-/P2.mp4

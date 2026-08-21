@@ -13,7 +13,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .types import FeatureBundle, Prototype, normalize_vector
+from ..types import FeatureBundle, Prototype, normalize_vector
 
 
 @dataclass(frozen=True)
@@ -45,18 +45,9 @@ class PrototypeMemory:
         gait_max_learning_rate: float = 0.10,
         minimum_append_quality: float = 0.70,
         minimum_candidate_quality: float = 0.20,
-        maximum_quarantine_prototypes: int | None = None,
     ) -> None:
         """初始化有容量上限的图库策略以及空的正式区/隔离区。"""
         self.maximum_prototypes = max(int(maximum_prototypes), 1)
-        self.maximum_quarantine_prototypes = max(
-            int(
-                maximum_prototypes
-                if maximum_quarantine_prototypes is None
-                else maximum_quarantine_prototypes
-            ),
-            1,
-        )
         self.diversity_threshold = float(np.clip(diversity_threshold, -1.0, 1.0))
         self.appearance_max_learning_rate = float(np.clip(appearance_max_learning_rate, 0.0, 1.0))
         self.gait_max_learning_rate = float(np.clip(gait_max_learning_rate, 0.0, 1.0))
@@ -100,66 +91,22 @@ class PrototypeMemory:
             return tuple(values.get(modality, ()))
         return tuple(proto for group in values.values() for proto in group)
 
-    def best_formal(
-        self,
-        identity_id: str,
-        modality: str,
-        query: np.ndarray,
-        *,
-        model_version: str | None = None,
-        feature_schema: str | None = None,
-        artifact_sha256: str | None = None,
-        preprocess_version: str | None = None,
-        joint_format: str | None = None,
-        sequence_length: int | None = None,
-        tta_mode: str | None = None,
-        coordinate_contract: str | None = None,
-        embedding_dimensions: dict[str, int] | None = None,
-    ) -> tuple[float | None, Prototype | None]:
-        """返回与查询协议兼容的最近正式原型及其余弦相似度。"""
+    def best_formal(self, identity_id: str, modality: str, query: np.ndarray) -> tuple[float | None, Prototype | None]:
+        """返回最近的正式原型及其余弦相似度。"""
         normalized = normalize_vector(query)
         if normalized is None:
             return None, None
         prototypes = self.formal.get(identity_id, {}).get(modality, [])
         best: tuple[float | None, Prototype | None] = (None, None)
         for prototype in prototypes:
-            if model_version is not None and prototype.model_version != model_version:
-                continue
-            if feature_schema is not None and prototype.feature_schema != feature_schema:
-                continue
-            if artifact_sha256 is not None and prototype.artifact_sha256 != artifact_sha256:
-                continue
-            if preprocess_version is not None and prototype.preprocess_version != preprocess_version:
-                continue
-            if joint_format is not None and prototype.joint_format != joint_format:
-                continue
-            if sequence_length is not None and prototype.sequence_length != sequence_length:
-                continue
-            if tta_mode is not None and prototype.tta_mode != tta_mode:
-                continue
-            if coordinate_contract is not None and prototype.coordinate_contract != coordinate_contract:
-                continue
-            if embedding_dimensions is not None and dict(prototype.embedding_dimensions) != dict(embedding_dimensions):
-                continue
-            if prototype.vector.shape != normalized.shape:
-                # A matching label/schema is not enough to make a malformed or
-                # partially migrated vector comparable.  Treat it as absent
-                # instead of exposing the sentinel similarity -1 downstream.
-                continue
             score = self._similarity(normalized, prototype.vector)
             if best[0] is None or score > best[0]:
                 best = (score, prototype)
         return best
 
-    def _evict_redundant(
-        self,
-        group: list[Prototype],
-        *,
-        maximum: int | None = None,
-    ) -> None:
+    def _evict_redundant(self, group: list[Prototype]) -> None:
         """删除最冗余的原型，使容量保持在上限以内。"""
-        limit = self.maximum_prototypes if maximum is None else max(int(maximum), 1)
-        if len(group) <= limit:
+        if len(group) <= self.maximum_prototypes:
             return
         # 删除最近邻相似度最高的原型。若出现并列，则丢弃质量较低的那个，
         # 从而保留多样化视角。
@@ -187,7 +134,6 @@ class PrototypeMemory:
         quality: float,
         append_gate: float,
         enforce_gate: bool,
-        maximum_prototypes: int,
     ) -> tuple[str, float | None, str | None]:
         """合并邻近原型，或在通过门控后追加一个多样样本。"""
         if not group:
@@ -209,7 +155,7 @@ class PrototypeMemory:
             return "blocked", nearest_score, None
 
         group.append(prototype)
-        self._evict_redundant(group, maximum=maximum_prototypes)
+        self._evict_redundant(group)
         return "append", nearest_score, prototype.prototype_id
 
     def _add_to_zone(
@@ -224,15 +170,6 @@ class PrototypeMemory:
         view_angle: str | None,
         clothing_tag: str | None,
         source_event_id: str | None,
-        model_version: str,
-        feature_schema: str,
-        artifact_sha256: str,
-        preprocess_version: str,
-        joint_format: str,
-        sequence_length: int | None,
-        tta_mode: str,
-        coordinate_contract: str,
-        embedding_dimensions: dict[str, int] | None,
         formal: bool,
         enforce_append_gate: bool = True,
     ) -> tuple[MemoryUpdate, ...]:
@@ -248,34 +185,6 @@ class PrototypeMemory:
                 else self.gait_max_learning_rate
             )
             group = zone.setdefault(identity_id, {}).setdefault(modality, [])
-            if group:
-                incompatible = [
-                    current
-                    for current in group
-                    if (
-                        current.vector.size != vector.size
-                        or current.model_version != model_version
-                        or current.feature_schema != feature_schema
-                        or current.artifact_sha256 != artifact_sha256
-                        or current.preprocess_version != preprocess_version
-                        or current.joint_format != joint_format
-                        or current.sequence_length != sequence_length
-                        or current.tta_mode != tta_mode
-                        or current.coordinate_contract != coordinate_contract
-                        or dict(current.embedding_dimensions)
-                        != dict(embedding_dimensions or {})
-                    )
-                ]
-                if incompatible:
-                    raise ValueError(
-                        "incompatible embedding contract for "
-                        f"{identity_id}/{modality}: "
-                        f"existing={incompatible[0].model_version}/"
-                        f"{incompatible[0].feature_schema}/"
-                        f"{incompatible[0].artifact_sha256}/"
-                        f"{incompatible[0].vector.size}, "
-                        f"new={model_version}/{feature_schema}/{artifact_sha256}/{vector.size}"
-                    )
             prototype = Prototype(
                 identity_id=identity_id,
                 modality=modality,
@@ -286,15 +195,6 @@ class PrototypeMemory:
                 view_angle=view_angle,
                 clothing_tag=clothing_tag,
                 source_event_id=source_event_id,
-                model_version=model_version,
-                feature_schema=feature_schema,
-                artifact_sha256=artifact_sha256,
-                preprocess_version=preprocess_version,
-                joint_format=joint_format,
-                sequence_length=sequence_length,
-                tta_mode=tta_mode,
-                coordinate_contract=coordinate_contract,
-                embedding_dimensions=dict(embedding_dimensions or {}),
             )
             action, similarity, prototype_id = self._write_one(
                 group,
@@ -303,11 +203,6 @@ class PrototypeMemory:
                 quality=quality,
                 append_gate=self.minimum_append_quality,
                 enforce_gate=formal and enforce_append_gate,
-                maximum_prototypes=(
-                    self.maximum_prototypes
-                    if formal
-                    else self.maximum_quarantine_prototypes
-                ),
             )
             updates.append(
                 MemoryUpdate(
@@ -332,15 +227,6 @@ class PrototypeMemory:
         view_angle: str | None = None,
         clothing_tag: str | None = None,
         source_event_id: str | None = None,
-        model_version: str = "unconfigured",
-        feature_schema: str = "unconfigured-v1",
-        artifact_sha256: str = "unverified",
-        preprocess_version: str = "unversioned-v1",
-        joint_format: str = "unknown",
-        sequence_length: int | None = None,
-        tta_mode: str = "unknown",
-        coordinate_contract: str = "unknown",
-        embedding_dimensions: dict[str, int] | None = None,
         enforce_append_gate: bool = True,
     ) -> tuple[MemoryUpdate, ...]:
         """将严格样本写入正式记忆。
@@ -362,15 +248,6 @@ class PrototypeMemory:
             view_angle=view_angle,
             clothing_tag=clothing_tag,
             source_event_id=source_event_id,
-            model_version=model_version,
-            feature_schema=feature_schema,
-            artifact_sha256=artifact_sha256,
-            preprocess_version=preprocess_version,
-            joint_format=joint_format,
-            sequence_length=sequence_length,
-            tta_mode=tta_mode,
-            coordinate_contract=coordinate_contract,
-            embedding_dimensions=embedding_dimensions,
             formal=True,
             enforce_append_gate=enforce_append_gate,
         )
@@ -398,15 +275,6 @@ class PrototypeMemory:
                                 view_angle=view_angle,
                                 clothing_tag=clothing_tag,
                                 source_event_id=source_event_id,
-                                model_version=model_version,
-                                feature_schema=feature_schema,
-                                artifact_sha256=artifact_sha256,
-                                preprocess_version=preprocess_version,
-                                joint_format=joint_format,
-                                sequence_length=sequence_length,
-                                tta_mode=tta_mode,
-                                coordinate_contract=coordinate_contract,
-                                embedding_dimensions=dict(embedding_dimensions or {}),
                             )
                         )
                         self._evict_redundant(group)
@@ -423,15 +291,6 @@ class PrototypeMemory:
         view_angle: str | None = None,
         clothing_tag: str | None = None,
         source_event_id: str | None = None,
-        model_version: str = "unconfigured",
-        feature_schema: str = "unconfigured-v1",
-        artifact_sha256: str = "unverified",
-        preprocess_version: str = "unversioned-v1",
-        joint_format: str = "unknown",
-        sequence_length: int | None = None,
-        tta_mode: str = "unknown",
-        coordinate_contract: str = "unknown",
-        embedding_dimensions: dict[str, int] | None = None,
     ) -> tuple[MemoryUpdate, ...]:
         """将观测添加到隔离记忆，不触碰正式身份。"""
 
@@ -452,15 +311,6 @@ class PrototypeMemory:
             view_angle=view_angle,
             clothing_tag=clothing_tag,
             source_event_id=source_event_id,
-            model_version=model_version,
-            feature_schema=feature_schema,
-            artifact_sha256=artifact_sha256,
-            preprocess_version=preprocess_version,
-            joint_format=joint_format,
-            sequence_length=sequence_length,
-            tta_mode=tta_mode,
-            coordinate_contract=coordinate_contract,
-            embedding_dimensions=embedding_dimensions,
             formal=False,
         )
 
@@ -505,15 +355,6 @@ class PrototypeMemory:
                     view_angle=source.view_angle,
                     clothing_tag=source.clothing_tag,
                     source_event_id=source.source_event_id,
-                    model_version=source.model_version,
-                    feature_schema=source.feature_schema,
-                    artifact_sha256=source.artifact_sha256,
-                    preprocess_version=source.preprocess_version,
-                    joint_format=source.joint_format,
-                    sequence_length=source.sequence_length,
-                    tta_mode=source.tta_mode,
-                    coordinate_contract=source.coordinate_contract,
-                    embedding_dimensions=dict(source.embedding_dimensions),
                 )
                 group.append(clone)
                 self._evict_redundant(group)

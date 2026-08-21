@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from .types import CandidateRecord, Observation, VerificationState
+from ..types import CandidateRecord, Observation, VerificationState
 
 
 ALLOWED_TRANSITIONS: dict[VerificationState, frozenset[VerificationState]] = {
@@ -142,10 +142,11 @@ def mark_evidence(
         candidate.high_quality_evidence_count += 1
     if conflict:
         candidate.conflict_count += 1
-        # 单帧分支冲突先记录为隔离证据，不立即把候选人推进到终止状态。
-        # 自动控制器会丢弃当前未完成窗口并等待新的无冲突轨迹；只有显式
-        # 复核/策略层才应把候选人置为 SUSPENDED。
-        candidate.metadata["needs_manual_review"] = True
+        if candidate.state in {
+            VerificationState.ISOLATED_CANDIDATE,
+            VerificationState.PROVISIONAL_IDENTITY,
+        }:
+            transition(candidate, VerificationState.SUSPENDED)
         return
 
     if identity_id is not None:
@@ -153,7 +154,11 @@ def mark_evidence(
             candidate.proposed_identity = identity_id
         elif candidate.proposed_identity != identity_id:
             candidate.conflict_count += 1
-            candidate.metadata["needs_manual_review"] = True
+            if candidate.state in {
+                VerificationState.ISOLATED_CANDIDATE,
+                VerificationState.PROVISIONAL_IDENTITY,
+            }:
+                transition(candidate, VerificationState.SUSPENDED)
             return
 
     if (

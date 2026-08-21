@@ -12,7 +12,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .types import Prototype, normalize_vector
+from ..types import Prototype, normalize_vector
 
 
 @dataclass(frozen=True)

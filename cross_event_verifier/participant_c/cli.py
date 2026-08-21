@@ -11,8 +11,8 @@ import json
 
 import numpy as np
 
-from .engine import CrossEventVerifier
-from .types import FeatureBundle, Observation, TrackQuality
+from ..participant_a.engine import CrossEventVerifier
+from ..types import FeatureBundle, Observation, TrackQuality
 
 
 def _good_quality() -> TrackQuality:
@@ -89,7 +89,7 @@ def run_doctor() -> int:
     except ImportError as error:
         report["onnxruntime_error"] = str(error)
     try:
-        from .production_vision import (
+        from ..participant_b.production_vision import (
             ProductionVisionConfig,
             production_readiness,
         )

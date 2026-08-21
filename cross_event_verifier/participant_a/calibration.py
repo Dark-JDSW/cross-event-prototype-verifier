@@ -36,9 +36,6 @@ class ScoreCalibrator:
     scale: float = 8.0
     midpoint: float = 0.55
     name: str = "default"
-    source: str = "heuristic"
-    sample_count: int = 0
-    version: str = "unversioned"
 
     def __post_init__(self) -> None:
         """校验正斜率以及余弦相似度定义域内的中点。"""
@@ -46,18 +43,6 @@ class ScoreCalibrator:
             raise ValueError("calibrator scale must be a positive finite value")
         if not math.isfinite(self.midpoint) or not -1.0 <= self.midpoint <= 1.0:
             raise ValueError("calibrator midpoint must be in [-1, 1]")
-        if not str(self.source).strip():
-            raise ValueError("calibrator source cannot be empty")
-        if not str(self.version).strip():
-            raise ValueError("calibrator version cannot be empty")
-        if int(self.sample_count) < 0:
-            raise ValueError("calibrator sample_count cannot be negative")
-
-    @property
-    def is_target_calibrated(self) -> bool:
-        """是否来自足够大的目标域数据集，而不是启发式默认值。"""
-
-        return self.source == "target-data" and int(self.sample_count) >= 32
 
     def probability(self, raw_similarity: float) -> float:
         """将一个原始余弦相似度映射为校准概率。"""
@@ -68,16 +53,9 @@ class ScoreCalibrator:
         """返回用于分支融合和诊断的校准对数几率。"""
         return _logit(self.probability(raw_similarity))
 
-    def to_dict(self) -> dict[str, float | str | int]:
+    def to_dict(self) -> dict[str, float | str]:
         """将校准参数序列化，用于清单和审计元数据。"""
-        return {
-            "scale": self.scale,
-            "midpoint": self.midpoint,
-            "name": self.name,
-            "source": self.source,
-            "sample_count": int(self.sample_count),
-            "version": self.version,
-        }
+        return {"scale": self.scale, "midpoint": self.midpoint, "name": self.name}
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> "ScoreCalibrator":
@@ -86,9 +64,6 @@ class ScoreCalibrator:
             scale=float(values.get("scale", 8.0)),
             midpoint=float(values.get("midpoint", 0.55)),
             name=str(values.get("name", "loaded")),
-            source=str(values.get("source", "heuristic")),
-            sample_count=int(values.get("sample_count", 0)),
-            version=str(values.get("version", values.get("name", "loaded"))),
         )
 
     @classmethod
@@ -101,7 +76,6 @@ class ScoreCalibrator:
         iterations: int = 800,
         learning_rate: float = 0.05,
         l2: float = 1e-3,
-        minimum_pairs: int = 32,
     ) -> "ScoreCalibrator":
         """在验证样本对上拟合 ``sigmoid(scale * (score - midpoint))``。
 
@@ -111,19 +85,10 @@ class ScoreCalibrator:
 
         x = np.asarray(list(similarities), dtype=np.float64).reshape(-1)
         y = np.asarray(list(labels), dtype=np.float64).reshape(-1)
-        minimum_pairs = max(4, int(minimum_pairs))
-        if x.size != y.size or x.size < minimum_pairs:
-            raise ValueError(
-                f"at least {minimum_pairs} score/label pairs of equal length are required"
-            )
+        if x.size != y.size or x.size < 4:
+            raise ValueError("at least four score/label pairs of equal length are required")
         if not np.all(np.isin(y, [0.0, 1.0])) or np.unique(y).size < 2:
             raise ValueError("labels must contain both 0 and 1")
-        positive = int(np.count_nonzero(y == 1.0))
-        negative = int(np.count_nonzero(y == 0.0))
-        if min(positive, negative) < 8:
-            raise ValueError(
-                "target calibration requires at least eight genuine and eight impostor pairs"
-            )
 
         # 先在 [score, 1] 上进行逻辑回归，再转换为正斜率/中点参数形式。
         design = np.column_stack([x, np.ones_like(x)])
@@ -137,29 +102,14 @@ class ScoreCalibrator:
 
         scale = max(float(abs(weights[0])), 1e-3)
         midpoint = float(-weights[1] / weights[0]) if abs(weights[0]) > 1e-6 else 0.5
-        return cls(
-            scale=scale,
-            midpoint=float(np.clip(midpoint, -1.0, 1.0)),
-            name=name,
-            source="target-data",
-            sample_count=int(x.size),
-            version=name,
-        )
+        return cls(scale=scale, midpoint=float(np.clip(midpoint, -1.0, 1.0)), name=name)
 
 
 DEFAULT_APPEARANCE_CALIBRATOR = ScoreCalibrator(
-    scale=8.0,
-    midpoint=0.56,
-    name="appearance-default",
-    source="heuristic",
-    version="heuristic-default-v1",
+    scale=8.0, midpoint=0.56, name="appearance-default"
 )
 DEFAULT_GAIT_CALIBRATOR = ScoreCalibrator(
-    scale=8.0,
-    midpoint=0.68,
-    name="gait-default",
-    source="heuristic",
-    version="heuristic-default-v1",
+    scale=8.0, midpoint=0.68, name="gait-default"
 )
 
 

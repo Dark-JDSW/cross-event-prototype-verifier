@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import time
 from uuid import uuid4
 
-from .types import Observation
+from ..types import Observation
 
 
 @dataclass

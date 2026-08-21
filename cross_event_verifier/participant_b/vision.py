@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from .adapters import occlusion_scores
-from .types import FeatureBundle, TrackQuality
+from ..types import FeatureBundle, TrackQuality
 
 
 Box = tuple[int, int, int, int]
@@ -153,7 +153,6 @@ class OpenCvDemoAdapter:
 
     supports_automatic_registration = False
     model_version = "opencv-hog-diagnostic-v1"
-    feature_schema = "opencv-hog-diagnostic-v1"
     backend_status = "OpenCV HOG 诊断模式（禁止自动注册）"
 
     def __init__(

@@ -7,7 +7,7 @@ license does not replace their own terms.
 ## Ultralytics YOLO11
 
 - Project: <https://github.com/ultralytics/ultralytics>
-- Runtime/model: `ultralytics==8.3.163` in the validated environment, `models/yolo11l.pt`
+- Runtime/model: `ultralytics`, `models/yolo11x.pt`
 - Upstream terms: AGPL-3.0 or an Ultralytics Enterprise license.
 
 Ultralytics states that proprietary/private/commercial deployment requires an

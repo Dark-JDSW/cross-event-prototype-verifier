@@ -5,35 +5,16 @@
 和事件来源信息。
 """
 
-from .automation import AutomationPolicy, AutomationStage, AutomationStatus
-from .appearance_first import AppearanceFirstGaitEnrollmentController
-from .config import VerifierConfig
-from .engine import CrossEventVerifier
-from .gait_readiness import GaitReadinessEvaluator
-from .evaluation import (
-    EncoderEvaluation,
-    VerificationMetrics,
-    compare_encoder_embeddings,
-    d_prime,
-    evaluate_encoder_embeddings,
-    equal_error_rate,
-    fnir_at_fpir,
-    max_formal_similarity,
-    threshold_at_fpir,
-    threshold_metrics,
-)
+from .participant_c.automation import AutomationPolicy, AutomationStage, AutomationStatus
+from .participant_a.config import VerifierConfig
+from .participant_a.engine import CrossEventVerifier
+from .participant_a.evaluation import VerificationMetrics, equal_error_rate, threshold_metrics
 from .types import (
     AppearanceAbsorptionRequest,
     CandidateRecord,
     Decision,
     DecisionKind,
-    EmbeddingContract,
     FeatureBundle,
-    AppearanceIdentityBinding,
-    GaitEnrollmentEvent,
-    GaitQualityBand,
-    GaitReadinessReport,
-    GaitReadinessState,
     Observation,
     Prototype,
     TrackQuality,
@@ -46,31 +27,16 @@ __all__ = [
     "AutomationPolicy",
     "AutomationStage",
     "AutomationStatus",
-    "AppearanceFirstGaitEnrollmentController",
-    "AppearanceIdentityBinding",
     "CrossEventVerifier",
-    "GaitReadinessEvaluator",
     "Decision",
     "DecisionKind",
-    "EmbeddingContract",
     "FeatureBundle",
-    "GaitEnrollmentEvent",
-    "GaitQualityBand",
-    "GaitReadinessReport",
-    "GaitReadinessState",
     "Observation",
     "Prototype",
     "TrackQuality",
     "VerificationState",
     "VerifierConfig",
     "VerificationMetrics",
-    "EncoderEvaluation",
-    "compare_encoder_embeddings",
-    "d_prime",
-    "evaluate_encoder_embeddings",
     "equal_error_rate",
-    "fnir_at_fpir",
-    "max_formal_similarity",
-    "threshold_at_fpir",
     "threshold_metrics",
 ]
