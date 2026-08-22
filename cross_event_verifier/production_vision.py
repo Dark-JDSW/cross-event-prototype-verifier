@@ -4,8 +4,9 @@
 代码只接收 ``VisionTrack`` 值，不导入模型框架，也不需要知道时序状态如何维护。
 
 适配器为每条轨迹维护检测、姿态、嵌入及时序质量状态。一帧图像会依次经过
-检测/跟踪、批量姿态推理、外观刷新、步态窗口更新和质量计算。模型权重在首帧
-到来时延迟加载，因此构造 GUI 时仍能保持响应。
+检测/跟踪、批量姿态推理、外观刷新、步态窗口更新和质量计算。模型权重既可以
+在首帧到来时按需加载，也可以由 GUI 在后台显式分阶段预加载并执行一次无身份
+语义的 Dummy warmup；两种入口共用同一套模型槽位。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import importlib.util
 import json
 from pathlib import Path
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 import cv2
 import numpy as np
@@ -353,6 +354,16 @@ class _YoloByteTracker:
         if predictor is not None and hasattr(predictor, "vid_path"):
             predictor.vid_path = [None] * max(1, len(trackers or ()))
 
+    def warmup(self) -> None:
+        """用空白画面预热 YOLO/ByteTrack，并丢弃预热产生的轨迹状态。"""
+
+        frame = np.zeros(
+            (self.config.image_size, self.config.image_size, 3),
+            dtype=np.uint8,
+        )
+        self.track(frame)
+        self.reset()
+
 
 class _RtmposeEstimator:
     """使用批量 CUDA ONNX 推理的自顶向下 RTMPose-s 适配器。"""
@@ -511,6 +522,15 @@ class _RtmposeEstimator:
             output[destination_index] = points
         return output
 
+    def warmup(self) -> None:
+        """用一个空白人体框执行一次完整的 RTMPose 前向。"""
+
+        frame = np.zeros(
+            (self._INPUT_HEIGHT, self._INPUT_WIDTH, 3),
+            dtype=np.uint8,
+        )
+        self.extract(frame, ((0, 0, self._INPUT_WIDTH, self._INPUT_HEIGHT),))
+
     @classmethod
     def _decode_simcc(
         cls,
@@ -593,6 +613,12 @@ class _OsnetAppearanceExtractor:
             if norm > 1e-8:
                 output[destination_index] = vector / norm
         return output
+
+    def warmup(self) -> None:
+        """用空白人物框执行一次 OSNet-AIN 前向，不写入任何身份数据。"""
+
+        frame = np.zeros((256, 128, 3), dtype=np.uint8)
+        self.extract(frame, ((0, 0, 128, 256),))
 
 
 @dataclass
@@ -864,20 +890,48 @@ class ProductionVisionAdapter:
         self._last_frame_latency_ms = elapsed
         self._frame_latency_samples_ms.append(elapsed)
 
-    def _load(self) -> None:
-        """只加载一次检测、姿态、外观和步态模型。"""
-        if self.detector is not None:
+    @staticmethod
+    def _notify_stage(
+        callback: Callable[[str, float], None] | None,
+        text: str,
+        progress: float,
+    ) -> None:
+        """向后台预加载调用方报告一个可展示的阶段。"""
+
+        if callback is not None:
+            callback(text, max(0.0, min(1.0, float(progress))))
+
+    def preload(
+        self,
+        on_stage: Callable[[str, float], None] | None = None,
+    ) -> None:
+        """按 YOLO、RTMPose、OSNet、GaitGraph2 顺序加载模型。"""
+
+        if all(
+            component is not None
+            for component in (self.detector, self.pose, self.appearance, self.gait)
+        ):
             return
         try:
+            self._notify_stage(on_stage, "正在加载 YOLO/ByteTrack…", 0.16)
             self.detector = _YoloByteTracker(self.config)
+            self._notify_stage(on_stage, "YOLO/ByteTrack 已加载", 0.30)
+
+            self._notify_stage(on_stage, "正在加载 RTMPose…", 0.30)
             self.pose = _RtmposeEstimator(
                 self.config.pose_path,
                 require_cuda=self.config.require_cuda,
             )
+            self._notify_stage(on_stage, "RTMPose 已加载", 0.44)
+
+            self._notify_stage(on_stage, "正在加载 OSNet-AIN…", 0.44)
             self.appearance = _OsnetAppearanceExtractor(
                 self.config.appearance_path,
                 self.config.torch_device,
             )
+            self._notify_stage(on_stage, "OSNet-AIN 已加载", 0.58)
+
+            self._notify_stage(on_stage, "正在加载 GaitGraph2…", 0.58)
             self.gait = TemporalGaitEncoder(
                 self.config.gait_path,
                 device=self.config.torch_device,
@@ -894,12 +948,46 @@ class ProductionVisionAdapter:
                 raise ProductionVisionError(
                     "OSNet-AIN production contract requires a 512-dimensional embedding"
                 )
+            self._notify_stage(on_stage, "GaitGraph2 已加载", 0.70)
         except Exception:
             self.detector = None
             self.pose = None
             self.appearance = None
             self.gait = None
             raise
+
+    def warmup(
+        self,
+        on_stage: Callable[[str, float], None] | None = None,
+    ) -> None:
+        """对四个模型执行空白输入预热，不产生 Track 或身份样本。"""
+
+        self.preload(on_stage=on_stage)
+        assert self.detector is not None
+        assert self.pose is not None
+        assert self.appearance is not None
+        assert self.gait is not None
+
+        self._notify_stage(on_stage, "正在预热 YOLO/ByteTrack…", 0.70)
+        self.detector.warmup()
+        self._notify_stage(on_stage, "YOLO/ByteTrack 预热完成", 0.77)
+
+        self._notify_stage(on_stage, "正在预热 RTMPose…", 0.77)
+        self.pose.warmup()
+        self._notify_stage(on_stage, "RTMPose 预热完成", 0.84)
+
+        self._notify_stage(on_stage, "正在预热 OSNet-AIN…", 0.84)
+        self.appearance.warmup()
+        self._notify_stage(on_stage, "OSNet-AIN 预热完成", 0.91)
+
+        self._notify_stage(on_stage, "正在预热 GaitGraph2…", 0.91)
+        self.gait.warmup()
+        self._notify_stage(on_stage, "GaitGraph2 预热完成", 0.97)
+
+    def _load(self) -> None:
+        """兼容旧入口，只执行分阶段模型加载而不额外预热。"""
+
+        self.preload()
 
     @property
     def backend_status(self) -> str:

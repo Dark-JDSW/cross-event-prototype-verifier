@@ -525,6 +525,26 @@ class TemporalGaitEncoder:
         """编码一个姿态窗口；窗口不可用时返回 ``None``。"""
         return self.encode_batch([poses])[0]
 
+    def warmup(self) -> None:
+        """用合成的有效姿态窗口执行一次 GaitGraph2 前向。"""
+
+        sequence = np.zeros(
+            (self.sequence_length, 17, 3),
+            dtype=np.float32,
+        )
+        time_axis = np.linspace(
+            0.0,
+            1.0,
+            self.sequence_length,
+            dtype=np.float32,
+        )[:, None]
+        joint_axis = np.arange(17, dtype=np.float32)[None, :]
+        sequence[:, :, 0] = joint_axis * 0.02 + time_axis
+        sequence[:, :, 1] = joint_axis * 0.03 + time_axis * 0.5
+        sequence[:, :, 2] = 1.0
+        if self.encode(sequence) is None:
+            raise RuntimeError("GaitGraph2 Dummy warmup 未产生有效嵌入")
+
     def encode_batch(
         self,
         pose_sequences: Sequence[Sequence[np.ndarray] | np.ndarray],

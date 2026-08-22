@@ -4,7 +4,9 @@ import unittest
 import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
+import threading
 import tempfile
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -15,6 +17,7 @@ from cross_event_verifier.gui import (
     VerifierWindow,
     _frame_to_photo,
 )
+from cross_event_verifier.gui_theme import ENGINEERING_GRID_TAG
 from cross_event_verifier.media import FrameWorker, ParameterUpdateMessage, SourceSpec
 from cross_event_verifier.pipeline import VideoVerifierPipeline
 from cross_event_verifier.storage import SqliteStore
@@ -185,6 +188,150 @@ class GuiPipelineTests(unittest.TestCase):
                 "disabled",
             )
         finally:
+            window.close()
+
+    def test_runtime_parameter_sliders_share_existing_stringvars(self) -> None:
+        """滑条只同步既有表单变量，不绕过原参数事务接口。"""
+
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            return_value=FakeVision(),
+        ):
+            window = VerifierWindow(":memory:", "demo")
+        window.root.withdraw()
+        try:
+            key = "verifier.gait_novelty_threshold"
+            self.assertIn(key, window.parameter_scales)
+            self.assertEqual(window.parameter_vars[key].get(), "0.35")
+
+            window._parameter_scale_changed(key, "0.5")
+            self.assertEqual(window.parameter_vars[key].get(), "0.5")
+
+            window.parameter_vars[key].set("0.25")
+            window.root.update_idletasks()
+            self.assertAlmostEqual(window.parameter_scales[key].get(), 0.25, places=2)
+        finally:
+            window.close()
+
+    def test_nasapunk_theme_keeps_parameter_controls_styled(self) -> None:
+        """视觉主题应落在现有控件上，不替换参数控件或其行为。"""
+
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            return_value=FakeVision(),
+        ):
+            window = VerifierWindow(":memory:", "demo")
+        try:
+            key = "verifier.gait_novelty_threshold"
+            self.assertEqual(
+                str(window.parameter_entries[key].cget("style")),
+                "Retro.Numeric.TEntry",
+            )
+            self.assertEqual(
+                str(window.parameter_scales[key].cget("style")),
+                "Retro.Horizontal.TScale",
+            )
+            self.assertEqual(
+                str(window.side_scrollbar.cget("style")),
+                "Retro.Vertical.TScrollbar",
+            )
+            self.assertIn("NO VISUAL FEED", str(window.video_label.cget("text")))
+            window.root.update()
+            window._redraw_engineering_grid()
+            for canvas in (
+                window.background_canvas,
+                window.monitor_background_canvas,
+                window.parameter_background_canvas,
+            ):
+                grid_items = canvas.find_withtag(ENGINEERING_GRID_TAG)
+                self.assertGreater(len(grid_items), 0)
+            window.root.geometry("1180x720")
+            window.root.update()
+            resized_grid_items = window.background_canvas.find_withtag(
+                ENGINEERING_GRID_TAG
+            )
+            self.assertGreater(len(resized_grid_items), 0)
+            window.root.update()
+            self.assertEqual(
+                len(resized_grid_items),
+                len(window.background_canvas.find_withtag(ENGINEERING_GRID_TAG)),
+            )
+            self.assertTrue(window.video_empty_canvas.winfo_ismapped())
+            result = window.pipeline.process_frame(
+                np.zeros((220, 120, 3), dtype=np.uint8),
+                timestamp=1.0,
+            )
+            window._update_frame(result)
+            window.root.update()
+            self.assertFalse(window.video_empty_canvas.winfo_ismapped())
+        finally:
+            window.close()
+
+    def test_canvas_mousewheel_scrolls_side_panel(self) -> None:
+        """鼠标滚轮应能滚动右侧 Canvas 视口。"""
+
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            return_value=FakeVision(),
+        ):
+            window = VerifierWindow(":memory:", "demo")
+        window.root.geometry("980x640")
+        window.root.update()
+        try:
+            before = window.side_canvas.yview()
+            window.side_canvas.event_generate("<MouseWheel>", delta=-120)
+            window.root.update()
+            after = window.side_canvas.yview()
+            self.assertNotEqual(before, after)
+
+            window.notebook.select(1)
+            window.root.update()
+            parameter_before = window.parameter_canvas.yview()
+            window.parameter_canvas.event_generate("<MouseWheel>", delta=-120)
+            window.root.update()
+            parameter_after = window.parameter_canvas.yview()
+            self.assertNotEqual(parameter_before, parameter_after)
+        finally:
+            window.close()
+
+    def test_production_gui_renders_input_controls_before_preload_finishes(self) -> None:
+        """模型加载期间输入源仍可编辑，但采集按钮保持禁用。"""
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def delayed_builder(*_args: object, **_kwargs: object) -> FakeVision:
+            started.set()
+            release.wait(timeout=2.0)
+            finished.set()
+            return FakeVision()
+
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            side_effect=delayed_builder,
+        ):
+            window = VerifierWindow(":memory:", "production")
+        try:
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertTrue(window.file_entry.winfo_exists())
+            self.assertEqual(str(window.start_button.cget("state")), "disabled")
+            window.source_kind.set("file")
+            window._source_mode_changed()
+            self.assertEqual(str(window.file_entry.cget("state")), "normal")
+            self.assertEqual(str(window.browse_button.cget("state")), "normal")
+
+            release.set()
+            self.assertTrue(finished.wait(timeout=1.0))
+            for _ in range(100):
+                window._poll_preload()
+                if window.worker is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(window.worker)
+            self.assertEqual(str(window.start_button.cget("state")), "normal")
+        finally:
+            release.set()
             window.close()
 
     def test_small_window_keeps_appearance_absorption_panel_reachable(self) -> None:

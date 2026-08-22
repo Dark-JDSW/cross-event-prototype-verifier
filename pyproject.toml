@@ -15,6 +15,10 @@ dependencies = [
 gui = [
   "opencv-python>=4.8,<5",
 ]
+gui-qt = [
+  "opencv-python>=4.8,<5",
+  "PyQt6>=6.7,<7",
+]
 production = [
   "opencv-python>=4.8,<5",
   "torch==2.12.1+cu132",

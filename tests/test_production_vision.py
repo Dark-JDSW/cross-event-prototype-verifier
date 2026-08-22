@@ -27,6 +27,7 @@ from cross_event_verifier.vision import OpenCvDemoAdapter
 class _FakeDetector:
     def __init__(self, _config):
         self.calls = 0
+        self.warmup_calls = 0
 
     def track(self, _frame):
         self.calls += 1
@@ -38,6 +39,9 @@ class _FakeDetector:
 
     def reset(self):
         pass
+
+    def warmup(self):
+        self.warmup_calls += 1
 
 
 class _FakeTruncatedDetector(_FakeDetector):
@@ -77,7 +81,7 @@ class _FakePose:
     providers = ("FakeExecutionProvider",)
 
     def __init__(self, _path, **_kwargs):
-        pass
+        self.warmup_calls = 0
 
     def extract(self, _frame, boxes):
         points = np.zeros((17, 3), dtype=np.float32)
@@ -85,6 +89,9 @@ class _FakePose:
         points[:, 1] = np.linspace(20, 180, 17)
         points[:, 2] = 0.95
         return [points.copy() for _ in boxes]
+
+    def warmup(self):
+        self.warmup_calls += 1
 
 
 class _ShortPose(_FakePose):
@@ -95,12 +102,16 @@ class _ShortPose(_FakePose):
 class _FakeAppearance:
     def __init__(self, _path, _device):
         self.batch_sizes = []
+        self.warmup_calls = 0
 
     def extract(self, _frame, boxes):
         self.batch_sizes.append(len(boxes))
         vector = np.zeros(512, dtype=np.float32)
         vector[0] = 1.0
         return [vector.copy() for _ in boxes]
+
+    def warmup(self):
+        self.warmup_calls += 1
 
 
 class _DriftingAppearance(_FakeAppearance):
@@ -115,6 +126,7 @@ class _DriftingAppearance(_FakeAppearance):
 class _FakeGait:
     def __init__(self, *_args, **_kwargs):
         self.batch_sizes = []
+        self.warmup_calls = 0
 
     def encode_batch(self, pose_sequences):
         self.batch_sizes.append(len(pose_sequences))
@@ -124,6 +136,9 @@ class _FakeGait:
             vector[index % len(vector)] = 1.0
             output.append(vector)
         return output
+
+    def warmup(self):
+        self.warmup_calls += 1
 
 
 class _FakeTwoPersonDetector(_FakeDetector):
@@ -149,6 +164,43 @@ class _RecordingBatchModel:
 
 
 class ProductionVisionTests(unittest.TestCase):
+    def test_production_preload_reports_stages_and_warms_every_model(self) -> None:
+        config = ProductionVisionConfig()
+        stages: list[tuple[str, float]] = []
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _FakeDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            adapter.warmup(on_stage=lambda text, progress: stages.append((text, progress)))
+
+        self.assertIsNotNone(adapter.detector)
+        self.assertIsNotNone(adapter.pose)
+        self.assertIsNotNone(adapter.appearance)
+        self.assertIsNotNone(adapter.gait)
+        self.assertEqual(adapter.detector.warmup_calls, 1)
+        self.assertEqual(adapter.pose.warmup_calls, 1)
+        self.assertEqual(adapter.appearance.warmup_calls, 1)
+        self.assertEqual(adapter.gait.warmup_calls, 1)
+        self.assertEqual(stages[0], ("正在加载 YOLO/ByteTrack…", 0.16))
+        self.assertEqual(stages[-1], ("GaitGraph2 预热完成", 0.97))
+        self.assertEqual(
+            [progress for _text, progress in stages],
+            sorted(progress for _text, progress in stages),
+        )
+
     def test_simcc_confidence_uses_the_less_reliable_axis(self) -> None:
         simcc_x = np.zeros((1, 1, 4), dtype=np.float32)
         simcc_y = np.zeros((1, 1, 4), dtype=np.float32)
