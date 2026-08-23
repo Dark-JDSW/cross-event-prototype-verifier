@@ -142,6 +142,15 @@ class ProductionVisionConfig:
             return "cuda:0"
         return str(self.device)
 
+    @property
+    def cuda_device_index(self) -> int:
+        """Return the CUDA ordinal shared by PyTorch and ONNX Runtime."""
+
+        value = self.torch_device.strip().lower()
+        if not value.startswith("cuda:") or not value.removeprefix("cuda:").isdigit():
+            raise ValueError(f"production device must be cuda:N, got {self.torch_device!r}")
+        return int(value.removeprefix("cuda:"))
+
 
 def production_readiness(
     config: ProductionVisionConfig | None = None,
@@ -375,7 +384,13 @@ class _RtmposeEstimator:
     _SIMCC_SPLIT = 2.0
     _BUCKETS = (1, 2, 4, 8, 16, 32)
 
-    def __init__(self, path: Path, *, require_cuda: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        require_cuda: bool = True,
+        cuda_device_id: int = 0,
+    ) -> None:
         """创建以 CUDA 为必需主 provider 的 ONNX 会话。"""
         try:
             # PyTorch 自带 CUDA PyPI 构建的 ONNX Runtime 所需 CUDA/cuDNN DLL。
@@ -394,7 +409,7 @@ class _RtmposeEstimator:
             # CUDA 负责主图，CPU 作为明确的图分区回退以承接少量 shape/layout
             # 辅助节点。provider 列表本身不代表每个节点的位置，启动诊断会
             # 同时记录实际 provider 配置和端到端延迟。
-            providers = [("CUDAExecutionProvider", {"device_id": 0})]
+            providers = [("CUDAExecutionProvider", {"device_id": int(cuda_device_id)})]
             if "CPUExecutionProvider" in available:
                 providers.append("CPUExecutionProvider")
         else:
@@ -624,24 +639,34 @@ class _OsnetAppearanceExtractor:
 @dataclass
 class _TrackState:
     """由一个 ByteTrack ID 持有的短期时序缓存。"""
+    # ``frame_count`` and the quality counters below describe the current clean
+    # subtracklet.  Lifetime counters remain audit-only and must never veto a
+    # freshly established segment.
     frame_count: int = 0
+    lifetime_frame_count: int = 0
     last_seen_frame: int = 0
     poses: deque[np.ndarray] = field(default_factory=deque)
     timestamps: deque[float] = field(default_factory=deque)
     boxes: deque[Box] = field(default_factory=lambda: deque(maxlen=20))
+    real_boxes: deque[Box] = field(default_factory=lambda: deque(maxlen=2))
+    real_box_frames: deque[int] = field(default_factory=lambda: deque(maxlen=2))
     valid_pose_frames: int = 0
     valid_leg_frames: int = 0
     detector_gap_frames: int = 0
+    lifetime_detector_gap_frames: int = 0
     track_gap_frames: int = 0
+    lifetime_track_gap_frames: int = 0
     last_seen_timestamp: float | None = None
     last_valid_timestamp: float | None = None
     appearance: np.ndarray | None = None
     last_appearance_frame: int | None = None
+    appearance_generation: int = 0
     appearance_similarity_to_previous: float | None = None
     appearance_change_suspected: bool = False
     gait: np.ndarray | None = None
     last_gait_frame: int | None = None
     id_switches: int = 0
+    lifetime_id_switches: int = 0
     segment_id: int = 0
     segment_start_frame: int = 0
     segment_boundary_reasons: tuple[str, ...] = ()
@@ -921,6 +946,9 @@ class ProductionVisionAdapter:
             self.pose = _RtmposeEstimator(
                 self.config.pose_path,
                 require_cuda=self.config.require_cuda,
+                cuda_device_id=(
+                    self.config.cuda_device_index if self.config.require_cuda else 0
+                ),
             )
             self._notify_stage(on_stage, "RTMPose 已加载", 0.44)
 
@@ -1110,22 +1138,21 @@ class ProductionVisionAdapter:
             self._cached_detections = self.detector.track(frame_bgr)
             self._last_detector_frame = self.frame_index
             return self._cached_detections
-        # ByteTrack is stateful, but it only sees detector calls.  On skipped
-        # frames predict a short constant-velocity box from the recent track
-        # history instead of freezing the crop; this keeps pose/appearance
-        # aligned with motion while the next persisted tracker update remains
-        # authoritative.
-        delta = max(1, self.frame_index - (self._last_detector_frame or self.frame_index))
+        # ByteTrack is stateful, but it only sees detector calls. On skipped
+        # frames, extrapolate exclusively from its two latest *real*
+        # observations. A predicted box must never become the next velocity
+        # anchor, otherwise detector stride recursively amplifies crop drift.
         height, width = frame_bgr.shape[:2]
         predicted: list[_Detection] = []
         for detection in self._cached_detections:
             state = self.states.get(detection.track_id)
             box = detection.box
-            if state is not None and len(state.boxes) >= 2:
-                previous = np.asarray(state.boxes[-2], dtype=np.float32)
-                current = np.asarray(state.boxes[-1], dtype=np.float32)
-                velocity = current - previous
-                raw = current + velocity * min(delta, 2)
+            if state is not None and len(state.real_boxes) >= 2:
+                previous = np.asarray(state.real_boxes[-2], dtype=np.float32)
+                current = np.asarray(state.real_boxes[-1], dtype=np.float32)
+                previous_frame, current_frame = state.real_box_frames
+                velocity = (current - previous) / max(current_frame - previous_frame, 1)
+                raw = current + velocity * max(self.frame_index - current_frame, 0)
                 x1, y1, x2, y2 = (int(round(float(value))) for value in raw)
                 x1 = max(0, min(x1, max(width - 1, 0)))
                 y1 = max(0, min(y1, max(height - 1, 0)))
@@ -1133,6 +1160,7 @@ class ProductionVisionAdapter:
                 y2 = max(y1 + 1, min(y2, height))
                 box = (x1, y1, x2, y2)
                 state.detector_gap_frames += 1
+                state.lifetime_detector_gap_frames += 1
             predicted.append(_Detection(detection.track_id, box, detection.confidence))
         return tuple(predicted)
 
@@ -1177,17 +1205,24 @@ class ProductionVisionAdapter:
         state.poses.clear()
         state.timestamps.clear()
         state.boxes.clear()
+        state.real_boxes.clear()
+        state.real_box_frames.clear()
         state.views.clear()
         state.valid_pose_frames = 0
         state.valid_leg_frames = 0
+        state.frame_count = 0
+        state.detector_gap_frames = 0
+        state.track_gap_frames = 0
+        state.id_switches = 0
         state.last_valid_timestamp = None
         state.gait = None
         state.last_gait_frame = None
         state.appearance_similarity_to_previous = None
         state.appearance_change_suspected = False
-        if clear_appearance:
-            state.appearance = None
-            state.last_appearance_frame = None
+        # A new clean subtracklet may belong to another person. The previous
+        # embedding is audit context only; never carry it into new evidence.
+        state.appearance = None
+        state.last_appearance_frame = None
 
     @staticmethod
     def _append_missing_slot(state: _TrackState, timestamp: float) -> None:
@@ -1294,13 +1329,15 @@ class ProductionVisionAdapter:
                 > self.config.maximum_track_gap_seconds
             ):
                 state.track_gap_frames += 1
+                state.lifetime_track_gap_frames += 1
                 self._start_new_subtracklet(
                     state,
                     self.frame_index,
                     ("track_gap",),
                 )
-            if state.boxes and _abrupt_track_jump(state.boxes[-1], detection.box):
+            if state.real_boxes and _abrupt_track_jump(state.real_boxes[-1], detection.box):
                 state.id_switches += 1
+                state.lifetime_id_switches += 1
                 hard_jump = True
                 self._start_new_subtracklet(
                     state,
@@ -1309,9 +1346,14 @@ class ProductionVisionAdapter:
                     clear_appearance=True,
                 )
             state.frame_count += 1
+            state.lifetime_frame_count += 1
             state.last_seen_frame = self.frame_index
             state.last_seen_timestamp = timestamp
             state.boxes.append(detection.box)
+            if self._detector_refreshed_this_frame:
+                state.real_boxes.append(detection.box)
+                state.real_box_frames.append(self.frame_index)
+                state.detector_gap_frames = 0
             canonical = _canonical_pose(
                 None if hard_jump else poses[index],
                 detection.box,
@@ -1449,6 +1491,7 @@ class ProductionVisionAdapter:
                         }.intersection(state.segment_boundary_reasons)
                     )
                     state.appearance = value
+                    state.appearance_generation += 1
 
         output: list[VisionTrack] = []
         active_ids: set[int] = set()
@@ -1514,7 +1557,7 @@ class ProductionVisionAdapter:
                 contour_area=float((x2 - x1) * (y2 - y1)),
                 contour_jitter=_box_jitter(state.boxes),
                 id_switches=state.id_switches,
-                frame_count=state.frame_count,
+                frame_count=len(state.poses),
                 valid_pose_frames=state.valid_pose_frames,
                 valid_leg_frames=state.valid_leg_frames,
                 detector_gap_frames=state.detector_gap_frames,
@@ -1580,6 +1623,15 @@ class ProductionVisionAdapter:
                         state.appearance_similarity_to_previous
                     ),
                     "appearance_change_suspected": state.appearance_change_suspected,
+                    "appearance_generation": state.appearance_generation,
+                    "appearance_fresh": bool(
+                        state.last_appearance_frame == state.frame_count
+                        and index in appearance_indexes
+                    ),
+                    "lifetime_frame_count": state.lifetime_frame_count,
+                    "lifetime_detector_gap_frames": state.lifetime_detector_gap_frames,
+                    "lifetime_track_gap_frames": state.lifetime_track_gap_frames,
+                    "lifetime_id_switches": state.lifetime_id_switches,
                 },
             )
             output.append(track)

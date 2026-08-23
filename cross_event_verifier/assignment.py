@@ -105,7 +105,8 @@ def gated_global_assignment(
 
     在匈牙利算法之前进行门控，可以防止低置信度配对占用另一行本可使用的
     列。间隔门被有意放在指派之后，并且只比较可行列，这与早期跟踪设计中
-    的门控指派行为一致。
+    的门控指派行为一致。间隔比较会纳入所有质量可行的正式身份，即使另一个
+    候选尚未过接受阈值，避免把“accepted-candidate margin”误作真实 Top-2。
     """
 
     # 行表示当前轨迹，列表示正式身份。先计算可行性再优化，避免坏边占用
@@ -149,7 +150,8 @@ def gated_global_assignment(
         if row >= scores.shape[0] or column >= real_columns or not feasible[row, column]:
             continue
         if margin_threshold > 0:
-            other_scores = scores[row, feasible_real[row] & (np.arange(real_columns) != column)]
+            margin_feasible = np.isfinite(scores[row]) & (appearance[row] >= appearance_floor)
+            other_scores = scores[row, margin_feasible & (np.arange(real_columns) != column)]
             if other_scores.size and float(scores[row, column] - np.max(other_scores)) < margin_threshold:
                 continue
         result[int(row)] = int(column)

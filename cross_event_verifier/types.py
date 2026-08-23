@@ -890,6 +890,7 @@ class GaitReadinessReport:
     minimum_inter_event_similarity: float | None = None
     holdout_passed: bool | None = None
     open_set_passed: bool | None = None
+    gallery_collision_passed: bool | None = None
     reasons: tuple[str, ...] = ()
 
 

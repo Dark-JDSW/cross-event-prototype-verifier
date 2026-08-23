@@ -1207,7 +1207,7 @@ class VerifierWindow(QMainWindow):
         if self.worker is None:
             self.status.setText("模型仍在后台加载，请稍候")
             return
-        self.worker.stop()
+        self.worker.stop(timeout=None)
         self.status.setText("已停止")
 
     def _toggle_automatic_registration(self, checked: bool) -> None:
@@ -1252,7 +1252,7 @@ class VerifierWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.worker.stop()
+        self.worker.stop(timeout=None)
         store = self.verifier.store
         backup_path: Path | None = None
         if store.path != ":memory:":
@@ -1507,7 +1507,7 @@ class VerifierWindow(QMainWindow):
             self._preload_timer.stop()
         self._message_timer.stop()
         if self.worker is not None:
-            self.worker.stop()
+            self.worker.stop(timeout=None)
         self.verifier.close()
         super().close()
 

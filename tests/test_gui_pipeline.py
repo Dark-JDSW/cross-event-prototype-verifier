@@ -847,6 +847,56 @@ class GuiPipelineTests(unittest.TestCase):
             ["candidate-1", "candidate-1"],
         )
 
+    def test_worker_cannot_restart_while_a_previous_run_is_still_processing(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingCapture:
+            def __init__(self, _spec: SourceSpec) -> None:
+                self.fps = 0.0
+                self.frame_count = 1
+                self.width = 2
+                self.height = 2
+                self.capture = None
+                self._read = False
+
+            def open(self) -> None:
+                return None
+
+            def read(self) -> tuple[bool, object]:
+                if self._read:
+                    return False, None
+                self._read = True
+                return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+            def release(self) -> None:
+                return None
+
+        class BlockingPipeline:
+            def __init__(self) -> None:
+                self.vision = type("Vision", (), {"backend_status": "test"})()
+                self.verifier = type("Verifier", (), {"maintenance": lambda _self, now: ()})()
+                self.automation = type("Automation", (), {"discard_candidates": lambda _self, candidates: None})()
+
+            def set_source(self, _label: str, **_kwargs: object) -> None:
+                return None
+
+            def process_frame(self, _frame: object, *, timestamp: float) -> object:
+                entered.set()
+                release.wait(2.0)
+                return timestamp
+
+        worker = FrameWorker(BlockingPipeline())  # type: ignore[arg-type]
+        spec = SourceSpec("file", "sample.mp4", "sample.mp4")
+        with patch("cross_event_verifier.media.OpenCvCapture", BlockingCapture):
+            worker.start(spec)
+            self.assertTrue(entered.wait(1.0))
+            self.assertFalse(worker.stop(timeout=0.01))
+            with self.assertRaisesRegex(RuntimeError, "仍在停止"):
+                worker.start(spec)
+            release.set()
+            self.assertTrue(worker.stop(timeout=2.0))
+
     def test_clear_gallery_removes_persistent_and_runtime_identity_data(self) -> None:
         store = SqliteStore(":memory:")
         verifier = CrossEventVerifier(store=store)

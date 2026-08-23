@@ -69,14 +69,18 @@ class GaitReadinessEvaluator:
                 return False
         return True
 
-    def _open_set_passed(
+    def _gallery_collision_passed(
         self,
         identity_id: str,
         events: Sequence[GaitEnrollmentEvent],
         all_events: Iterable[GaitEnrollmentEvent],
         all_gait_prototypes: Iterable[Prototype],
     ) -> bool | None:
-        """检查已有其他身份的步态原型是否超过开放集相似度上限。"""
+        """检查 live gallery 是否存在高相似度碰撞。
+
+        这是 gallery 内部的必要安全检查，不是独立 unknown split 上的
+        open-set 验证，故不应被单独解释为 FPIR 通过。
+        """
 
         impostors: list[np.ndarray] = [
             event.vector
@@ -144,6 +148,9 @@ class GaitReadinessEvaluator:
         if min_similarity is not None and min_similarity < self.config.gait_event_min_similarity:
             reasons.append("independent_gait_events_conflict")
             state = GaitReadinessState.CONFLICT
+        elif independent_sessions < self.config.gait_provisional_min_events:
+            reasons.append("need_more_independent_gait_sessions")
+            state = GaitReadinessState.LEARNING
         elif accepted_event_count < self.config.gait_provisional_min_events:
             reasons.append("need_more_independent_gait_events")
             state = GaitReadinessState.LEARNING
@@ -151,27 +158,31 @@ class GaitReadinessEvaluator:
             state = GaitReadinessState.PROVISIONAL
 
         holdout_passed = self._holdout_passed(events)
-        open_set_passed = self._open_set_passed(
+        gallery_collision_passed = self._gallery_collision_passed(
             identity_id,
             events,
             all_events,
             all_gait_prototypes,
         )
 
-        if state != GaitReadinessState.CONFLICT and accepted_event_count >= self.config.gait_ready_min_events:
+        if (
+            state != GaitReadinessState.CONFLICT
+            and accepted_event_count >= self.config.gait_ready_min_events
+            and independent_sessions >= self.config.gait_ready_min_events
+        ):
             if prototype_count < min(2, self.config.gait_ready_min_coverage):
                 reasons.append("gait_prototype_diversity_pending")
             if coverage_count < self.config.gait_ready_min_coverage:
                 reasons.append("gait_condition_coverage_pending")
             if holdout_passed is not True:
                 reasons.append("gait_holdout_pending")
-            if open_set_passed is not True:
-                reasons.append("gait_open_set_validation_pending")
+            if gallery_collision_passed is not True:
+                reasons.append("gait_gallery_collision_pending")
             if (
                 coverage_count >= self.config.gait_ready_min_coverage
                 and prototype_count >= min(2, self.config.gait_ready_min_coverage)
                 and holdout_passed is True
-                and open_set_passed is True
+                and gallery_collision_passed is True
             ):
                 state = GaitReadinessState.READY
                 reasons.append("gait_ready")
@@ -188,7 +199,8 @@ class GaitReadinessEvaluator:
             coverage_count=coverage_count,
             minimum_inter_event_similarity=min_similarity,
             holdout_passed=holdout_passed,
-            open_set_passed=open_set_passed,
+            open_set_passed=gallery_collision_passed,
+            gallery_collision_passed=gallery_collision_passed,
             reasons=tuple(dict.fromkeys(reasons)),
         )
 

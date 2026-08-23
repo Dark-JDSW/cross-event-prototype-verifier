@@ -41,6 +41,7 @@ class _AppearanceFirstTrackState:
     gait_window_start_timestamp: float | None = None
     conflict: bool = False
     subtracklet_id: str | None = None
+    last_appearance_generation: int | None = None
     action_type: ActionType | None = None
     action_gate_active: bool = False
 
@@ -108,6 +109,7 @@ class AppearanceFirstGaitEnrollmentController:
             state.gait_window_start_timestamp = None
             state.conflict = False
             state.subtracklet_id = None
+            state.last_appearance_generation = None
             state.action_type = None
             state.action_gate_active = False
         self._readiness_cache.clear()
@@ -131,6 +133,7 @@ class AppearanceFirstGaitEnrollmentController:
             state.gait_window_start_timestamp = None
             state.conflict = False
             state.subtracklet_id = None
+            state.last_appearance_generation = None
             state.action_type = None
             state.action_gate_active = False
 
@@ -175,10 +178,10 @@ class AppearanceFirstGaitEnrollmentController:
     def _event_key(observation: Observation) -> str:
         """同一会话/挑战中的多个窗口只对应一个步态事件。"""
 
-        if observation.challenge_id:
-            return f"challenge:{observation.challenge_id}"
         if observation.capture_session_id and observation.capture_session_id != "unknown-session":
             return f"session:{observation.capture_session_id}"
+        if observation.challenge_id:
+            return f"challenge:{observation.challenge_id}"
         return f"event:{observation.event_id}"
 
     @staticmethod
@@ -192,7 +195,7 @@ class AppearanceFirstGaitEnrollmentController:
         state: _AppearanceFirstTrackState,
         observation: Observation,
     ) -> None:
-        """在生产子轨迹切换时丢弃尚未完成的旧步态/外观窗口。"""
+        """在生产子轨迹切换时撤销旧的本地身份和证据窗口。"""
 
         value = observation.metadata.get("subtracklet_id")
         current = str(value) if value not in (None, "") else None
@@ -202,6 +205,9 @@ class AppearanceFirstGaitEnrollmentController:
             state.appearance_samples.clear()
             AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
             state.gait_window_start_timestamp = None
+            state.identity_id = None
+            state.conflict = False
+            state.last_appearance_generation = None
             state.action_type = None
             state.action_gate_active = False
         state.subtracklet_id = current
@@ -501,12 +507,6 @@ class AppearanceFirstGaitEnrollmentController:
 
         if not observation.features.has_appearance:
             return False
-        # A continuous ByteTrack track can legitimately change appearance after
-        # a clothing change.  ProductionVisionAdapter marks that observation
-        # explicitly; keep the existing hard contradiction rule for all other
-        # callers and for uncertain/new tracks.
-        if bool(observation.metadata.get("appearance_change_suspected")):
-            return False
         quality = observation.quality.appearance_availability(
             self.verifier.config.detection_confidence_floor
         )
@@ -556,6 +556,15 @@ class AppearanceFirstGaitEnrollmentController:
         )
         if not features.has_appearance or quality < self.verifier.config.strong_appearance_quality:
             return None, "等待高质量外观样本", quality
+        generation = observation.metadata.get("appearance_generation")
+        if generation is not None:
+            try:
+                generation = int(generation)
+            except (TypeError, ValueError):
+                return None, "外观样本代次无效，等待新的 OSNet 推理", quality
+            if state.last_appearance_generation == generation:
+                return None, "等待新的 OSNet 外观推理样本", quality
+            state.last_appearance_generation = generation
         vector = np.asarray(features.appearance, dtype=np.float32)
         reference = self._unit_mean(state.appearance_samples)
         if reference is not None:
@@ -895,7 +904,6 @@ class AppearanceFirstGaitEnrollmentController:
         if (
             appearance_decision is not None
             and appearance_decision.kind == DecisionKind.CONFLICT
-            and not bool(observation.metadata.get("appearance_change_suspected"))
         ):
             return appearance_decision
         if allow_gait and observation.features.has_gait:

@@ -1178,7 +1178,7 @@ class VerifierWindow:
         if self.worker is None:
             self.status.set("模型仍在后台加载，请稍候")
             return
-        self.worker.stop()
+        self.worker.stop(timeout=None)
         self.status.set("已停止")
 
     def _toggle_automatic_registration(self) -> None:
@@ -1232,7 +1232,7 @@ class VerifierWindow:
             icon="warning",
         ):
             return
-        self.worker.stop()
+        self.worker.stop(timeout=None)
         store = self.verifier.store
         backup_path: Path | None = None
         if store.path != ":memory:":
@@ -1441,7 +1441,7 @@ class VerifierWindow:
                 pass
         self._idle_after_ids.clear()
         if self.worker is not None:
-            self.worker.stop()
+            self.worker.stop(timeout=None)
         self.verifier.close()
         self.root.destroy()
 

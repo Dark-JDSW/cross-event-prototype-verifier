@@ -73,6 +73,13 @@ class OpenSetProtocolReport:
     known_rejected_count: int
     unknown_accepted_count: int
     calibration_unknown_count: int
+    known_rank_correct_count: int = 0
+    known_invalid_count: int = 0
+    known_unrankable_count: int = 0
+    known_wrong_identity_count: int = 0
+    unknown_invalid_count: int = 0
+    unknown_unrankable_count: int = 0
+    calibration_source: str = "unknown"
 
     @property
     def fnir(self) -> float:
@@ -96,7 +103,7 @@ class OpenSetProtocolReport:
 
         if self.known_probe_count == 0:
             return float("nan")
-        return self.known_correct_count / self.known_probe_count
+        return self.known_rank_correct_count / self.known_probe_count
 
     def to_dict(self) -> dict[str, object]:
         """Return a serialisable report for experiment logs."""
@@ -111,6 +118,13 @@ class OpenSetProtocolReport:
             "known_rejected_count": self.known_rejected_count,
             "unknown_accepted_count": self.unknown_accepted_count,
             "calibration_unknown_count": self.calibration_unknown_count,
+            "known_rank_correct_count": self.known_rank_correct_count,
+            "known_invalid_count": self.known_invalid_count,
+            "known_unrankable_count": self.known_unrankable_count,
+            "known_wrong_identity_count": self.known_wrong_identity_count,
+            "unknown_invalid_count": self.unknown_invalid_count,
+            "unknown_unrankable_count": self.unknown_unrankable_count,
+            "calibration_source": self.calibration_source,
             "fnir": self.fnir,
             "fpir": self.fpir,
             "rank_accuracy": self.rank_accuracy,
@@ -247,13 +261,15 @@ def evaluate_open_set_protocol(
     rank: int = 1,
     threshold: float | None = None,
     calibration_unknown_probes: Iterable[Sequence[float] | np.ndarray] = (),
+    require_independent_calibration: bool = False,
 ) -> OpenSetProtocolReport:
     """Evaluate identity/event-disjoint known and unknown probe splits.
 
     The caller should exclude event/session/camera leakage when constructing
     the split. If no threshold is supplied, it is calibrated from
-    calibration_unknown_probes; for a compact exploratory run unknown_probes
-    are used as the calibration population when that argument is empty.
+    calibration_unknown_probes. Reusing ``unknown_probes`` is explicitly
+    marked exploratory and is forbidden when ``require_independent_calibration``
+    is true.
     """
 
     if not 0.0 <= target_fpir <= 1.0:
@@ -263,40 +279,75 @@ def evaluate_open_set_protocol(
     rank = int(rank)
     gallery = _gallery_representatives(gallery_embeddings)
     known_rows: list[tuple[str, tuple[tuple[str, float], ...]]] = []
+    known_invalid = 0
+    known_unrankable = 0
     for identity, probes in known_probes.items():
         for probe in probes:
+            if _unit(probe) is None:
+                known_invalid += 1
+                continue
             ranking = _rank_gallery(probe, gallery)
             if ranking:
                 known_rows.append((str(identity), ranking))
-    unknown_rows = [
-        ranking
-        for probe in unknown_probes
-        if (ranking := _rank_gallery(probe, gallery))
-    ]
-    calibration_rows = [
-        ranking
-        for probe in calibration_unknown_probes
-        if (ranking := _rank_gallery(probe, gallery))
-    ]
+            else:
+                known_unrankable += 1
+    unknown_rows: list[tuple[tuple[str, float], ...]] = []
+    unknown_invalid = 0
+    unknown_unrankable = 0
+    for probe in unknown_probes:
+        if _unit(probe) is None:
+            unknown_invalid += 1
+            continue
+        ranking = _rank_gallery(probe, gallery)
+        if ranking:
+            unknown_rows.append(ranking)
+        else:
+            unknown_unrankable += 1
+    calibration_rows: list[tuple[tuple[str, float], ...]] = []
+    for probe in calibration_unknown_probes:
+        if _unit(probe) is None:
+            continue
+        ranking = _rank_gallery(probe, gallery)
+        if ranking:
+            calibration_rows.append(ranking)
     calibration_scores = [ranking[0][1] for ranking in calibration_rows]
-    if not calibration_scores:
+    if threshold is not None:
+        calibration_source = "explicit_threshold"
+    elif calibration_scores:
+        calibration_source = "independent_calibration_unknown"
+    else:
+        if require_independent_calibration:
+            raise ValueError("independent calibration unknown probes are required")
         calibration_scores = [ranking[0][1] for ranking in unknown_rows]
+        calibration_source = "exploratory_test_unknown_fallback"
     effective_threshold = (
         float(threshold)
         if threshold is not None
         else threshold_at_fpir(calibration_scores, target_fpir)
     )
     known_correct = 0
+    known_rank_correct = 0
     known_rejected = 0
+    known_wrong_identity = 0
     for identity, ranking in known_rows:
         accepted = bool(
             np.isfinite(effective_threshold)
             and ranking[0][1] >= effective_threshold
         )
+        scores = dict(ranking)
+        mate_ranked = identity in {item[0] for item in ranking[:rank]}
+        if mate_ranked:
+            known_rank_correct += 1
+        mate_accepted = bool(
+            np.isfinite(effective_threshold)
+            and scores.get(identity, float("-inf")) >= effective_threshold
+        )
         if not accepted:
             known_rejected += 1
-        elif identity in {item[0] for item in ranking[:rank]}:
+        elif mate_ranked and mate_accepted:
             known_correct += 1
+        else:
+            known_wrong_identity += 1
     unknown_accepted = sum(
         bool(
             np.isfinite(effective_threshold)
@@ -308,12 +359,19 @@ def evaluate_open_set_protocol(
         rank=rank,
         target_fpir=float(target_fpir),
         threshold=effective_threshold,
-        known_probe_count=len(known_rows),
-        unknown_probe_count=len(unknown_rows),
+        known_probe_count=len(known_rows) + known_invalid + known_unrankable,
+        unknown_probe_count=len(unknown_rows) + unknown_invalid + unknown_unrankable,
         known_correct_count=known_correct,
         known_rejected_count=known_rejected,
         unknown_accepted_count=unknown_accepted,
-        calibration_unknown_count=len(calibration_scores),
+        calibration_unknown_count=len(calibration_rows),
+        known_rank_correct_count=known_rank_correct,
+        known_invalid_count=known_invalid,
+        known_unrankable_count=known_unrankable,
+        known_wrong_identity_count=known_wrong_identity,
+        unknown_invalid_count=unknown_invalid,
+        unknown_unrankable_count=unknown_unrankable,
+        calibration_source=calibration_source,
     )
 
 

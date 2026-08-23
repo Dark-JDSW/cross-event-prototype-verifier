@@ -64,6 +64,9 @@ YOLO11L 人物检测 → ByteTrack 多目标轨迹
   - 添加了预加载功能，大幅优化加载速度
   - 重写NASAPunk风格GUI(可能有BUG，后面修)
 
+- V1.17
+  - 简单修改了算法
+  - 大幅优化性能！
 
 ## 先运行起来
 
@@ -84,9 +87,9 @@ GUI 选择视频文件时，“视频重复学习”默认为 1；设置为大�
 - 视觉身份由 OSNet 外观匹配、人工确认或外部采集任务确定并获得 `P1`、`P2` 标签；视觉身份已确认不等于步态已经就绪。
 - 自动生成的 `P` 是系统内部视觉身份标签，不是 OSNet 从图像中推断出的真实姓名；需要语义姓名时仍应由人工或外部采集任务提供映射。
 - 已确认视觉身份的 Track 才能贡献步态样本。RTMPose 姿态序列经 GaitGraph2 编码后，按质量和稳定性审核为步态样本。
-- 同一次采集会话/挑战中的多个窗口只计为一个步态事件；通过独立性、稳定性和模型协议检查后，事件事实会追加到 SQLite 修订历史。同一会话后续窗口可以生成新的事件修订，但不会增加独立事件数；该视觉身份的步态模型由当前事件集合重新派生。
+- 同一次采集会话中的多个窗口和多个 challenge 都只计为一个步态事件；`capture_session_id` 优先于 `challenge_id` 作为事件键。通过独立性、稳定性和模型协议检查后，事件事实会追加到 SQLite 修订历史；同会话后续窗口只能生成修订/覆盖，不能增加独立事件数。
 - 步态原型不会在线修改 GaitGraph2 权重；系统学习的是该视觉身份的事件事实和原型图库，后续可用 GaitGraph2 向量检索该身份。
-- 步态就绪需要足够的独立事件、条件覆盖、内部一致性、留出验证和开放集检查；在此之前状态分别为“步态学习中”或“步态暂可用”。
+- 步态就绪需要足够的**独立 capture session**、条件覆盖、内部一致性和留出验证；图库内的相似度检查只记录为 `gallery_collision_passed`，不是独立 unknown 数据上的 FPIR 验证。在此之前状态分别为“步态学习中”或“步态暂可用”。
 - 步态冲突会暂停写入并清空当前窗口，不会把冲突事件强行并入视觉身份。
 - OSNet 可以负责 Track 的初始身份绑定和候选续接，但不能把任意外观向量直接输入 GaitGraph2；两个模型仍使用各自的输入契约。
 - 旧版强步态建号和一次性外观请求 API 仍保留用于兼容与人工复核，生产 GUI 默认使用上述视觉优先流程。
@@ -380,9 +383,14 @@ report = evaluate_open_set_protocol(
     calibration_unknown_probes=(calibration_unknown_probe,),
     target_fpir=0.01,
     rank=1,
+    require_independent_calibration=True,
 )
 print(report.fnir, report.fpir, report.threshold)
 ```
+
+`rank_accuracy` 是阈值无关的 closed-set Rank-k；`known_correct_count` 则要求
+真实 mate 位于 Top-k 且其自身分数过阈。报告会显式给出 supplied probe 中的
+`invalid`、`unrankable` 与 `calibration_source`，不会再静默丢弃困难样本。
 
 ## Python API
 

@@ -158,17 +158,26 @@ class FrameWorker:
         ] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._generation = 0
+        self._run_lock = threading.RLock()
 
     @property
     def running(self) -> bool:
         """采集线程是否存活并接受排队命令。"""
-        return self._thread is not None and self._thread.is_alive()
+        with self._run_lock:
+            return self._thread is not None and self._thread.is_alive()
 
     def _put(
         self,
         message: FrameMessage | StatusMessage | RegistrationMessage | ParameterUpdateMessage,
+        *,
+        generation: int | None = None,
     ) -> None:
         """发布消息；只丢弃旧帧，不丢弃控制/状态/登记结果。"""
+        if generation is not None:
+            with self._run_lock:
+                if generation != self._generation:
+                    return
         try:
             self.messages.put_nowait(message)
         except queue.Full:
@@ -210,28 +219,50 @@ class FrameWorker:
         ``candidate_id`` 由采集任务/操作员显式提供，允许同一未知人物在
         不同输入源之间继续积累独立事件；缺省时保持会话隔离。
         """
-        self.stop()
-        self._stop.clear()
+        if self.running:
+            # Do not reuse a shared pipeline while a previous GPU/SQLite call
+            # may still be in flight. The caller must wait for stop() to
+            # report completion before starting another source.
+            self.stop(timeout=0.0)
+            raise RuntimeError("上一采集线程仍在停止，不能启动新的输入源")
         effective_candidate = (
             candidate_id if candidate_id is not None else spec.candidate_id
         )
         if effective_candidate is not None and not effective_candidate.strip():
             raise ValueError("candidate_id cannot be empty")
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(spec, effective_candidate.strip() if effective_candidate else None),
-            name="cross-event-capture",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._run_lock:
+            self._generation += 1
+            generation = self._generation
+            stop_event = threading.Event()
+            self._stop = stop_event
+            thread = threading.Thread(
+                target=self._run,
+                args=(
+                    spec,
+                    effective_candidate.strip() if effective_candidate else None,
+                    stop_event,
+                    generation,
+                ),
+                name="cross-event-capture",
+                daemon=True,
+            )
+            self._thread = thread
+        thread.start()
 
-    def stop(self) -> None:
-        """请求关闭并短暂等待，以便及时释放资源。"""
-        self._stop.set()
-        thread = self._thread
+    def stop(self, *, timeout: float | None = 2.0) -> bool:
+        """请求关闭当前 run，并只在其真正退出后释放所有权。"""
+        with self._run_lock:
+            stop_event = self._stop
+            thread = self._thread
+        stop_event.set()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-        self._thread = None
+            thread.join(timeout=timeout)
+        stopped = thread is None or not thread.is_alive()
+        if stopped:
+            with self._run_lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
 
     def register_identity(self, identity_id: str, track_id: int | None = None) -> None:
         """在采集线程排队登记操作，以保持管线状态局部性。"""
@@ -281,7 +312,12 @@ class FrameWorker:
             return
         self._commands.put(("parameters", payload, None))
 
-    def _apply_runtime_parameters(self, values: dict[str, object]) -> None:
+    def _apply_runtime_parameters(
+        self,
+        values: dict[str, object],
+        *,
+        generation: int | None = None,
+    ) -> None:
         """应用参数映射，并发布成功消息或面向用户的错误。"""
         try:
             state = self.pipeline.update_runtime_parameters(values)
@@ -291,12 +327,16 @@ class FrameWorker:
                     True,
                     f"{action}（运行时版本 {state.revision}）",
                     state,
-                )
+                ),
+                generation=generation,
             )
         except Exception as error:
-            self._put(ParameterUpdateMessage(False, f"参数应用失败：{error}"))
+            self._put(
+                ParameterUpdateMessage(False, f"参数应用失败：{error}"),
+                generation=generation,
+            )
 
-    def _drain_commands(self) -> None:
+    def _drain_commands(self, *, generation: int | None = None) -> None:
         """处理读取下一帧之前排队的所有命令。"""
         while True:
             try:
@@ -312,7 +352,7 @@ class FrameWorker:
                 continue
             if command == "parameters":
                 if isinstance(payload, dict):
-                    self._apply_runtime_parameters(payload)
+                    self._apply_runtime_parameters(payload, generation=generation)
                 continue
             if command != "register":
                 continue
@@ -323,19 +363,30 @@ class FrameWorker:
                     RegistrationMessage(
                         True,
                         f"已登记身份 {identity_id}（track {enrolled_track}）",
-                    )
+                    ),
+                    generation=generation,
                 )
             except Exception as error:  # 将用户操作错误显示在 GUI 中
-                self._put(RegistrationMessage(False, f"登记失败：{error}"))
+                self._put(
+                    RegistrationMessage(False, f"登记失败：{error}"),
+                    generation=generation,
+                )
 
-    def _run(self, spec: SourceSpec, candidate_id: str | None) -> None:
+    def _run(
+        self,
+        spec: SourceSpec,
+        candidate_id: str | None,
+        stop_event: threading.Event | None = None,
+        generation: int | None = None,
+    ) -> None:
         """持续采集、处理并发布帧，直到停止或输入结束。"""
+        stop_event = stop_event or self._stop
         capture: OpenCvCapture | None = None
         session_id = f"{spec.kind}-{int(time.time() * 1000)}"
         try:
             last_maintenance = time.monotonic()
             for repeat_index in range(spec.repeat_count):
-                if self._stop.is_set():
+                if stop_event.is_set():
                     break
                 capture = OpenCvCapture(spec)
                 capture.open()
@@ -367,11 +418,12 @@ class FrameWorker:
                             f"已打开：{spec.label} | {capture.width}×{capture.height} | "
                             f"{fps_text}{repeat_text} | {backend_status}"
                         ),
-                    )
+                    ),
+                    generation=generation,
                 )
                 try:
-                    while not self._stop.is_set():
-                        self._drain_commands()
+                    while not stop_event.is_set():
+                        self._drain_commands(generation=generation)
                         ok, frame = capture.read()
                         if not ok:
                             if repeat_index + 1 < spec.repeat_count:
@@ -382,10 +434,14 @@ class FrameWorker:
                                             f"第 {repeat_index + 1}/{spec.repeat_count} 次学习完成，"
                                             "准备重复播放同一视频"
                                         ),
-                                    )
+                                    ),
+                                    generation=generation,
                                 )
                             else:
-                                self._put(StatusMessage("ended", "视频已结束"))
+                                self._put(
+                                    StatusMessage("ended", "视频已结束"),
+                                    generation=generation,
+                                )
                             break
                         started = time.perf_counter()
                         if spec.kind == "file" and capture.capture is not None:
@@ -401,6 +457,8 @@ class FrameWorker:
                             frame,
                             timestamp=frame_timestamp,
                         )
+                        if stop_event.is_set():
+                            break
                         if time.monotonic() - last_maintenance >= 30.0:
                             removed_candidates = self.pipeline.verifier.maintenance(
                                 now=time.time()
@@ -409,24 +467,30 @@ class FrameWorker:
                                 removed_candidates
                             )
                             last_maintenance = time.monotonic()
-                        self._put(FrameMessage(result))
+                        self._put(FrameMessage(result), generation=generation)
                         if spec.kind == "file" and capture.fps > 1.0:
                             remaining = (1.0 / capture.fps) - (
                                 time.perf_counter() - started
                             )
                             if remaining > 0:
-                                self._stop.wait(min(remaining, 0.20))
+                                stop_event.wait(min(remaining, 0.20))
                 finally:
                     capture.release()
                     capture = None
         except CaptureError as error:
-            self._put(StatusMessage("error", str(error)))
+            self._put(StatusMessage("error", str(error)), generation=generation)
         except Exception as error:  # 保持 GUI 存活并报告工作线程错误
-            self._put(StatusMessage("error", f"处理输入源失败：{error}"))
+            self._put(
+                StatusMessage("error", f"处理输入源失败：{error}"),
+                generation=generation,
+            )
         finally:
             if capture is not None:
                 capture.release()
-            self._thread = None
+            with self._run_lock:
+                if generation is None or generation == self._generation:
+                    if self._thread is threading.current_thread():
+                        self._thread = None
 
 
 __all__ = [

@@ -164,6 +164,23 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(assigned, {})
 
+    def test_gated_assignment_uses_the_real_top2_margin(self) -> None:
+        assigned = gated_global_assignment(
+            np.asarray([[0.91, 0.89]], dtype=np.float32),
+            accept_threshold=0.90,
+            appearance_floor=0.0,
+            margin_threshold=0.08,
+        )
+        self.assertEqual(assigned, {})
+
+    def test_calibration_rejects_an_inverted_similarity_mapping(self) -> None:
+        from cross_event_verifier.calibration import ScoreCalibrator
+
+        scores = np.linspace(-0.9, 0.9, 40)
+        labels = [1 if score < 0.0 else 0 for score in scores]
+        with self.assertRaisesRegex(ValueError, "non-positive similarity slope"):
+            ScoreCalibrator.fit(scores, labels, iterations=2000)
+
     def test_formal_match_is_separate_from_unknown_candidate(self) -> None:
         verifier = CrossEventVerifier()
         verifier.register_identity("P1", FeatureBundle([1, 0, 0], [0, 1, 0]))

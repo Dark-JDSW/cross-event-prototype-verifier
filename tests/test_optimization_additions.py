@@ -158,7 +158,8 @@ class OptimizationAdditionTests(unittest.TestCase):
                 candidate_id="candidate",
             )
             self.assertEqual(len(state.appearance_samples), 0)
-            self.assertEqual(len(state.gait_samples), 1)
+            self.assertEqual(len(state.gait_samples), 0)
+            self.assertIsNone(state.identity_id)
             self.assertEqual(state.subtracklet_id, "7:1")
         finally:
             verifier.close()
@@ -298,6 +299,34 @@ class OptimizationAdditionTests(unittest.TestCase):
         self.assertEqual(report.known_correct_count, 2)
         self.assertEqual(report.fnir, 0.0)
         self.assertEqual(report.fpir, 0.0)
+
+    def test_open_set_rank_is_threshold_independent_and_tracks_invalid_probes(self):
+        report = evaluate_open_set_protocol(
+            {
+                "P1": ([0.6, 0.8, 0.0],),
+                "P2": ([0.95, np.sqrt(1.0 - 0.95**2), 0.0],),
+            },
+            {"P1": ([1.0, 0.0, 0.0],), "P2": ([0.0, 0.0],)},
+            ([0.0, 1.0, 0.0], [float("nan"), 0.0, 0.0]),
+            threshold=0.90,
+            rank=2,
+        )
+
+        self.assertEqual(report.rank_accuracy, 0.5)
+        self.assertEqual(report.known_correct_count, 0)
+        self.assertEqual(report.known_invalid_count, 1)
+        self.assertEqual(report.unknown_invalid_count, 1)
+        self.assertEqual(report.unknown_probe_count, 2)
+        self.assertEqual(report.calibration_source, "explicit_threshold")
+
+    def test_open_set_strict_mode_requires_independent_calibration_unknowns(self):
+        with self.assertRaisesRegex(ValueError, "independent calibration"):
+            evaluate_open_set_protocol(
+                {"P1": ([1.0, 0.0],)},
+                {"P1": ([1.0, 0.0],)},
+                ([0.0, 1.0],),
+                require_independent_calibration=True,
+            )
 
     def test_event_revisions_and_derived_model_are_persisted(self):
         store = SqliteStore(":memory:")

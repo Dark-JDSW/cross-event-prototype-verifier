@@ -77,6 +77,16 @@ class _JumpingDetector(_FakeDetector):
         return detections
 
 
+class _MovingDetector(_FakeDetector):
+    """Returns a constant-velocity observation on each real detector call."""
+
+    def track(self, _frame):
+        detections = super().track(_frame)
+        offset = (self.calls - 1) * 40
+        detections[0].box = (20 + offset, 10, 100 + offset, 190)
+        return detections
+
+
 class _FakePose:
     providers = ("FakeExecutionProvider",)
 
@@ -217,6 +227,9 @@ class ProductionVisionTests(unittest.TestCase):
     def test_production_config_rejects_cpu_device(self) -> None:
         with self.assertRaises(ValueError):
             ProductionVisionConfig(device="cpu")
+
+    def test_production_config_uses_one_cuda_ordinal_for_all_runtimes(self) -> None:
+        self.assertEqual(ProductionVisionConfig(device="cuda:1").cuda_device_index, 1)
 
     def test_production_process_rejects_invalid_frame_shape(self) -> None:
         with patch(
@@ -425,7 +438,70 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertEqual(summary.frame_count, 1)
         self.assertEqual(summary.valid_pose_frames, 0)
         self.assertEqual(len(adapter.states[7].poses), 1)
-        self.assertEqual(jumped[0].quality.id_switches, 1)
+        self.assertEqual(jumped[0].quality.id_switches, 0)
+        self.assertEqual(jumped[0].metadata["lifetime_id_switches"], 1)
+
+    def test_long_clean_track_keeps_window_pose_coverage_eligible(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=60,
+            appearance_stride=120,
+        )
+        frame = np.zeros((200, 240, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _FakeDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            track = tuple(adapter.process(frame)[0] for _ in range(81))[-1]
+
+        self.assertEqual(track.quality.frame_count, 60)
+        self.assertEqual(track.quality.valid_pose_frames, 60)
+        self.assertGreater(track.quality.real_pose_coverage(), 0.99)
+
+    def test_detector_stride_prediction_uses_real_observations_not_predictions(self) -> None:
+        config = ProductionVisionConfig(
+            detector_inference_stride=4,
+            appearance_stride=30,
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+        )
+        frame = np.zeros((240, 500, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch(
+                "cross_event_verifier.production_vision._YoloByteTracker",
+                _MovingDetector,
+            ),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch(
+                "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
+                _FakeAppearance,
+            ),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            tracks = tuple(adapter.process(frame)[0] for _ in range(6))
+
+        # Real detections arrive at frames 1 and 5, moving 40 pixels in four
+        # frames. Frame 6 must extrapolate one more 10-pixel step, not reuse a
+        # previous prediction as a velocity anchor.
+        self.assertEqual(tracks[-1].box[0], 70)
 
     def test_production_adapter_applies_hot_thresholds_without_model_reload(self) -> None:
         with patch(

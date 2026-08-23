@@ -22,6 +22,8 @@ from cross_event_verifier import (
 from cross_event_verifier.appearance_first import (
     AppearanceFirstGaitEnrollmentController,
 )
+from cross_event_verifier.gait_readiness import GaitReadinessEvaluator
+from cross_event_verifier.types import GaitEnrollmentEvent
 
 
 def _quality() -> TrackQuality:
@@ -156,6 +158,36 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertEqual(report.state, GaitReadinessState.PROVISIONAL)
         self.assertEqual(report.independent_session_count, 2)
         verifier.close()
+
+    def test_multiple_challenges_in_one_session_are_not_independent_readiness_events(self) -> None:
+        config = VerifierConfig(
+            gait_provisional_min_events=2,
+            gait_ready_min_events=3,
+            gait_ready_min_coverage=1,
+            gait_event_min_similarity=0.70,
+            gait_holdout_min_similarity=0.70,
+        )
+        events = tuple(
+            GaitEnrollmentEvent(
+                identity_id="P1",
+                event_key=f"challenge:{index}",
+                event_id=f"event-{index}",
+                camera_id="cam-a",
+                capture_session_id="one-session",
+                track_id="7",
+                vector=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                stability=0.99,
+                quality=0.95,
+                sample_count=3,
+            )
+            for index in range(3)
+        )
+
+        report = GaitReadinessEvaluator(config).evaluate("P1", events)
+
+        self.assertEqual(report.independent_session_count, 1)
+        self.assertNotEqual(report.state, GaitReadinessState.READY)
+        self.assertIn("need_more_independent_gait_sessions", report.reasons)
 
     def test_same_session_continues_learning_samples_after_event_counted(self) -> None:
         """同一事件不重复计数，但后续窗口仍应更新该事件的步态原型。"""
@@ -360,6 +392,73 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertEqual(verifier.formal_identities, ("P1",))
         appearance_prototypes = verifier.memory.formal_prototypes("P1", "appearance")
         self.assertGreaterEqual(len(appearance_prototypes), 2)
+        verifier.close()
+
+    def test_replayed_appearance_generation_cannot_enroll_a_new_prototype(self) -> None:
+        verifier = CrossEventVerifier()
+        verifier.register_identity(
+            "P1",
+            FeatureBundle(appearance=np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+        )
+        controller = AppearanceFirstGaitEnrollmentController(
+            verifier,
+            AutomationPolicy(minimum_track_frames=1, gait_sample_window=8),
+        )
+        state_key = "cam:appearance-session:track-7"
+        controller.register_visual_identity(
+            "P1",
+            replace(
+                _appearance_only_observation(np.array([1.0, 0.0, 0.0], dtype=np.float32), 1.0),
+                metadata={"subtracklet_id": "7:0"},
+            ),
+            state_key=state_key,
+        )
+        side_view = np.array([0.5, 0.8660254, 0.0], dtype=np.float32)
+        for timestamp in range(2, 102):
+            controller.verify(
+                replace(
+                    _appearance_only_observation(side_view, float(timestamp)),
+                    metadata={"appearance_generation": 7, "appearance_fresh": False},
+                ),
+                candidate_id=state_key,
+            )
+
+        self.assertEqual(len(verifier.memory.formal_prototypes("P1", "appearance")), 1)
+        verifier.close()
+
+    def test_hard_subtracklet_boundary_requires_a_new_visual_binding(self) -> None:
+        verifier = CrossEventVerifier()
+        verifier.register_identity(
+            "P1",
+            FeatureBundle(appearance=np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+        )
+        controller = AppearanceFirstGaitEnrollmentController(
+            verifier,
+            AutomationPolicy(minimum_track_frames=1),
+        )
+        state_key = "cam:appearance-session:track-7"
+        controller.register_visual_identity(
+            "P1",
+            replace(
+                _appearance_only_observation(np.array([1.0, 0.0, 0.0], dtype=np.float32), 1.0),
+                metadata={"subtracklet_id": "7:0"},
+            ),
+            state_key=state_key,
+        )
+        decision, _ = controller.verify(
+            replace(
+                _appearance_only_observation(np.array([0.0, 1.0, 0.0], dtype=np.float32), 2.0),
+                metadata={
+                    "subtracklet_id": "7:1",
+                    "subtracklet_boundary_reasons": ("track_id_switch",),
+                    "appearance_generation": 2,
+                },
+            ),
+            candidate_id=state_key,
+        )
+
+        self.assertNotEqual(decision.identity_id, "P1")
+        self.assertNotIn("visual_identity_binding_continues", decision.reasons)
         verifier.close()
 
     def test_strong_gait_can_rebind_a_new_track_after_clothing_change(self) -> None:

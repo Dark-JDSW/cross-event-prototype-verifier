@@ -135,8 +135,13 @@ class ScoreCalibrator:
             gradient += l2 * np.array([weights[0], 0.0])
             weights -= learning_rate * gradient
 
-        scale = max(float(abs(weights[0])), 1e-3)
-        midpoint = float(-weights[1] / weights[0]) if abs(weights[0]) > 1e-6 else 0.5
+        if not math.isfinite(float(weights[0])) or float(weights[0]) <= 1e-6:
+            raise ValueError(
+                "calibration fit produced a non-positive similarity slope; "
+                "check labels and target-domain data"
+            )
+        scale = float(weights[0])
+        midpoint = float(-weights[1] / weights[0])
         return cls(
             scale=scale,
             midpoint=float(np.clip(midpoint, -1.0, 1.0)),
