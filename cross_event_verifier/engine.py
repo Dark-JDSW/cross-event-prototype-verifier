@@ -666,6 +666,14 @@ class CrossEventVerifier:
         features = normalized.features
         if not features.has_gait:
             raise ValueError("automatic enrollment requires a gait feature")
+        action_prediction = ActionRouter.from_metadata(normalized.metadata)
+        if (
+            bool(normalized.metadata.get("gait_action_evidence_required", False))
+            and not ActionRouter().allows_walk(action_prediction)
+        ):
+            raise ValueError(
+                "automatic enrollment requires an explicit strong WALK action prediction"
+            )
         gait_quality = normalized.quality.gait_availability(
             self.config.minimum_frames,
             self.config.minimum_gait_cycles,
@@ -930,7 +938,13 @@ class CrossEventVerifier:
         if not normalized.features.has_gait:
             raise ValueError("gait prototype enrollment requires a gait feature")
         action_prediction = ActionRouter.from_metadata(normalized.metadata)
-        if action_prediction is not None and not ActionRouter().allows_walk(action_prediction):
+        if (
+            bool(normalized.metadata.get("gait_action_evidence_required", False))
+            and not ActionRouter().allows_walk(action_prediction)
+        ) or (
+            action_prediction is not None
+            and not ActionRouter().allows_walk(action_prediction)
+        ):
             raise ValueError(
                 "gait prototype enrollment requires a strong WALK action prediction"
             )

@@ -23,11 +23,13 @@ from typing import Callable, Sequence
 import cv2
 import numpy as np
 
-from .actions import conservative_walk_prediction
+from .actions import ActionPrediction, ActionQuality, ActionRouter, ActionType
+from .action_classifier import PoseActionClassifier
 from .adapters import occlusion_scores
 from .gait_graph import TemporalGaitEncoder
 from .model_assets import tensor_state_fingerprint
 from .osnet_ain import load_osnet_ain
+from .posec3d_action import PoseC3DActionClassifier, PoseC3DPrediction
 from .types import CleanSubTracklet, FeatureBundle, TrackQuality
 from .vision import Box, VisionTrack
 
@@ -61,6 +63,17 @@ class ProductionVisionConfig:
     pose_path: Path = MODEL_DIRECTORY / "rtmpose-s.onnx"
     appearance_path: Path = MODEL_DIRECTORY / "osnet_ain_x1_0_dg.pth"
     gait_path: Path = MODEL_DIRECTORY / "gaitgraph2_grew_state.pt"
+    action_classifier_path: Path | None = None
+    # Optional official HMDB51 PoseC3D semantic gate.  The existing
+    # ``action_classifier_path`` remains reserved for the project's .npz
+    # centroid classifier.
+    posec3d_checkpoint_path: Path | None = None
+    posec3d_config_path: Path = MODEL_DIRECTORY / "posec3d_hmdb51_runtime.py"
+    posec3d_label_map_path: Path = MODEL_DIRECTORY / "hmdb51_label_map.txt"
+    posec3d_probability_threshold: float = 0.80
+    posec3d_margin_threshold: float = 0.15
+    posec3d_clip_length: int = 48
+    posec3d_inference_stride: int = 3
     detector_confidence: float = 0.25
     output_confidence: float = 0.45
     detector_iou: float = 0.50
@@ -75,9 +88,21 @@ class ProductionVisionConfig:
     gait_inference_stride: int = 3
     low_light_threshold: float = 100.0
     low_light_check_interval: int = 12
+    low_light_hysteresis: float = 8.0
+    low_light_min_hold_frames: int = 24
     state_retention_frames: int = 90
     state_retention_seconds: float = 3.0
     maximum_track_gap_seconds: float = 1.5
+    # Optional image-to-ground homography.  It is deliberately inert until a
+    # real per-camera calibration is supplied; gait model coordinates must
+    # remain in their GREW-compatible image-space contract.
+    ground_homography: tuple[float, ...] | None = None
+    ground_calibration_id: str | None = None
+    ground_coordinate_frame: str | None = None
+    ground_trajectory_window_seconds: float = 2.0
+    ground_max_speed_mps: float = 6.0
+    action_stability_frames: int = 3
+    action_unknown_end_frames: int = 6
     device: str | None = None
     # 生产推理有意采用“失败即关闭”策略。任何一个分支回退到 CPU，都会让实时
     # 管线表面看起来正常，却悄悄破坏吞吐量并使预期部署配置失效。
@@ -91,6 +116,8 @@ class ProductionVisionConfig:
             "detector_iou",
             "keypoint_confidence",
             "appearance_change_suspect_similarity",
+            "posec3d_probability_threshold",
+            "posec3d_margin_threshold",
         ):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
@@ -109,25 +136,79 @@ class ProductionVisionConfig:
             raise ValueError("appearance_stride must be at least 1")
         if self.gait_inference_stride < 1:
             raise ValueError("gait_inference_stride must be at least 1")
+        if self.posec3d_clip_length < 8:
+            raise ValueError("posec3d_clip_length must be at least 8")
+        if self.posec3d_clip_length != PoseC3DActionClassifier.clip_length:
+            raise ValueError(
+                "posec3d_clip_length must remain 48 for the official HMDB51 checkpoint"
+            )
+        if self.posec3d_inference_stride < 1:
+            raise ValueError("posec3d_inference_stride must be at least 1")
+        if self.low_light_hysteresis < 0:
+            raise ValueError("low_light_hysteresis cannot be negative")
+        if self.low_light_min_hold_frames < 1:
+            raise ValueError("low_light_min_hold_frames must be positive")
         if self.state_retention_seconds <= 0 or self.maximum_track_gap_seconds <= 0:
             raise ValueError("track retention/gap seconds must be positive")
         if self.maximum_track_gap_seconds >= self.state_retention_seconds:
             raise ValueError(
                 "maximum_track_gap_seconds must be shorter than state_retention_seconds"
             )
+        if self.ground_homography is not None:
+            matrix = np.asarray(self.ground_homography, dtype=np.float64)
+            if matrix.size != 9 or not np.isfinite(matrix).all():
+                raise ValueError("ground_homography must contain nine finite values")
+        if self.ground_trajectory_window_seconds <= 0:
+            raise ValueError("ground_trajectory_window_seconds must be positive")
+        if self.ground_max_speed_mps <= 0:
+            raise ValueError("ground_max_speed_mps must be positive")
+        for name in ("ground_calibration_id", "ground_coordinate_frame"):
+            value = getattr(self, name)
+            if value is not None and not str(value).strip():
+                raise ValueError(f"{name} cannot be blank when supplied")
+        if self.action_stability_frames < 1:
+            raise ValueError("action_stability_frames must be positive")
+        if self.action_unknown_end_frames < self.action_stability_frames:
+            raise ValueError(
+                "action_unknown_end_frames cannot be below action_stability_frames"
+            )
         if self.require_cuda and self.torch_device.lower().startswith("cpu"):
             raise ValueError("生产视觉链路 require_cuda=True 时不能把 device 设为 CPU")
+        if self.action_classifier_path is not None and not Path(self.action_classifier_path).is_file():
+            raise ValueError(
+                f"action classifier model does not exist: {self.action_classifier_path}"
+            )
+        if self.posec3d_checkpoint_path is not None:
+            if not Path(self.posec3d_checkpoint_path).is_file():
+                raise ValueError(
+                    f"PoseC3D checkpoint does not exist: {self.posec3d_checkpoint_path}"
+                )
+            if not Path(self.posec3d_config_path).is_file():
+                raise ValueError(
+                    f"PoseC3D config does not exist: {self.posec3d_config_path}"
+                )
+            if not Path(self.posec3d_label_map_path).is_file():
+                raise ValueError(
+                    f"PoseC3D label map does not exist: {self.posec3d_label_map_path}"
+                )
+            if self.gait_sequence_length < self.posec3d_clip_length:
+                raise ValueError(
+                    "gait_sequence_length cannot be shorter than posec3d_clip_length"
+                )
 
     @property
     def required_files(self) -> tuple[Path, ...]:
         """返回生产启动前所需的全部本地文件。"""
-        return (
+        paths = [
             self.detector_path,
             self.tracker_path,
             self.pose_path,
             self.appearance_path,
             self.gait_path,
-        )
+        ]
+        if self.posec3d_checkpoint_path is not None:
+            paths.append(self.posec3d_checkpoint_path)
+        return tuple(paths)
 
     @property
     def torch_device(self) -> str:
@@ -168,6 +249,17 @@ def production_readiness(
     for module in ("torch", "ultralytics", "onnxruntime"):
         if importlib.util.find_spec(module) is None:
             issues.append(f"缺少 Python 依赖：{module}")
+    if cfg.posec3d_checkpoint_path is not None:
+        missing_posec3d = [
+            module
+            for module in ("mmaction", "mmengine", "mmcv")
+            if importlib.util.find_spec(module) is None
+        ]
+        if missing_posec3d:
+            issues.append(
+                "PoseC3D 运行时缺少官方 MMAction2 依赖："
+                + ", ".join(missing_posec3d)
+            )
     if importlib.util.find_spec("ultralytics") is not None and MODEL_MANIFEST.is_file():
         try:
             runtime_contract = json.loads(
@@ -254,24 +346,48 @@ class _Detection:
 
 class _LowLightEnhancer:
     """仅在采样亮度较低时启用的可选 CLAHE 预处理器。"""
-    def __init__(self, threshold: float, interval: int) -> None:
+    def __init__(
+        self,
+        threshold: float,
+        interval: int,
+        hysteresis: float = 8.0,
+        min_hold_frames: int = 24,
+    ) -> None:
         """配置亮度采样间隔和可复用的 CLAHE 算子。"""
         self.threshold = float(threshold)
         self.interval = max(1, int(interval))
+        self.hysteresis = max(0.0, float(hysteresis))
+        self.min_hold_frames = max(1, int(min_hold_frames))
         self.frame_index = 0
         self.enabled = False
+        self._last_switch_frame = -self.min_hold_frames
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def reset(self) -> None:
         """清除已采样亮度，使下一帧重新评估光照。"""
         self.frame_index = 0
         self.enabled = False
+        self._last_switch_frame = -self.min_hold_frames
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         """根据采样间隔返回原始帧或 CLAHE 增强帧。"""
         if self.frame_index % self.interval == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            self.enabled = float(gray.mean()) < self.threshold
+            brightness = float(gray.mean())
+            can_switch = (
+                self.frame_index - self._last_switch_frame
+                >= self.min_hold_frames
+            )
+            if not self.enabled and brightness < self.threshold and can_switch:
+                self.enabled = True
+                self._last_switch_frame = self.frame_index
+            elif (
+                self.enabled
+                and brightness > self.threshold + self.hysteresis
+                and can_switch
+            ):
+                self.enabled = False
+                self._last_switch_frame = self.frame_index
         self.frame_index += 1
         if not self.enabled:
             return frame
@@ -671,6 +787,56 @@ class _TrackState:
     segment_start_frame: int = 0
     segment_boundary_reasons: tuple[str, ...] = ()
     views: deque[str | None] = field(default_factory=lambda: deque(maxlen=60))
+    ground_points: deque[tuple[float, float] | None] = field(
+        default_factory=lambda: deque(maxlen=60)
+    )
+    camera_view_timeline: deque[_CameraViewSample] = field(
+        default_factory=lambda: deque(maxlen=60)
+    )
+    action_type: ActionType = ActionType.UNKNOWN
+    action_branch_generation: int = 0
+    action_segment_id: int = 0
+    action_boundary_reason: str | None = None
+    action_candidate_type: ActionType | None = None
+    action_candidate_frames: int = 0
+    action_unknown_frames: int = 0
+    posec3d_prediction: PoseC3DPrediction | None = None
+
+
+@dataclass(frozen=True)
+class _CameraViewSample:
+    """One track-aligned camera/view observation for audit and replay."""
+
+    frame_index: int
+    timestamp: float
+    view_angle: str | None
+    camera_zone: str | None
+    world_position: tuple[float, float] | None
+    ground_anchor_source: str | None
+    missing: bool = False
+
+
+@dataclass(frozen=True)
+class _WorldTrajectory:
+    """Smoothed ground-plane motion derived from an aligned track window."""
+
+    position: tuple[float, float] | None = None
+    speed: float | None = None
+    displacement: float | None = None
+    direction_degrees: float | None = None
+    quality: float = 0.0
+    valid_samples: int = 0
+    outlier_count: int = 0
+
+
+def _finite_optional_float(value: object) -> float | None:
+    """Normalize optional plugin audit values without letting them break frames."""
+
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate if np.isfinite(candidate) else None
 
 
 def _box_valid(box: Box) -> bool:
@@ -802,6 +968,220 @@ def _box_jitter(boxes: Sequence[Box]) -> float:
     return float(np.clip(np.std(normalized) * 3.0, 0.0, 1.0))
 
 
+def _pose_jitter(poses: Sequence[np.ndarray]) -> float:
+    """Estimate upper-body relative jitter without mistaking walking for noise."""
+
+    if len(poses) < 3:
+        return 0.0
+    values = np.asarray(poses, dtype=np.float32)
+    confidence = values[:, :, 2]
+    anchor_valid = (confidence[:, 11] > 0.0) & (confidence[:, 12] > 0.0)
+    if int(anchor_valid.sum()) < 3:
+        return 0.0
+    anchors = (values[:, 11, :2] + values[:, 12, :2]) * 0.5
+    shoulders = values[:, [5, 6], :2] - anchors[:, None, :]
+    valid = (
+        anchor_valid[:, None]
+        & (confidence[:, [5, 6]] > 0.0)
+        & np.isfinite(shoulders).all(axis=2)
+    )
+    delta = np.linalg.norm(np.diff(shoulders, axis=0), axis=2)
+    paired = valid[:-1] & valid[1:]
+    if not paired.any():
+        return 0.0
+    torso = np.linalg.norm(values[:, 5, :2] - anchors, axis=1)
+    scale = float(np.median(torso[np.isfinite(torso) & (torso > 1e-3)]))
+    if not np.isfinite(scale) or scale <= 1e-3:
+        return 0.0
+    return float(np.clip(np.median(delta[paired]) / scale, 0.0, 1.0))
+
+
+def _lower_body_mean_score(poses: Sequence[np.ndarray]) -> float:
+    """Return the observed RTMPose confidence for hips, knees and ankles."""
+
+    if len(poses) == 0:
+        return 0.0
+    values = np.asarray(poses, dtype=np.float32)
+    if values.ndim != 3 or values.shape[1:] != (17, 3):
+        return 0.0
+    scores = values[:, [11, 12, 13, 14, 15, 16], 2]
+    finite = np.where(np.isfinite(scores), scores, 0.0)
+    return float(np.clip(np.mean(finite), 0.0, 1.0))
+
+
+def _longest_leg_gap_frames(poses: Sequence[np.ndarray]) -> int:
+    """Return the longest consecutive slot without sufficient leg evidence."""
+
+    longest = 0
+    current = 0
+    for pose in poses:
+        values = np.asarray(pose, dtype=np.float32)
+        visible = (
+            values.shape == (17, 3)
+            and np.isfinite(values[[11, 12, 13, 14, 15, 16], 2]).all()
+            and float(np.mean(values[[11, 12, 13, 14, 15, 16], 2] > 0.0)) >= 0.5
+        )
+        if visible:
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+    return longest
+
+
+def _camera_zone(box: Box, frame_shape: tuple[int, ...]) -> str:
+    """Return a calibration-free 3x3 image zone for prototype auditing."""
+
+    height, width = frame_shape[:2]
+    center_x = (float(box[0]) + float(box[2])) * 0.5 / max(float(width), 1.0)
+    center_y = (float(box[1]) + float(box[3])) * 0.5 / max(float(height), 1.0)
+    column = min(2, max(0, int(center_x * 3.0)))
+    row = min(2, max(0, int(center_y * 3.0)))
+    return f"r{row}c{column}"
+
+
+def _ground_point(
+    points: np.ndarray | None,
+    box: Box,
+    homography: tuple[float, ...] | None,
+) -> tuple[tuple[float, float] | None, str | None]:
+    """Project a ground-contact proxy without modifying pose model inputs."""
+
+    if homography is None:
+        return None, None
+    anchor: tuple[float, float]
+    source: str
+    if (
+        points is not None
+        and points.shape == (17, 3)
+        and np.isfinite(points[[15, 16]]).all()
+        and np.all(points[[15, 16], 2] > 0.0)
+    ):
+        ankles = points[[15, 16], :2]
+        anchor = (float(ankles[:, 0].mean()), float(ankles[:, 1].mean()))
+        source = "ankle_midpoint"
+    else:
+        anchor = ((float(box[0]) + float(box[2])) * 0.5, float(box[3]))
+        source = "bbox_bottom"
+    matrix = np.asarray(homography, dtype=np.float64).reshape(3, 3)
+    point = np.asarray([anchor[0], anchor[1], 1.0], dtype=np.float64)
+    projected = matrix @ point
+    if not np.isfinite(projected).all() or abs(float(projected[2])) <= 1e-8:
+        return None, None
+    return (
+        (float(projected[0] / projected[2]), float(projected[1] / projected[2])),
+        source,
+    )
+
+
+def _ground_speed(
+    points: Sequence[tuple[float, float] | None],
+    timestamps: Sequence[float],
+) -> float | None:
+    """Return the latest calibrated ground speed, or ``None`` without data."""
+
+    for index in range(len(points) - 1, 0, -1):
+        current, previous = points[index], points[index - 1]
+        if current is None or previous is None:
+            continue
+        elapsed = float(timestamps[index] - timestamps[index - 1])
+        if elapsed <= 1e-6:
+            continue
+        return float(np.linalg.norm(np.asarray(current) - np.asarray(previous)) / elapsed)
+    return None
+
+
+def _view_consensus(samples: Sequence[_CameraViewSample]) -> tuple[str | None, float]:
+    """Return the most frequent recent view and its observed share."""
+
+    labels = [item.view_angle for item in samples if item.view_angle is not None]
+    if not labels:
+        return None, 0.0
+    counts = {label: labels.count(label) for label in set(labels)}
+    latest_index = {
+        label: max(index for index, item in enumerate(labels) if item == label)
+        for label in counts
+    }
+    view = max(counts, key=lambda label: (counts[label], latest_index[label]))
+    return view, float(counts[view] / len(labels))
+
+
+def _world_trajectory(
+    points: Sequence[tuple[float, float] | None],
+    timestamps: Sequence[float],
+    *,
+    window_seconds: float,
+    maximum_speed_mps: float,
+) -> _WorldTrajectory:
+    """Fit a short ground trajectory after rejecting impossible track jumps."""
+
+    samples = [
+        (float(timestamp), np.asarray(point, dtype=np.float64))
+        for point, timestamp in zip(points, timestamps)
+        if point is not None
+        and np.isfinite(point).all()
+        and np.isfinite(timestamp)
+    ]
+    if not samples:
+        return _WorldTrajectory()
+    latest_time = samples[-1][0]
+    samples = [item for item in samples if item[0] >= latest_time - window_seconds]
+    accepted = [samples[0]]
+    outlier_count = 0
+    for timestamp, point in samples[1:]:
+        previous_time, previous_point = accepted[-1]
+        elapsed = timestamp - previous_time
+        if elapsed <= 1e-6:
+            outlier_count += 1
+            continue
+        if float(np.linalg.norm(point - previous_point) / elapsed) > maximum_speed_mps:
+            outlier_count += 1
+            continue
+        accepted.append((timestamp, point))
+    if len(accepted) < 2:
+        return _WorldTrajectory(
+            position=tuple(float(item) for item in accepted[-1][1]),
+            quality=0.0,
+            valid_samples=len(accepted),
+            outlier_count=outlier_count,
+        )
+    times = np.asarray([item[0] for item in accepted], dtype=np.float64)
+    values = np.asarray([item[1] for item in accepted], dtype=np.float64)
+    relative_times = times - times[0]
+    span = float(relative_times[-1])
+    if span <= 1e-6:
+        return _WorldTrajectory(
+            position=tuple(float(item) for item in values[-1]),
+            quality=0.0,
+            valid_samples=len(accepted),
+            outlier_count=outlier_count,
+        )
+    slopes = np.asarray(
+        [np.polyfit(relative_times, values[:, axis], 1)[0] for axis in range(2)],
+        dtype=np.float64,
+    )
+    fitted_start = np.asarray(
+        [np.polyfit(relative_times, values[:, axis], 1)[1] for axis in range(2)],
+        dtype=np.float64,
+    )
+    displacement_vector = slopes * span
+    displacement = float(np.linalg.norm(displacement_vector))
+    valid_fraction = len(accepted) / max(len(samples), 1)
+    return _WorldTrajectory(
+        position=tuple(float(item) for item in fitted_start + displacement_vector),
+        speed=float(np.linalg.norm(slopes)),
+        displacement=displacement,
+        direction_degrees=(
+            float(np.degrees(np.arctan2(displacement_vector[1], displacement_vector[0])))
+            if displacement > 1e-8
+            else None
+        ),
+        quality=float(np.clip(valid_fraction * min(1.0, span / window_seconds), 0.0, 1.0)),
+        valid_samples=len(accepted),
+        outlier_count=outlier_count,
+    )
+
+
 def _abrupt_track_jump(previous: Box, current: Box) -> bool:
     """检测过大的位移，判断其是否不可能属于同一轨迹的延续。"""
     previous_center = np.asarray(
@@ -884,7 +1264,10 @@ class ProductionVisionAdapter:
         "low_light_threshold",
     )
 
-    def __init__(self, config: ProductionVisionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ProductionVisionConfig | None = None,
+    ) -> None:
         """校验就绪状态，并准备延迟加载的模型槽位。"""
         self.config = config or ProductionVisionConfig()
         ready, issues = production_readiness(self.config, verify_hashes=True)
@@ -894,9 +1277,19 @@ class ProductionVisionAdapter:
         self.pose: _RtmposeEstimator | None = None
         self.appearance: _OsnetAppearanceExtractor | None = None
         self.gait: TemporalGaitEncoder | None = None
+        self.posec3d: PoseC3DActionClassifier | None = None
+        self.action_classifier = (
+            PoseActionClassifier.from_path(self.config.action_classifier_path)
+            if self.config.action_classifier_path is not None
+            else PoseActionClassifier(minimum_frames=self.config.minimum_pose_frames)
+        )
+        self._pose_buffer_length = int(self.config.gait_sequence_length)
+        self._action_router = ActionRouter()
         self.enhancer = _LowLightEnhancer(
             self.config.low_light_threshold,
             self.config.low_light_check_interval,
+            self.config.low_light_hysteresis,
+            self.config.low_light_min_hold_frames,
         )
         self.states: dict[int, _TrackState] = {}
         self.latest: dict[int, VisionTrack] = {}
@@ -930,12 +1323,15 @@ class ProductionVisionAdapter:
         self,
         on_stage: Callable[[str, float], None] | None = None,
     ) -> None:
-        """按 YOLO、RTMPose、OSNet、GaitGraph2 顺序加载模型。"""
+        """按 YOLO、RTMPose、OSNet、可选 PoseC3D、GaitGraph2 顺序加载模型。"""
 
+        posec3d_ready = (
+            self.config.posec3d_checkpoint_path is None or self.posec3d is not None
+        )
         if all(
             component is not None
             for component in (self.detector, self.pose, self.appearance, self.gait)
-        ):
+        ) and posec3d_ready:
             return
         try:
             self._notify_stage(on_stage, "正在加载 YOLO/ByteTrack…", 0.16)
@@ -959,7 +1355,23 @@ class ProductionVisionAdapter:
             )
             self._notify_stage(on_stage, "OSNet-AIN 已加载", 0.58)
 
-            self._notify_stage(on_stage, "正在加载 GaitGraph2…", 0.58)
+            if self.config.posec3d_checkpoint_path is not None:
+                self._notify_stage(on_stage, "正在加载 PoseC3D-HMDB51…", 0.58)
+                self.posec3d = PoseC3DActionClassifier(
+                    self.config.posec3d_checkpoint_path,
+                    self.config.posec3d_config_path,
+                    self.config.posec3d_label_map_path,
+                    device=self.config.torch_device,
+                    probability_threshold=self.config.posec3d_probability_threshold,
+                    margin_threshold=self.config.posec3d_margin_threshold,
+                )
+                self._notify_stage(on_stage, "PoseC3D-HMDB51 已加载", 0.62)
+
+            self._notify_stage(
+                on_stage,
+                "正在加载 GaitGraph2…",
+                0.62 if self.posec3d is not None else 0.58,
+            )
             self.gait = TemporalGaitEncoder(
                 self.config.gait_path,
                 device=self.config.torch_device,
@@ -982,13 +1394,14 @@ class ProductionVisionAdapter:
             self.pose = None
             self.appearance = None
             self.gait = None
+            self.posec3d = None
             raise
 
     def warmup(
         self,
         on_stage: Callable[[str, float], None] | None = None,
     ) -> None:
-        """对四个模型执行空白输入预热，不产生 Track 或身份样本。"""
+        """对身份模型和可选动作模型执行空白输入预热。"""
 
         self.preload(on_stage=on_stage)
         assert self.detector is not None
@@ -1008,7 +1421,16 @@ class ProductionVisionAdapter:
         self.appearance.warmup()
         self._notify_stage(on_stage, "OSNet-AIN 预热完成", 0.91)
 
-        self._notify_stage(on_stage, "正在预热 GaitGraph2…", 0.91)
+        if self.posec3d is not None:
+            self._notify_stage(on_stage, "正在预热 PoseC3D-HMDB51…", 0.91)
+            self.posec3d.warmup()
+            self._notify_stage(on_stage, "PoseC3D-HMDB51 预热完成", 0.94)
+
+        self._notify_stage(
+            on_stage,
+            "正在预热 GaitGraph2…",
+            0.94 if self.posec3d is not None else 0.91,
+        )
         self.gait.warmup()
         self._notify_stage(on_stage, "GaitGraph2 预热完成", 0.97)
 
@@ -1037,7 +1459,17 @@ class ProductionVisionAdapter:
             if pose_latency > 0
             else ""
         )
-        return f"YOLO/ByteTrack + RTMPose({pose_backend}{latency}) + OSNet-AIN + GaitGraph2"
+        posec3d_status = (
+            f"PoseC3D({self.posec3d.model_version}) + "
+            if self.posec3d is not None
+            else ""
+        )
+        return (
+            f"YOLO/ByteTrack + RTMPose({pose_backend}{latency}) + "
+            f"PoseActionClassifier({self.action_classifier.model_version}) + "
+            f"{posec3d_status}"
+            "OSNet-AIN + GaitGraph2"
+        )
 
     def diagnostics(self) -> dict[str, object]:
         """返回启动/运行诊断，明确 provider 列表不等于节点全在 GPU。"""
@@ -1057,6 +1489,40 @@ class ProductionVisionAdapter:
                 else 0.0
             ),
             "node_placement": "ORT graph partitioning; inspect profiling for per-node placement",
+            "action_classifier_model_version": self.action_classifier.model_version,
+            "action_classifier_feature_schema": "pose-action-kinematics-v1",
+            "posec3d_model_version": (
+                self.posec3d.model_version if self.posec3d is not None else None
+            ),
+            "posec3d_enabled": self.posec3d is not None,
+        }
+
+    def pose_snapshot(self, track_id: int) -> dict[str, object] | None:
+        """Return the latest real pose row for an emitted track.
+
+        The snapshot is intended for the annotation-to-training tool.  It is
+        read-only and copies arrays so a caller cannot mutate the live tracker
+        state.  A missing/expired track returns ``None`` instead of fabricating
+        a pose row.
+        """
+
+        state = self.states.get(int(track_id))
+        track = self.latest.get(int(track_id))
+        if state is None or track is None or not state.poses or not state.timestamps:
+            return None
+        pose = np.asarray(state.poses[-1], dtype=np.float32)
+        if pose.shape != (17, 3):
+            return None
+        return {
+            "keypoints_xy": pose[:, :2].copy(),
+            "keypoint_scores": pose[:, 2].copy(),
+            "valid_mask": (pose[:, 2] > 0.0).copy(),
+            "boxes_xyxy": np.asarray(track.box, dtype=np.float32),
+            "frame_index": int(self.frame_index),
+            "timestamp": float(state.timestamps[-1]),
+            "track_id": int(track.track_id),
+            "missing": bool(not np.any(pose[:, 2] > 0.0)),
+            "action_type": str(track.metadata.get("action_type", ActionType.UNKNOWN.value)),
         }
 
     def runtime_parameters(self) -> dict[str, int | float]:
@@ -1079,6 +1545,8 @@ class ProductionVisionAdapter:
             for name in ("keypoint_confidence", "minimum_pose_frames")
         )
         self.config = candidate
+        if self.action_classifier.model is None:
+            self.action_classifier.minimum_frames = int(candidate.minimum_pose_frames)
         if self.detector is not None:
             self.detector.config = candidate
         if any(
@@ -1208,6 +1676,8 @@ class ProductionVisionAdapter:
         state.real_boxes.clear()
         state.real_box_frames.clear()
         state.views.clear()
+        state.ground_points.clear()
+        state.camera_view_timeline.clear()
         state.valid_pose_frames = 0
         state.valid_leg_frames = 0
         state.frame_count = 0
@@ -1223,16 +1693,231 @@ class ProductionVisionAdapter:
         # embedding is audit context only; never carry it into new evidence.
         state.appearance = None
         state.last_appearance_frame = None
+        state.action_type = ActionType.UNKNOWN
+        state.action_branch_generation += 1
+        state.action_segment_id += 1
+        state.action_boundary_reason = "subtracklet_boundary"
+        state.action_candidate_type = None
+        state.action_candidate_frames = 0
+        state.action_unknown_frames = 0
+        state.posec3d_prediction = None
 
     @staticmethod
-    def _append_missing_slot(state: _TrackState, timestamp: float) -> None:
+    def _reset_action_window(state: _TrackState, *, reason: str) -> None:
+        """Keep only the boundary frame after a confirmed action change.
+
+        A gait encoder must not receive a window that straddles walking and a
+        different action.  The current frame is retained as the first sample
+        of the new branch; the following frames rebuild the minimum temporal
+        context.  We intentionally keep real detector boxes so ByteTrack's
+        motion anchor is not reset just because the action label changed.
+        """
+
+        current_pose = state.poses[-1].copy() if state.poses else None
+        current_timestamp = state.timestamps[-1] if state.timestamps else None
+        current_view = state.views[-1] if state.views else None
+        current_box = state.boxes[-1] if state.boxes else None
+        current_ground_point = state.ground_points[-1] if state.ground_points else None
+        current_camera_view = (
+            state.camera_view_timeline[-1] if state.camera_view_timeline else None
+        )
+        state.poses.clear()
+        state.timestamps.clear()
+        state.views.clear()
+        state.boxes.clear()
+        state.ground_points.clear()
+        state.camera_view_timeline.clear()
+        state.gait = None
+        state.last_gait_frame = None
+        state.posec3d_prediction = None
+        state.action_segment_id += 1
+        state.action_boundary_reason = reason
+        if current_pose is not None and current_timestamp is not None:
+            state.poses.append(current_pose)
+            state.timestamps.append(float(current_timestamp))
+            state.views.append(current_view)
+            state.ground_points.append(current_ground_point)
+            if current_camera_view is not None:
+                state.camera_view_timeline.append(current_camera_view)
+            state.valid_pose_frames = int(np.any(current_pose[:, 2] > 0.0))
+            state.valid_leg_frames = int(
+                np.mean(current_pose[[11, 12, 13, 14, 15, 16], 2] > 0.0) >= 0.45
+            )
+        else:
+            state.valid_pose_frames = 0
+            state.valid_leg_frames = 0
+        if current_box is not None:
+            state.boxes.append(current_box)
+
+    def _advance_action_state(
+        self,
+        state: _TrackState,
+        prediction: ActionPrediction,
+    ) -> bool:
+        """Commit only stable action changes and expose a fail-closed gate.
+
+        The raw classifier may flicker for a few frames.  During a candidate
+        transition no gait is emitted; a committed transition starts a fresh
+        action segment, so the fixed-length gait window cannot straddle two
+        actions.  This state belongs to the production adapter rather than to
+        the classifier because it must reset its pose/embedding caches.
+        """
+
+        is_strong = prediction.quality == ActionQuality.STRONG
+        if not is_strong or prediction.action_type == ActionType.UNKNOWN:
+            state.action_candidate_type = None
+            state.action_candidate_frames = 0
+            state.action_unknown_frames += 1
+            if (
+                state.action_type != ActionType.UNKNOWN
+                and len(state.poses) >= self.config.minimum_pose_frames
+                and state.action_unknown_frames >= self.config.action_unknown_end_frames
+            ):
+                state.action_type = ActionType.UNKNOWN
+                state.action_branch_generation += 1
+                self._reset_action_window(state, reason="sustained_unknown")
+            return False
+
+        state.action_unknown_frames = 0
+        if prediction.action_type == state.action_type:
+            state.action_candidate_type = None
+            state.action_candidate_frames = 0
+            return True
+
+        # The first strong action is produced from the classifier's own
+        # minimum complete window.  There is no preceding committed action to
+        # mix with, so preserve that evidence for startup latency while still
+        # assigning an explicit segment for downstream aggregation.
+        if state.action_type == ActionType.UNKNOWN:
+            state.action_type = prediction.action_type
+            state.action_branch_generation += 1
+            state.action_segment_id += 1
+            state.action_boundary_reason = "initial_action_confirmed"
+            state.action_candidate_type = None
+            state.action_candidate_frames = 0
+            return True
+
+        if prediction.action_type == state.action_candidate_type:
+            state.action_candidate_frames += 1
+        else:
+            state.action_candidate_type = prediction.action_type
+            state.action_candidate_frames = 1
+
+        # The first concrete action after an UNKNOWN warm-up still gets a
+        # clean temporal segment.  It has no write permission until enough
+        # subsequent samples rebuild that segment.
+        if state.action_candidate_frames < self.config.action_stability_frames:
+            return False
+
+        state.action_type = prediction.action_type
+        state.action_branch_generation += 1
+        state.action_candidate_type = None
+        state.action_candidate_frames = 0
+        self._reset_action_window(state, reason="stable_action_change")
+        return True
+
+    def _posec3d_prediction(
+        self,
+        state: _TrackState,
+        frame_shape: tuple[int, int],
+    ) -> PoseC3DPrediction | None:
+        """Return a cached or fresh PoseC3D result for the current track window."""
+
+        if self.posec3d is None:
+            return None
+        clip_length = self.config.posec3d_clip_length
+        if len(state.poses) < clip_length:
+            state.posec3d_prediction = None
+            return PoseC3DPrediction.invalid("posec3d_window_short")
+        window = np.asarray(tuple(state.poses)[-clip_length:], dtype=np.float32)
+        if (
+            window.shape != (clip_length, 17, 3)
+            or not np.isfinite(window).all()
+            or not np.any(window[:, :, 2] > 0.0, axis=1).all()
+        ):
+            state.posec3d_prediction = None
+            return PoseC3DPrediction.invalid("posec3d_window_invalid")
+        if (
+            state.posec3d_prediction is not None
+            and state.frame_count % self.config.posec3d_inference_stride != 0
+        ):
+            return state.posec3d_prediction
+        prediction = self.posec3d.predict(window, image_shape=frame_shape)
+        state.posec3d_prediction = prediction
+        return prediction
+
+    @staticmethod
+    def _fuse_action_predictions(
+        heuristic: ActionPrediction,
+        semantic: PoseC3DPrediction | None,
+        *,
+        probability_threshold: float,
+        margin_threshold: float,
+        model_version: str,
+    ) -> ActionPrediction:
+        """Fuse semantic and kinematic evidence without creating a soft fallback."""
+
+        if semantic is None:
+            return heuristic
+        semantic_ok = bool(
+            semantic.reason == "ok"
+            and semantic.top_label == "walk"
+            and semantic.walk_probability >= probability_threshold
+            and semantic.margin >= margin_threshold
+        )
+        if (
+            not semantic_ok
+            or heuristic.action_type != ActionType.WALK
+            or heuristic.quality != ActionQuality.STRONG
+        ):
+            quality = (
+                ActionQuality.PARTIAL
+                if heuristic.quality != ActionQuality.INVALID
+                else ActionQuality.INVALID
+            )
+            return ActionPrediction(
+                ActionType.UNKNOWN,
+                confidence=0.0,
+                quality=quality,
+                completion=heuristic.completion,
+                source="posec3d_hmdb51+pose_heuristic",
+                model_version=model_version,
+            )
+        return ActionPrediction(
+            ActionType.WALK,
+            confidence=min(heuristic.confidence, semantic.walk_probability),
+            quality=ActionQuality.STRONG,
+            completion=heuristic.completion,
+            source="posec3d_hmdb51+pose_heuristic",
+            model_version=model_version,
+        )
+
+    @staticmethod
+    def _append_missing_slot(
+        state: _TrackState,
+        timestamp: float,
+        frame_index: int,
+    ) -> None:
         """在短暂漏检期间保留一个带掩码的时间槽。"""
 
         if state.last_seen_timestamp is not None and timestamp <= state.last_seen_timestamp:
             return
         state.poses.append(np.zeros((17, 3), dtype=np.float32))
         state.timestamps.append(float(timestamp))
+        state.posec3d_prediction = None
         state.views.append(None)
+        state.ground_points.append(None)
+        state.camera_view_timeline.append(
+            _CameraViewSample(
+                frame_index=int(frame_index),
+                timestamp=float(timestamp),
+                view_angle=None,
+                camera_zone=None,
+                world_position=None,
+                ground_anchor_source=None,
+                missing=True,
+            )
+        )
         state.valid_pose_frames = sum(
             bool(np.any(item[:, 2] > 0.0)) for item in state.poses
         )
@@ -1293,7 +1978,7 @@ class ProductionVisionAdapter:
         active_detection_ids = {item.track_id for item in detections}
         for track_id, state in tuple(self.states.items()):
             if track_id not in active_detection_ids:
-                self._append_missing_slot(state, timestamp)
+                self._append_missing_slot(state, timestamp, self.frame_index)
         if not detections:
             self._expire_states(set(), timestamp=timestamp)
             self._record_frame_latency(started)
@@ -1309,16 +1994,28 @@ class ProductionVisionAdapter:
         overlaps = occlusion_scores(np.asarray(boxes, dtype=np.float32))
 
         frame_metrics: list[
-            tuple[np.ndarray | None, float, float, float, float]
+            tuple[
+                np.ndarray | None,
+                float,
+                float,
+                float,
+                float,
+                ActionPrediction,
+                PoseC3DPrediction | None,
+                bool,
+                str,
+            ]
         ] = []
         gait_indexes: list[int] = []
         for index, detection in enumerate(detections):
             state = self.states.get(detection.track_id)
             if state is None:
                 state = _TrackState(
-                    poses=deque(maxlen=self.config.gait_sequence_length),
-                    timestamps=deque(maxlen=self.config.gait_sequence_length),
-                    views=deque(maxlen=self.config.gait_sequence_length),
+                    poses=deque(maxlen=self._pose_buffer_length),
+                    timestamps=deque(maxlen=self._pose_buffer_length),
+                    views=deque(maxlen=self._pose_buffer_length),
+                    ground_points=deque(maxlen=self._pose_buffer_length),
+                    camera_view_timeline=deque(maxlen=self._pose_buffer_length),
                     segment_start_frame=self.frame_index,
                 )
                 self.states[detection.track_id] = state
@@ -1372,7 +2069,24 @@ class ProductionVisionAdapter:
                 else np.zeros((17, 3), dtype=np.float32)
             )
             state.timestamps.append(float(timestamp))
-            state.views.append(_view_angle(canonical))
+            frame_view_angle = _view_angle(canonical)
+            ground_point, ground_anchor_source = _ground_point(
+                canonical,
+                detection.box,
+                self.config.ground_homography,
+            )
+            state.views.append(frame_view_angle)
+            state.ground_points.append(ground_point)
+            state.camera_view_timeline.append(
+                _CameraViewSample(
+                    frame_index=self.frame_index,
+                    timestamp=float(timestamp),
+                    view_angle=frame_view_angle,
+                    camera_zone=_camera_zone(detection.box, frame_bgr.shape),
+                    world_position=ground_point,
+                    ground_anchor_source=ground_anchor_source,
+                )
+            )
             state.valid_pose_frames = sum(
                 bool(np.any(item[:, 2] > 0.0)) for item in state.poses
             )
@@ -1387,6 +2101,49 @@ class ProductionVisionAdapter:
                 detection.box,
                 state.timestamps,
             )
+            heuristic_prediction = self.action_classifier.predict(
+                tuple(state.poses),
+                state.timestamps,
+                walking_ratio=walking_ratio,
+                gait_cycles=gait_cycles,
+            )
+            semantic_prediction = self._posec3d_prediction(
+                state,
+                frame_bgr.shape[:2],
+            )
+            action_prediction = self._fuse_action_predictions(
+                heuristic_prediction,
+                semantic_prediction,
+                probability_threshold=self.config.posec3d_probability_threshold,
+                margin_threshold=self.config.posec3d_margin_threshold,
+                model_version=(
+                    self.posec3d.model_version
+                    if self.posec3d is not None
+                    else heuristic_prediction.model_version
+                ),
+            )
+            action_stable = self._advance_action_state(state, action_prediction)
+            walk_authorized = bool(
+                action_stable
+                and state.action_type == ActionType.WALK
+                and self._action_router.allows_walk(action_prediction)
+            )
+            if walk_authorized:
+                gait_gate_reason = "walk_authorized"
+            elif not action_stable:
+                gait_gate_reason = "action_transition_pending"
+            elif state.action_type != ActionType.WALK:
+                gait_gate_reason = "stable_action_not_walk"
+            elif not self._action_router.allows_walk(action_prediction):
+                gait_gate_reason = self._action_router.quarantine_reason(
+                    action_prediction
+                )
+            if not walk_authorized:
+                # A candidate, degraded, partial or unknown action cannot
+                # keep an older gait vector alive as if the current window
+                # were still a complete WALK segment.
+                state.gait = None
+                state.last_gait_frame = None
             gait_due = (
                 state.gait is None
                 or state.last_gait_frame is None
@@ -1402,7 +2159,11 @@ class ProductionVisionAdapter:
             )
             if (
                 state.valid_pose_frames >= self.config.minimum_pose_frames
-                and gait_cycles >= 0.5
+                # A complete cycle is required before GaitGraph2 sees the
+                # current action segment; half-cycle fixed windows are too
+                # easy to contaminate during entrance/exit transitions.
+                and gait_cycles >= 1.0
+                and walk_authorized
                 and gait_due
                 and (
                     first_gait
@@ -1412,7 +2173,17 @@ class ProductionVisionAdapter:
             ):
                 gait_indexes.append(index)
             frame_metrics.append(
-                (canonical, visibility, leg_visibility, walking_ratio, gait_cycles)
+                (
+                    canonical,
+                    visibility,
+                    leg_visibility,
+                    walking_ratio,
+                    gait_cycles,
+                    action_prediction,
+                    semantic_prediction,
+                    walk_authorized,
+                    gait_gate_reason,
+                )
             )
 
         if gait_indexes:
@@ -1498,7 +2269,17 @@ class ProductionVisionAdapter:
         frame_height, frame_width = frame_bgr.shape[:2]
         for index, detection in enumerate(detections):
             state = self.states[detection.track_id]
-            canonical, visibility, leg_visibility, walking_ratio, gait_cycles = (
+            (
+                canonical,
+                visibility,
+                leg_visibility,
+                walking_ratio,
+                gait_cycles,
+                action_prediction,
+                semantic_prediction,
+                walk_authorized,
+                gait_gate_reason,
+            ) = (
                 frame_metrics[index]
             )
             x1, y1, x2, y2 = detection.box
@@ -1545,6 +2326,20 @@ class ProductionVisionAdapter:
             # 被图像边界裁剪时，不要让该缓存嵌入成为强证据。
             if not box_valid:
                 gait_quality = 0.0
+            lower_body_mean_score = _lower_body_mean_score(state.poses)
+            longest_leg_gap_frames = _longest_leg_gap_frames(state.poses)
+            track_gap_ratio = float(
+                np.clip(
+                    (state.detector_gap_frames + state.track_gap_frames)
+                    / max(len(state.poses), 1),
+                    0.0,
+                    1.0,
+                )
+            )
+            pose_jitter = _pose_jitter(state.poses)
+            stable_view_angle, view_angle_confidence = _view_consensus(
+                state.camera_view_timeline
+            )
             quality = TrackQuality(
                 detection_confidence=detection.confidence,
                 box_height=float(y2 - y1),
@@ -1567,12 +2362,22 @@ class ProductionVisionAdapter:
                     if len(state.timestamps) >= 2
                     else 0.0
                 ),
+                lower_body_mean_score=lower_body_mean_score,
+                longest_leg_gap_frames=longest_leg_gap_frames,
+                track_gap_ratio=track_gap_ratio,
+                pose_jitter=pose_jitter,
                 gait_cycles=gait_cycles,
                 walking_ratio=walking_ratio,
-                view_angle=_view_angle(canonical),
+                view_angle=stable_view_angle,
                 reasons=tuple(reasons),
             )
             window_frame_count = len(state.poses)
+            world_trajectory = _world_trajectory(
+                state.ground_points,
+                state.timestamps,
+                window_seconds=self.config.ground_trajectory_window_seconds,
+                maximum_speed_mps=self.config.ground_max_speed_mps,
+            )
             segment = CleanSubTracklet(
                 source_track_id=detection.track_id,
                 segment_id=state.segment_id,
@@ -1595,13 +2400,6 @@ class ProductionVisionAdapter:
                     sorted({view for view in state.views if view is not None})
                 ),
             )
-            action_prediction = conservative_walk_prediction(
-                walking_ratio=walking_ratio,
-                gait_cycles=gait_cycles,
-                valid_pose_frames=state.valid_pose_frames,
-                valid_leg_frames=state.valid_leg_frames,
-                minimum_frames=self.config.minimum_pose_frames,
-            )
             track = VisionTrack(
                 track_id=detection.track_id,
                 box=detection.box,
@@ -1612,6 +2410,7 @@ class ProductionVisionAdapter:
                 ),
                 quality=quality,
                 clean_subtracklet=segment,
+                pose_keypoints=(canonical.copy() if canonical is not None else None),
                 metadata={
                     "action_type": action_prediction.action_type.value,
                     "action_confidence": action_prediction.confidence,
@@ -1619,6 +2418,87 @@ class ProductionVisionAdapter:
                     "action_completion": action_prediction.completion,
                     "action_source": action_prediction.source,
                     "action_model_version": action_prediction.model_version,
+                    "action_semantic_label": (
+                        semantic_prediction.top_label
+                        if semantic_prediction is not None
+                        else None
+                    ),
+                    "action_semantic_index": (
+                        semantic_prediction.top_index
+                        if semantic_prediction is not None
+                        else None
+                    ),
+                    "action_semantic_probability": (
+                        semantic_prediction.walk_probability
+                        if semantic_prediction is not None
+                        else None
+                    ),
+                    "action_semantic_margin": (
+                        semantic_prediction.margin
+                        if semantic_prediction is not None
+                        else None
+                    ),
+                    "action_semantic_reason": (
+                        semantic_prediction.reason
+                        if semantic_prediction is not None
+                        else None
+                    ),
+                    "action_gait_authorized": walk_authorized,
+                    "action_gait_gate_reason": gait_gate_reason,
+                    "action_branch_id": (
+                        f"gait_{action_prediction.action_type.value.lower()}"
+                        if action_prediction.action_type != ActionType.UNKNOWN
+                        else "unknown"
+                    ),
+                    "action_branch_generation": state.action_branch_generation,
+                    "action_segment_id": state.action_segment_id,
+                    "action_boundary_reason": state.action_boundary_reason,
+                    "action_stable_type": state.action_type.value,
+                    "action_transition_pending": state.action_candidate_type is not None,
+                    "action_candidate_type": (
+                        state.action_candidate_type.value
+                        if state.action_candidate_type is not None
+                        else None
+                    ),
+                    "action_candidate_frames": state.action_candidate_frames,
+                    "action_unknown_frames": state.action_unknown_frames,
+                    # These values are audit/conditioning metadata.  They do
+                    # not change GaitGraph2's image-coordinate input.
+                    "camera_zone": _camera_zone(detection.box, frame_bgr.shape),
+                    "frame_index": self.frame_index,
+                    "frame_timestamp": float(timestamp),
+                    "view_angle_raw": frame_view_angle,
+                    "view_angle_confidence": view_angle_confidence,
+                    "camera_view_timeline": tuple(
+                        {
+                            "frame_index": sample.frame_index,
+                            "timestamp": sample.timestamp,
+                            "view_angle": sample.view_angle,
+                            "camera_zone": sample.camera_zone,
+                            "world_position": sample.world_position,
+                            "ground_anchor_source": sample.ground_anchor_source,
+                            "missing": sample.missing,
+                        }
+                        for sample in state.camera_view_timeline
+                    ),
+                    "pose_jitter": pose_jitter,
+                    "gait_lower_body_mean_score": lower_body_mean_score,
+                    "gait_longest_leg_gap_frames": longest_leg_gap_frames,
+                    "gait_track_gap_ratio": track_gap_ratio,
+                    "world_position": world_trajectory.position,
+                    "ground_speed": world_trajectory.speed,
+                    "world_displacement": world_trajectory.displacement,
+                    "world_direction_degrees": world_trajectory.direction_degrees,
+                    "ground_trajectory_quality": world_trajectory.quality,
+                    "ground_valid_samples": world_trajectory.valid_samples,
+                    "ground_outlier_count": world_trajectory.outlier_count,
+                    "ground_calibration_id": self.config.ground_calibration_id,
+                    "ground_coordinate_frame": self.config.ground_coordinate_frame,
+                    "ground_coordinate_aligned": bool(
+                        self.config.ground_homography is not None
+                        and self.config.ground_coordinate_frame is not None
+                    ),
+                    "ground_calibrated": self.config.ground_homography is not None,
                     "appearance_similarity_to_previous": (
                         state.appearance_similarity_to_previous
                     ),

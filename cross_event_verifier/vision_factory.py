@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from .vision import OpenCvDemoAdapter, VisionAdapter
@@ -17,8 +18,13 @@ def build_vision_adapter(
     *,
     preload: bool = False,
     on_stage: Callable[[str, float], None] | None = None,
+    action_classifier_path: Path | None = None,
+    posec3d_checkpoint_path: Path | None = None,
+    ground_homography: tuple[float, ...] | None = None,
+    ground_calibration_id: str | None = None,
+    ground_coordinate_frame: str | None = None,
 ) -> VisionAdapter:
-    """构造请求的后端，并可选执行分阶段模型加载与 Dummy warmup。"""
+    """构造请求的后端，并按请求执行 warmup。"""
 
     def notify(text: str, progress: float) -> None:
         if on_stage is not None:
@@ -33,15 +39,23 @@ def build_vision_adapter(
 
     from .production_vision import (
         ProductionVisionAdapter,
+        ProductionVisionConfig,
         ProductionVisionError,
         production_readiness,
     )
 
     notify("正在检查运行环境与模型资产…", 0.04)
-    ready, issues = production_readiness()
+    config = ProductionVisionConfig(
+        action_classifier_path=action_classifier_path,
+        posec3d_checkpoint_path=posec3d_checkpoint_path,
+        ground_homography=ground_homography,
+        ground_calibration_id=ground_calibration_id,
+        ground_coordinate_frame=ground_coordinate_frame,
+    )
+    ready, issues = production_readiness(config)
     if ready:
         notify("正在校验模型清单与运行协议…", 0.08)
-        adapter = ProductionVisionAdapter()
+        adapter = ProductionVisionAdapter(config)
         if preload:
             adapter.preload(on_stage=on_stage)
             adapter.warmup(on_stage=on_stage)

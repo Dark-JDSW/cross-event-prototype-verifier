@@ -1,0 +1,70 @@
+{
+  "schema_version": "cross-event-rgb-gait-v1",
+  "minimum_distinct_identities": 60,
+  "strict_operational_identity_buckets": {
+    "train-dev": 40,
+    "calibration-known": 10,
+    "calibration-unknown": 10,
+    "locked-test-known": 10,
+    "locked-test-unknown": 10
+  },
+  "minimums_per_identity": {
+    "independent_sessions": 4,
+    "distinct_capture_periods": 2,
+    "clothing_conditions": 2,
+    "view_conditions": 3,
+    "walking_events": 12
+  },
+  "minimum_total_walking_events": 720,
+  "minimum_condition_coverage": {
+    "challenge_or_occlusion_event_fraction": 0.2,
+    "adverse_light_or_quality_event_fraction": 0.2
+  },
+  "unknown_search_targets": {
+    "fpir_0_001": 3000,
+    "fpir_0_0001": 30000,
+    "independence_unit": "identity_session_search_cluster"
+  },
+  "required_event_fields": [
+    "event_id",
+    "identity_id",
+    "capture_session_id",
+    "camera_id",
+    "source_video_id",
+    "video_path",
+    "video_sha256",
+    "fps",
+    "frame_count",
+    "frame_start",
+    "frame_end",
+    "capture_period",
+    "clothing_condition_id",
+    "load_condition",
+    "view_conditions",
+    "walking_direction",
+    "split",
+    "consent_id",
+    "source_track_key",
+    "tracks_path",
+    "poses_dir"
+  ],
+  "required_pose_arrays": {
+    "keypoints_xy": "[T,17,2] float32 original-image pixel coordinates",
+    "keypoint_scores": "[T,17] float32 RTMPose confidence",
+    "valid_mask": "[T,17] bool",
+    "boxes_xyxy": "[T,4] float32 detector boxes",
+    "frame_indices": "[T] int64 original frame indices",
+    "timestamp": "[T] float64 source timestamps",
+    "track_id": "[T] int64 or string source track ID",
+    "missing_mask": "[T] bool explicit missing-frame mask"
+  },
+  "quality_gates": {
+    "event_metadata_completeness": 0.99,
+    "video_track_reference_consistency": 1.0,
+    "finite_pose_box_timestamp_rate": 1.0,
+    "manual_review_pass_rate": 0.98,
+    "minimum_pose_window_pass_rate": 0.95,
+    "interpolated_frames_count_as_real_frames": false,
+    "continuous_window_is_independent_event": false
+  }
+}

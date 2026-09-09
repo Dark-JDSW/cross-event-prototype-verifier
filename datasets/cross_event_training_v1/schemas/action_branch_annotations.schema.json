@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cross-event-action-branch-v3/action_branch_annotations.schema.json",
+  "title": "Human-confirmed action, walking-view, and walking-direction annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "annotation_key",
+    "source_video_id",
+    "source_video_path",
+    "track_id",
+    "action_label",
+    "gait_branch_id",
+    "start_frame",
+    "end_frame",
+    "action_confidence",
+    "annotation_status"
+  ],
+  "properties": {
+    "schema_version": {"enum": ["mevid-action-branch-v1", "mevid-action-branch-v2", "mevid-action-branch-v3"]},
+    "annotation_key": {"type": "string", "minLength": 1},
+    "source_video_id": {"type": "string", "minLength": 1},
+    "source_video_path": {"type": "string", "minLength": 1},
+    "track_id": {"type": "integer", "minimum": 0},
+    "action_label": {
+      "type": "string",
+      "enum": [
+        "walking",
+        "running",
+        "carrying",
+        "pushing_pulling",
+        "standing",
+        "sitting",
+        "other",
+        "unknown"
+      ]
+    },
+    "walking_view": {
+      "type": "string",
+      "enum": ["side", "oblique", "front", "back", "transition", "unknown"]
+    },
+    "walking_direction": {
+      "type": "string",
+      "enum": ["left_to_right", "right_to_left", "approaching", "leaving", "transition", "unknown"]
+    },
+    "gait_branch_id": {"type": "string", "pattern": "^(gait_[a-z_]+|unknown)$"},
+    "start_frame": {"type": "integer", "minimum": 0},
+    "end_frame": {"type": "integer", "minimum": 0},
+    "action_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    "annotation_status": {
+      "type": "string",
+      "enum": ["human_confirmed", "isolated_unknown"]
+    },
+    "annotation_note": {"type": "string"},
+    "source_frame_stride": {"type": "integer", "minimum": 1},
+    "source_image_size": {"type": "integer", "minimum": 320},
+    "source_fps": {"type": "number", "exclusiveMinimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "mevid-action-branch-v2"}}},
+      "then": {"required": ["walking_view"]}
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "mevid-action-branch-v3"}}},
+      "then": {"required": ["walking_view", "walking_direction"]}
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 """动作类型、质量和路由契约。
 
-V1 只负责把动作证据和现有 WALK/GaitGraph2 分支隔离开。动作分类器本身可以
-在适配器或离线模型中实现，但下游不应再依赖未版本化的字符串或把低置信度
-动作当成 WALK。没有动作预测时保留旧 API 的兼容行为；一旦调用方显式提供
-动作结果，路由器就采用保守的显式门控。
+本模块定义动作证据和现有 WALK/GaitGraph2 分支的边界。具体分类器位于
+``action_classifier``，但下游不应再依赖未版本化的字符串或把低置信度动作
+当成 WALK。没有动作预测时保留旧 API 的兼容行为；一旦调用方显式提供动作
+结果，路由器就采用保守的显式门控。
 """
 
 from __future__ import annotations
@@ -19,8 +19,17 @@ class ActionType(str, Enum):
     """当前规划支持的动作类型。"""
 
     WALK = "WALK"
+    RUNNING = "RUNNING"
+    CARRYING = "CARRYING"
+    PUSHING_PULLING = "PUSHING_PULLING"
+    STANDING = "STANDING"
+    SITTING = "SITTING"
     SQUAT = "SQUAT"
     SIT_STAND = "SIT_STAND"
+    SIT_DOWN = "SIT_DOWN"
+    STAND_UP = "STAND_UP"
+    HAND_UP = "HAND_UP"
+    WAVE = "WAVE"
     OTHER = "OTHER"
     UNKNOWN = "UNKNOWN"
 
@@ -33,6 +42,12 @@ class ActionType(str, Enum):
         normalized = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
         aliases = {
             "WALKING": cls.WALK,
+            "RUN": cls.RUNNING,
+            "CARRY": cls.CARRYING,
+            "PUSHING": cls.PUSHING_PULLING,
+            "PULLING": cls.PUSHING_PULLING,
+            "STAND": cls.STANDING,
+            "SIT": cls.SITTING,
             "SITSTAND": cls.SIT_STAND,
             "SIT_TO_STAND": cls.SIT_STAND,
             "STAND_TO_SIT": cls.SIT_STAND,
@@ -40,6 +55,18 @@ class ActionType(str, Enum):
             "": cls.UNKNOWN,
         }
         return aliases.get(normalized, cls._value2member_map_.get(normalized, cls.UNKNOWN))
+
+
+# Actions that an operator may explicitly trigger for a currently detected
+# target. This is intentionally narrower than ``ActionType``: locomotion and
+# diagnostic labels must never become direct device commands from the GUI.
+MANUAL_ACTION_TYPES: tuple[ActionType, ...] = (
+    ActionType.SQUAT,
+    ActionType.SIT_DOWN,
+    ActionType.STAND_UP,
+    ActionType.HAND_UP,
+    ActionType.WAVE,
+)
 
 
 class ActionQuality(str, Enum):
@@ -227,5 +254,6 @@ __all__ = [
     "ActionQuality",
     "ActionRouter",
     "ActionType",
+    "MANUAL_ACTION_TYPES",
     "conservative_walk_prediction",
 ]

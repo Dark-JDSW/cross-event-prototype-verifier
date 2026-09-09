@@ -29,3 +29,9 @@ models/*.engine
 /MAN.mp4
 /P1.mp4
 /P2.mp4
+/archive/
+
+# ESP-IDF generates a local target configuration next to the standalone
+# firmware project; keep it out of the Python repository.
+/firmware/esp32s3_ble/sdkconfig
+/firmware/esp32s3_ble/sdkconfig.old

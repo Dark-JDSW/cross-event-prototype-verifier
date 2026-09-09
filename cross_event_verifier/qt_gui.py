@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import os
 import queue
 import sys
 import threading
@@ -20,6 +21,14 @@ import cv2
 
 from .automation import AutomationPolicy
 from .engine import CrossEventVerifier
+from .ground_control import (
+    GroundControlPoint,
+    HomographyCheck,
+    compute_ground_homography,
+    load_ground_control_file,
+    parse_ground_control_point,
+    save_ground_control_file,
+)
 from .gui_theme import (
     ENGINEERING_GRID_MAJOR,
     ENGINEERING_GRID_MINOR,
@@ -49,11 +58,16 @@ from .media import (
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterSpec, RuntimeParameterState
 from .storage import SqliteStore
+from .transports import (
+    action_publisher_from_environment,
+    normalize_transport_mode,
+    transport_label,
+)
 from .vision_factory import build_vision_adapter
 
 
 try:  # Keep the import failure local to the optional Qt adapter.
-    from PyQt6.QtCore import QLineF, QTimer, Qt, QRectF
+    from PyQt6.QtCore import QLineF, QTimer, Qt, QRectF, pyqtSignal
     from PyQt6.QtGui import (
         QColor,
         QFont,
@@ -68,6 +82,7 @@ try:  # Keep the import failure local to the optional Qt adapter.
         QAbstractItemView,
         QApplication,
         QCheckBox,
+        QComboBox,
         QFileDialog,
         QFrame,
         QGridLayout,
@@ -96,6 +111,9 @@ except ImportError as error:  # pragma: no cover - exercised by dependency check
         "PyQt6 is required for the Qt GUI. Install the optional GUI dependency "
         "with `pip install -e .[gui-qt]`."
     ) from error
+
+
+from .actions import ActionType, MANUAL_ACTION_TYPES
 
 
 GUI_POLL_INTERVAL_MS = 16
@@ -626,6 +644,96 @@ class StandbyWidget(QWidget):
         painter.end()
 
 
+class GcpCanvas(QLabel):
+    """用现有任务画布承载固定画面和可点击的地面控制点。"""
+
+    point_clicked = pyqtSignal(float, float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._source_pixmap: QPixmap | None = None
+        self._source_size = (0, 0)
+        self._points: tuple[GroundControlPoint, ...] = ()
+        self._display_rect = QRectF()
+        self.setMinimumSize(320, 240)
+
+    def set_frame(self, frame: object) -> None:
+        if not hasattr(frame, "shape"):
+            raise ValueError("标定画面必须是 OpenCV 图像")
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = QImage(
+            rgb.data,
+            width,
+            height,
+            int(rgb.strides[0]),
+            QImage.Format.Format_RGB888,
+        ).copy()
+        self._source_pixmap = QPixmap.fromImage(image)
+        self._source_size = (int(width), int(height))
+        self.update()
+
+    def set_points(self, points: tuple[GroundControlPoint, ...]) -> None:
+        self._points = points
+        self.update()
+
+    def display_size(self) -> tuple[int, int] | None:
+        if self._source_size == (0, 0):
+            return None
+        return self._source_size
+
+    def _fit_rect(self) -> QRectF:
+        if self._source_pixmap is None:
+            return QRectF()
+        source_width, source_height = self._source_size
+        scale = min(
+            self.width() / max(source_width, 1),
+            self.height() / max(source_height, 1),
+            1.0,
+        )
+        width = source_width * scale
+        height = source_height * scale
+        return QRectF((self.width() - width) / 2.0, (self.height() - height) / 2.0, width, height)
+
+    def paintEvent(self, event: Any) -> None:  # pragma: no cover - visual drawing
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(PANEL_CREAM))
+        self._display_rect = self._fit_rect()
+        if self._source_pixmap is None:
+            painter.setPen(QPen(QColor(INDUSTRIAL_NAVY), 1))
+            painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "加载固定机位画面后，在此标记地面控制点")
+            painter.end()
+            return
+        painter.drawPixmap(self._display_rect, self._source_pixmap, QRectF(self._source_pixmap.rect()))
+        source_width, source_height = self._source_size
+        scale_x = self._display_rect.width() / max(source_width, 1)
+        scale_y = self._display_rect.height() / max(source_height, 1)
+        for point in self._points:
+            x = self._display_rect.left() + point.image_u * scale_x
+            y = self._display_rect.top() + point.image_v * scale_y
+            painter.setPen(QPen(QColor(RETRO_ORANGE), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(x - 5, y - 5, 10, 10))
+            painter.setPen(QPen(QColor(INDUSTRIAL_NAVY), 1))
+            painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+            painter.drawText(QRectF(x + 8, y - 16, 80, 20), point.point_id)
+        painter.end()
+
+    def mousePressEvent(self, event: Any) -> None:  # pragma: no cover - native UI event
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or self._source_size == (0, 0)
+            or not self._display_rect.contains(event.position())
+        ):
+            return
+        source_width, source_height = self._source_size
+        u = (event.position().x() - self._display_rect.left()) * source_width / max(self._display_rect.width(), 1.0)
+        v = (event.position().y() - self._display_rect.top()) * source_height / max(self._display_rect.height(), 1.0)
+        self.point_clicked.emit(float(u), float(v))
+
+
 class VerifierWindow(QMainWindow):
     """Qt presentation adapter over the existing worker and verification pipeline."""
 
@@ -633,6 +741,8 @@ class VerifierWindow(QMainWindow):
         self,
         database_path: str = "data/verifier-production-v1.sqlite3",
         vision_backend: str = "production",
+        action_classifier_path: Path | None = None,
+        posec3d_checkpoint_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Cross-event Prototype Verifier")
@@ -649,6 +759,14 @@ class VerifierWindow(QMainWindow):
         self.worker: FrameWorker | None = None
         self._photo: QPixmap | None = None
         self._last_frame: object | None = None
+        self.action_classifier_path = (
+            Path(action_classifier_path) if action_classifier_path is not None else None
+        )
+        self.posec3d_checkpoint_path = (
+            Path(posec3d_checkpoint_path)
+            if posec3d_checkpoint_path is not None
+            else None
+        )
         self._parameter_syncing = False
         self._runtime_parameter_state: RuntimeParameterState | None = None
         self.parameter_vars: dict[str, QLineEdit] = {}
@@ -657,6 +775,31 @@ class VerifierWindow(QMainWindow):
         self.parameter_specs: dict[str, RuntimeParameterSpec] = {}
         self._scale_steps: dict[str, int] = {}
         self._table_rows: dict[str, int] = {}
+        self.gcp_camera_id = QLineEdit("camera-1")
+        self.gcp_coordinate_frame = QLineEdit("ground-meters")
+        self.gcp_unit = QLineEdit("m")
+        self.gcp_point_id = QLineEdit("P1")
+        self.gcp_image_u = QLineEdit()
+        self.gcp_image_v = QLineEdit()
+        self.gcp_world_x = QLineEdit()
+        self.gcp_world_y = QLineEdit()
+        self.gcp_status: QLabel | None = None
+        self.gcp_matrix: QLabel | None = None
+        self.gcp_rows: dict[str, GroundControlPoint] = {}
+        self.gcp_check: HomographyCheck | None = None
+        self.gcp_image_size_value: tuple[int, int] | None = None
+        raw_transport = os.getenv("CROSS_EVENT_TRANSPORT", "mqtt").strip()
+        try:
+            transport = normalize_transport_mode(raw_transport).value
+        except ValueError:
+            transport = "mqtt"
+        self.transport_mode = transport_label(transport)
+        self._active_transport_mode: str | None = None
+        self.transport_status: QLabel | None = None
+        self.manual_action_target = ""
+        self.manual_action_type = MANUAL_ACTION_TYPES[0].value
+        self._manual_action_targets: dict[str, int] = {}
+        self._manual_action_syncing = False
 
         database = Path(database_path)
         if str(database) != ":memory:":
@@ -667,7 +810,11 @@ class VerifierWindow(QMainWindow):
         self._message_timer.timeout.connect(self._poll_messages)
         selected = vision_backend.strip().lower()
         if selected == "demo":
-            self.vision = build_vision_adapter(vision_backend)
+            self.vision = build_vision_adapter(
+                vision_backend,
+                action_classifier_path=self.action_classifier_path,
+                posec3d_checkpoint_path=self.posec3d_checkpoint_path,
+            )
             self._finish_runtime_initialization()
         else:
             self._preload_timer = QTimer(self)
@@ -675,7 +822,11 @@ class VerifierWindow(QMainWindow):
             self._preload_timer.start(50)
             self._preload_thread = threading.Thread(
                 target=self._preload_backend,
-                args=(vision_backend,),
+                args=(
+                    vision_backend,
+                    self.action_classifier_path,
+                    self.posec3d_checkpoint_path,
+                ),
                 name="cross-event-model-preload",
                 daemon=True,
             )
@@ -753,7 +904,18 @@ class VerifierWindow(QMainWindow):
         module_marker = _named(QLabel("MODULE / 01  ·  INPUT ARRAY"), "moduleMarker")
         self.backend_status = _named(QLabel("视觉后端：正在后台准备…"), "mutedLabel")
         controls_layout.addWidget(module_marker, 1, 0, 1, 3)
-        controls_layout.addWidget(self.backend_status, 1, 3, 1, 9)
+        controls_layout.addWidget(self.backend_status, 1, 3, 1, 5)
+        controls_layout.addWidget(QLabel("事件传输"), 1, 8)
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItems(("MQTT", "BLE Light"))
+        self.transport_combo.setCurrentText(self.transport_mode)
+        self.transport_combo.setMaximumWidth(110)
+        self.transport_combo.currentTextChanged.connect(self._transport_mode_changed)
+        controls_layout.addWidget(self.transport_combo, 1, 9)
+        self.transport_status = _named(
+            QLabel(f"{self.transport_mode}：未配置"), "mutedLabel"
+        )
+        controls_layout.addWidget(self.transport_status, 1, 10, 1, 2)
         self.preload_phase = _named(QLabel("正在后台准备生产视觉后端…"), "mutedLabel")
         self.preload_progress = QProgressBar()
         self.preload_progress.setRange(0, 100)
@@ -765,11 +927,14 @@ class VerifierWindow(QMainWindow):
         self.notebook = QTabWidget()
         self.monitor_page = QWidget()
         self.parameter_page = QWidget()
+        self.gcp_page = QWidget()
         self.notebook.addTab(self.monitor_page, "01 / 实时识别")
         self.notebook.addTab(self.parameter_page, "02 / 实时参数")
+        self.notebook.addTab(self.gcp_page, "03 / 地面控制点")
         outer.addWidget(self.notebook, 1)
         self._build_monitor_page()
         self._build_parameter_page()
+        self._build_gcp_page()
 
         self.status = _named(QLabel("正在后台分阶段加载模型，请稍候…"), "statusLine")
         self.status.setMinimumHeight(24)
@@ -823,8 +988,8 @@ class VerifierWindow(QMainWindow):
 
         side_layout.addWidget(_named(QLabel("MODULE / 03  ·  TARGET ACQUISITION"), "moduleMarker"))
         side_layout.addWidget(_named(QLabel("当前目标"), "instrumentLabel"))
-        self.track_tree = QTableWidget(0, 5)
-        self.track_tree.setHorizontalHeaderLabels(("Track", "身份/候选", "结果", "自动流程", "分数"))
+        self.track_tree = QTableWidget(0, 6)
+        self.track_tree.setHorizontalHeaderLabels(("Track", "动作", "身份/候选", "结果", "自动流程", "分数"))
         self.track_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.track_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.track_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -832,11 +997,39 @@ class VerifierWindow(QMainWindow):
         self.track_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.track_tree.verticalHeader().setDefaultSectionSize(24)
         header = self.track_tree.horizontalHeader()
-        for column, width in ((0, 58), (1, 105), (2, 125), (4, 62)):
+        for column, width in ((0, 58), (1, 86), (2, 105), (3, 125), (5, 62)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
             self.track_tree.setColumnWidth(column, width)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         side_layout.addWidget(self.track_tree)
+        self.track_tree.itemSelectionChanged.connect(self._sync_manual_action_target)
+
+        action_box = MissionGroupBox("手动动作触发", accent=RETRO_ORANGE)
+        action_layout = QGridLayout(action_box)
+        self.manual_action_target_combo = QComboBox()
+        self.manual_action_target_combo.setEditable(False)
+        self.manual_action_target_combo.setEnabled(False)
+        self.manual_action_combo = QComboBox()
+        self.manual_action_combo.addItems(
+            tuple(item.value for item in MANUAL_ACTION_TYPES)
+        )
+        self.manual_action_combo.setEnabled(False)
+        self.manual_action_button = QPushButton("按所选动作触发")
+        self.manual_action_button.setEnabled(False)
+        self.manual_action_button.clicked.connect(self.trigger_manual_action)
+        action_layout.addWidget(QLabel("目标（Track / 身份）"), 0, 0)
+        action_layout.addWidget(self.manual_action_target_combo, 0, 1)
+        action_layout.addWidget(QLabel("动作"), 1, 0)
+        action_layout.addWidget(self.manual_action_combo, 1, 1)
+        action_layout.addWidget(self.manual_action_button, 2, 0, 1, 2)
+        action_note = _named(
+            QLabel("动作只在下一帧再次确认身份为 KNOWN 后发布；不会写入步态库。"),
+            "mutedLabel",
+        )
+        action_note.setWordWrap(True)
+        action_layout.addWidget(action_note, 3, 0, 1, 2)
+        action_layout.setColumnStretch(1, 1)
+        side_layout.addWidget(action_box)
 
         enrollment = MissionGroupBox("人物注册", accent=SOLAR_YELLOW)
         enrollment_layout = QGridLayout(enrollment)
@@ -892,6 +1085,276 @@ class VerifierWindow(QMainWindow):
         side_layout.addWidget(gallery)
         side_layout.addStretch(1)
         self.side_scrollbar.setStyleSheet("")
+
+    def _build_gcp_page(self) -> None:
+        layout = QHBoxLayout(self.gcp_page)
+        layout.setContentsMargins(22, 14, 22, 18)
+        layout.setSpacing(10)
+
+        preview_panel = _named(MissionPanelFrame(accent=NASA_BLUE), "missionPanelFrame")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(1, 1, 1, 1)
+        self.gcp_canvas = GcpCanvas()
+        self.gcp_canvas.point_clicked.connect(self._gcp_canvas_click)
+        preview_layout.addWidget(self.gcp_canvas, 1)
+        preview_layout.addWidget(
+            _named(
+                QLabel("点击地面控制点获取像素坐标；然后在右侧录入对应世界坐标。"),
+                "mutedLabel",
+            )
+        )
+        layout.addWidget(preview_panel, 3)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+
+        metadata = MissionGroupBox("标定元数据", accent=NASA_BLUE)
+        metadata_layout = QGridLayout(metadata)
+        metadata_layout.setContentsMargins(7, 8, 7, 6)
+        metadata_layout.addWidget(QLabel("摄像头 ID"), 0, 0)
+        metadata_layout.addWidget(self.gcp_camera_id, 0, 1)
+        metadata_layout.addWidget(QLabel("世界坐标系"), 1, 0)
+        metadata_layout.addWidget(self.gcp_coordinate_frame, 1, 1)
+        metadata_layout.addWidget(QLabel("单位"), 2, 0)
+        metadata_layout.addWidget(self.gcp_unit, 2, 1)
+        metadata_layout.addWidget(QLabel("画面尺寸"), 3, 0)
+        self.gcp_image_size = _named(QLabel("未加载"), "mutedLabel")
+        metadata_layout.addWidget(self.gcp_image_size, 3, 1)
+        metadata_layout.setColumnStretch(1, 1)
+        right_layout.addWidget(metadata)
+
+        point_form = MissionGroupBox("控制点标记 / 录入", accent=RETRO_ORANGE)
+        form_layout = QGridLayout(point_form)
+        form_layout.setContentsMargins(7, 8, 7, 6)
+        for row, column, label, field in (
+            (0, 0, "点 ID", self.gcp_point_id),
+            (0, 2, "像素 U", self.gcp_image_u),
+            (1, 0, "像素 V", self.gcp_image_v),
+            (1, 2, "世界 X", self.gcp_world_x),
+            (2, 0, "世界 Y", self.gcp_world_y),
+        ):
+            form_layout.addWidget(QLabel(label), row, column)
+            form_layout.addWidget(field, row, column + 1)
+        add_button = QPushButton("添加 / 更新")
+        delete_button = QPushButton("删除选中")
+        add_button.clicked.connect(self._gcp_upsert)
+        delete_button.clicked.connect(self._gcp_delete)
+        form_layout.addWidget(add_button, 2, 2)
+        form_layout.addWidget(delete_button, 2, 3)
+        form_layout.setColumnStretch(1, 1)
+        form_layout.setColumnStretch(3, 1)
+        right_layout.addWidget(point_form)
+
+        table_box = MissionGroupBox("控制点清单", accent=NASA_BLUE)
+        table_layout = QVBoxLayout(table_box)
+        table_layout.setContentsMargins(7, 8, 7, 6)
+        self.gcp_table = QTableWidget(0, 6)
+        self.gcp_table.setHorizontalHeaderLabels(("ID", "U", "V", "X", "Y", "校核"))
+        self.gcp_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.gcp_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.gcp_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.gcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.gcp_table.itemSelectionChanged.connect(self._gcp_select)
+        table_layout.addWidget(self.gcp_table)
+        right_layout.addWidget(table_box, 1)
+
+        action_row = QHBoxLayout()
+        load_button = QPushButton("加载画面…")
+        import_button = QPushButton("导入标定…")
+        export_button = _named(QPushButton("导出标定…"), "primaryButton")
+        load_button.clicked.connect(self._gcp_load_image)
+        import_button.clicked.connect(self._gcp_import)
+        export_button.clicked.connect(self._gcp_export)
+        action_row.addWidget(load_button)
+        action_row.addWidget(import_button)
+        action_row.addWidget(export_button)
+        right_layout.addLayout(action_row)
+        check_button = _named(QPushButton("计算并校核 Homography"), "primaryButton")
+        clear_button = _named(QPushButton("清空控制点"), "dangerButton")
+        check_button.clicked.connect(self._gcp_check_homography)
+        clear_button.clicked.connect(self._gcp_clear)
+        right_layout.addWidget(check_button)
+        right_layout.addWidget(clear_button)
+        self.gcp_status = _named(
+            QLabel("请加载一张固定机位画面，然后在画布上点击地面点"),
+            "mutedLabel",
+        )
+        self.gcp_status.setWordWrap(True)
+        self.gcp_matrix = _named(QLabel("H 尚未校核"), "rangeLabel")
+        self.gcp_matrix.setWordWrap(True)
+        right_layout.addWidget(self.gcp_status)
+        right_layout.addWidget(self.gcp_matrix)
+        layout.addWidget(right, 2)
+
+    def _gcp_next_id(self) -> str:
+        index = 1
+        while f"P{index}" in self.gcp_rows:
+            index += 1
+        return f"P{index}"
+
+    def _gcp_current_point(self) -> GroundControlPoint:
+        return parse_ground_control_point(
+            self.gcp_point_id.text(),
+            self.gcp_image_u.text(),
+            self.gcp_image_v.text(),
+            self.gcp_world_x.text(),
+            self.gcp_world_y.text(),
+        )
+
+    def _gcp_upsert(self) -> None:
+        try:
+            point = self._gcp_current_point()
+        except ValueError as error:
+            QMessageBox.critical(self, "控制点录入失败", str(error))
+            return
+        self.gcp_rows[point.point_id] = point
+        self.gcp_point_id.setText(self._gcp_next_id())
+        self.gcp_check = None
+        self.gcp_matrix.setText("H 尚未校核")
+        self._gcp_refresh_table()
+        self.gcp_canvas.set_points(tuple(self.gcp_rows.values()))
+        self.gcp_status.setText(f"已记录 {point.point_id}；还可继续点击画面标记下一点")
+
+    def _gcp_select(self) -> None:
+        rows = self.gcp_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        point_ids = tuple(self.gcp_rows)
+        row = rows[0].row()
+        if row >= len(point_ids):
+            return
+        point = self.gcp_rows[point_ids[row]]
+        self.gcp_point_id.setText(point.point_id)
+        self.gcp_image_u.setText(f"{point.image_u:.3f}")
+        self.gcp_image_v.setText(f"{point.image_v:.3f}")
+        self.gcp_world_x.setText(f"{point.world_x:.3f}")
+        self.gcp_world_y.setText(f"{point.world_y:.3f}")
+
+    def _gcp_delete(self) -> None:
+        rows = self.gcp_table.selectionModel().selectedRows()
+        if not rows:
+            self.gcp_status.setText("请先在清单中选择控制点")
+            return
+        point_ids = tuple(self.gcp_rows)
+        row = rows[0].row()
+        if row < len(point_ids):
+            self.gcp_rows.pop(point_ids[row], None)
+        self.gcp_check = None
+        self.gcp_matrix.setText("H 尚未校核")
+        self._gcp_refresh_table()
+        self.gcp_canvas.set_points(tuple(self.gcp_rows.values()))
+        self.gcp_status.setText("已删除选中控制点")
+
+    def _gcp_refresh_table(self) -> None:
+        self.gcp_table.setRowCount(0)
+        for index, point in enumerate(self.gcp_rows.values()):
+            self.gcp_table.insertRow(index)
+            values = [point.point_id, f"{point.image_u:.2f}", f"{point.image_v:.2f}", f"{point.world_x:.3f}", f"{point.world_y:.3f}", "未校核"]
+            if self.gcp_check is not None:
+                inlier = self.gcp_check.inliers[index]
+                values[5] = f"{'内点' if inlier else '外点'} {self.gcp_check.reprojection_errors[index]:.3f}"
+            for column, value in enumerate(values):
+                self.gcp_table.setItem(index, column, QTableWidgetItem(value))
+
+    def _gcp_canvas_click(self, image_u: float, image_v: float) -> None:
+        self.gcp_image_u.setText(f"{image_u:.3f}")
+        self.gcp_image_v.setText(f"{image_v:.3f}")
+        if not self.gcp_point_id.text().strip() or self.gcp_point_id.text() in self.gcp_rows:
+            self.gcp_point_id.setText(self._gcp_next_id())
+        self.gcp_status.setText(f"已标记像素坐标 ({image_u:.2f}, {image_v:.2f})；请输入世界坐标后添加")
+
+    def _gcp_load_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择固定机位画面", "", "图像 (*.png *.jpg *.jpeg *.bmp *.webp);;全部文件 (*)")
+        if not path:
+            return
+        image = cv2.imread(path)
+        if image is None:
+            QMessageBox.critical(self, "画面加载失败", "无法读取所选图像")
+            return
+        self.gcp_canvas.set_frame(image)
+        height, width = image.shape[:2]
+        self.gcp_image_size_value = (int(width), int(height))
+        self.gcp_image_size.setText(f"{width} × {height}")
+        self.gcp_status.setText(f"已加载画面 {Path(path).name}；点击地面点开始标记")
+
+    def _gcp_check_homography(self) -> HomographyCheck | None:
+        try:
+            check = compute_ground_homography(tuple(self.gcp_rows.values()))
+        except ValueError as error:
+            self.gcp_check = None
+            self.gcp_matrix.setText("H 尚未校核")
+            self.gcp_status.setText(str(error))
+            QMessageBox.critical(self, "Homography 校核失败", str(error))
+            return None
+        self.gcp_check = check
+        self._gcp_refresh_table()
+        matrix = check.matrix
+        rows = (matrix[0:3], matrix[3:6], matrix[6:9])
+        self.gcp_matrix.setText("H = " + "; ".join(", ".join(f"{value:.5g}" for value in row) for row in rows))
+        self.gcp_status.setText(
+            f"校核通过：{len(self.gcp_rows)} 点，内点 {sum(check.inliers)}，"
+            f"RMSE {check.rmse:.4f} {self.gcp_unit.text() or 'm'}，最大误差 {check.maximum_error:.4f}"
+        )
+        return check
+
+    def _gcp_clear(self) -> None:
+        self.gcp_rows.clear()
+        self.gcp_check = None
+        self.gcp_matrix.setText("H 尚未校核")
+        self.gcp_point_id.setText("P1")
+        self._gcp_refresh_table()
+        self.gcp_canvas.set_points(())
+        self.gcp_status.setText("已清空控制点")
+
+    def _gcp_import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "导入地面控制点标定", "", "GCP JSON (*.json);;全部文件 (*)")
+        if not path:
+            return
+        try:
+            payload = load_ground_control_file(path)
+        except ValueError as error:
+            QMessageBox.critical(self, "标定导入失败", str(error))
+            return
+        self.gcp_camera_id.setText(str(payload["camera_id"]))
+        self.gcp_coordinate_frame.setText(str(payload["coordinate_frame"]))
+        self.gcp_unit.setText(str(payload["unit"]))
+        image_size = payload.get("image_size")
+        if isinstance(image_size, list) and len(image_size) == 2:
+            self.gcp_image_size_value = (int(image_size[0]), int(image_size[1]))
+            self.gcp_image_size.setText(
+                f"{self.gcp_image_size_value[0]} × {self.gcp_image_size_value[1]}"
+            )
+        self.gcp_rows = {point.point_id: point for point in payload["points"]}
+        self.gcp_point_id.setText(self._gcp_next_id())
+        self.gcp_check = None
+        self._gcp_refresh_table()
+        self.gcp_canvas.set_points(tuple(self.gcp_rows.values()))
+        self._gcp_check_homography()
+        self.gcp_status.setText(f"已导入 {Path(path).name}；请确认画面与标定文件属于同一机位")
+
+    def _gcp_export(self) -> None:
+        check = self.gcp_check or self._gcp_check_homography()
+        if check is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出地面控制点标定", "ground_control_points.json", "GCP JSON (*.json)")
+        if not path:
+            return
+        try:
+            save_ground_control_file(
+                path,
+                camera_id=self.gcp_camera_id.text(),
+                coordinate_frame=self.gcp_coordinate_frame.text(),
+                unit=self.gcp_unit.text(),
+                image_size=self.gcp_canvas.display_size() or self.gcp_image_size_value,
+                points=tuple(self.gcp_rows.values()),
+                check=check,
+            )
+        except ValueError as error:
+            QMessageBox.critical(self, "标定导出失败", str(error))
+            return
+        self.gcp_status.setText(f"已导出标定文件：{Path(path).name}")
 
     def _build_parameter_page(self) -> None:
         self.parameter_layout = QVBoxLayout(self.parameter_page)
@@ -1051,9 +1514,20 @@ class VerifierWindow(QMainWindow):
         if not self._preload_cancel.is_set():
             self._preload_messages.put(("stage", text, progress, None))
 
-    def _preload_backend(self, backend: str) -> None:
+    def _preload_backend(
+        self,
+        backend: str,
+        action_classifier_path: Path | None = None,
+        posec3d_checkpoint_path: Path | None = None,
+    ) -> None:
         try:
-            vision = build_vision_adapter(backend, preload=True, on_stage=self._publish_preload)
+            vision = build_vision_adapter(
+                backend,
+                preload=True,
+                on_stage=self._publish_preload,
+                action_classifier_path=action_classifier_path,
+                posec3d_checkpoint_path=posec3d_checkpoint_path,
+            )
         except Exception as error:
             self._preload_messages.put(("error", f"视觉后端加载失败：{error}", 1.0, error))
             return
@@ -1094,7 +1568,12 @@ class VerifierWindow(QMainWindow):
             self.vision,
             automation_policy=AutomationPolicy(enabled=automatic_capable),
             appearance_first=True,
+            action_publisher=self._new_action_publisher(self.transport_mode),
+            auto_action_publisher=False,
         )
+        self._active_transport_mode = normalize_transport_mode(
+            self.transport_mode
+        ).value
         self.worker = FrameWorker(self.pipeline)
         self._runtime_parameter_state = self.pipeline.runtime_parameter_state()
         self.automatic_registration.setChecked(automatic_capable)
@@ -1193,6 +1672,7 @@ class VerifierWindow(QMainWindow):
         try:
             spec = self._source_spec()
             self.worker.start(spec)
+            self.transport_combo.setEnabled(False)
             self._show_video_standby()
             repeat_text = (
                 f"（自动重复学习 {spec.repeat_count} 次）"
@@ -1208,7 +1688,69 @@ class VerifierWindow(QMainWindow):
             self.status.setText("模型仍在后台加载，请稍候")
             return
         self.worker.stop(timeout=None)
+        self.transport_combo.setEnabled(True)
         self.status.setText("已停止")
+
+    def _new_action_publisher(self, mode: str):
+        """Create the selected event transport without breaking model startup."""
+
+        selected = normalize_transport_mode(mode)
+        label = transport_label(selected)
+        try:
+            publisher = action_publisher_from_environment(selected)
+        except Exception as error:
+            if self.transport_status is not None:
+                self.transport_status.setText(f"{label}：不可用")
+            self.status.setText(f"{label} 初始化失败：{error}")
+            return None
+        if self.transport_status is not None:
+            if publisher is None:
+                self.transport_status.setText(f"{label}：未配置")
+            else:
+                self.transport_status.setText(f"{label}：已启用")
+        return publisher
+
+    def _transport_mode_changed(self, mode: str) -> None:
+        """Switch event transport while the capture worker is stopped."""
+
+        try:
+            selected = normalize_transport_mode(mode)
+        except ValueError:
+            self.status.setText("不支持的动作传输方式；仅可选择 MQTT 或 BLE Light")
+            return
+        label = transport_label(selected)
+        if self.pipeline is None:
+            return
+        if self.worker is not None and self.worker.running:
+            if self._active_transport_mode is not None:
+                self.transport_combo.blockSignals(True)
+                self.transport_combo.setCurrentText(
+                    transport_label(self._active_transport_mode)
+                )
+                self.transport_combo.blockSignals(False)
+            QMessageBox.warning(self, "传输方式未切换", "请先停止采集，再切换 MQTT 或 BLE Light。")
+            return
+        try:
+            publisher = action_publisher_from_environment(selected)
+        except Exception as error:
+            if self._active_transport_mode is not None:
+                self.transport_combo.blockSignals(True)
+                self.transport_combo.setCurrentText(
+                    transport_label(self._active_transport_mode)
+                )
+                self.transport_combo.blockSignals(False)
+            if self.transport_status is not None:
+                self.transport_status.setText(f"{label}：不可用")
+            QMessageBox.critical(self, "传输方式不可用", str(error))
+            return
+        self.pipeline.set_action_publisher(publisher)
+        self._active_transport_mode = selected.value
+        if self.transport_status is not None:
+            if publisher is None:
+                self.transport_status.setText(f"{label}：未配置")
+            else:
+                self.transport_status.setText(f"{label}：已启用")
+        self.status.setText(f"动作事件传输已切换为 {label}")
 
     def _toggle_automatic_registration(self, checked: bool) -> None:
         if self.worker is None:
@@ -1224,6 +1766,91 @@ class VerifierWindow(QMainWindow):
             "自动注册：开启，OSNet 将先确认视觉身份，随后学习步态原型"
             if checked
             else "自动注册：关闭；识别和外观令牌响应仍继续"
+        )
+
+    def _sync_manual_action_target(self) -> None:
+        """Mirror the selected Track row into the action target selector."""
+
+        if self._manual_action_syncing:
+            return
+        rows = self.track_tree.selectionModel().selectedRows()
+        if not rows:
+            return
+        item = self.track_tree.item(rows[0].row(), 0)
+        if item is None:
+            return
+        try:
+            track_id = int(item.text())
+        except (TypeError, ValueError):
+            return
+        for label, candidate_track_id in self._manual_action_targets.items():
+            if candidate_track_id == track_id:
+                self._manual_action_syncing = True
+                self.manual_action_target_combo.setCurrentText(label)
+                self.manual_action_target = label
+                self._manual_action_syncing = False
+                return
+
+    def _refresh_manual_action_targets(self, tracks: tuple[object, ...]) -> None:
+        """Expose current Tracks and their known identity labels to the GUI."""
+
+        previous = self.manual_action_target
+        targets: dict[str, int] = {}
+        for track in tracks:
+            track_id = int(track.track_id)
+            decision = track.decision
+            identity = (
+                decision.identity_id
+                if decision.open_set_label == "KNOWN" and decision.identity_id
+                else "未确认"
+            )
+            targets[f"Track {track_id} · {identity}"] = track_id
+        self._manual_action_targets = targets
+        labels = tuple(targets)
+        self._manual_action_syncing = True
+        self.manual_action_target_combo.clear()
+        self.manual_action_target_combo.addItems(labels)
+        if previous in targets:
+            self.manual_action_target_combo.setCurrentText(previous)
+            self.manual_action_target = previous
+        elif labels:
+            self.manual_action_target_combo.setCurrentIndex(0)
+            self.manual_action_target = labels[0]
+        else:
+            self.manual_action_target = ""
+        self._manual_action_syncing = False
+        enabled = bool(labels)
+        self.manual_action_target_combo.setEnabled(enabled)
+        self.manual_action_combo.setEnabled(enabled)
+        self.manual_action_button.setEnabled(enabled)
+
+    def trigger_manual_action(self) -> None:
+        """Queue the selected action without bypassing identity authorization."""
+
+        if self.worker is None:
+            self.status.setText("模型仍在后台加载，请稍候")
+            return
+        label = self.manual_action_target_combo.currentText().strip()
+        target = self._manual_action_targets.get(label)
+        if target is None:
+            rows = self.track_tree.selectionModel().selectedRows()
+            if rows:
+                item = self.track_tree.item(rows[0].row(), 0)
+                try:
+                    target = int(item.text()) if item is not None else None
+                except (TypeError, ValueError):
+                    target = None
+        if target is None:
+            QMessageBox.warning(self, "未选择目标", "请先在当前目标表中选择一个 Track 或身份。")
+            return
+        action = ActionType.parse(self.manual_action_combo.currentText())
+        try:
+            self.worker.trigger_manual_action(target, action)
+        except Exception as error:
+            QMessageBox.critical(self, "手动动作失败", str(error))
+            return
+        self.status.setText(
+            f"已为 Track {target} 排队 {action.value}；下一帧将验证身份并发布动作事件"
         )
 
     def register_selected(self) -> None:
@@ -1267,6 +1894,12 @@ class VerifierWindow(QMainWindow):
             return
         self.track_tree.setRowCount(0)
         self._table_rows.clear()
+        self._manual_action_targets.clear()
+        self.manual_action_target = ""
+        self.manual_action_target_combo.clear()
+        self.manual_action_target_combo.setEnabled(False)
+        self.manual_action_combo.setEnabled(False)
+        self.manual_action_button.setEnabled(False)
         self.gallery_label.setText("无")
         self.pending_requests.setText("无")
         self.automation_status.setText("自动注册：开启，等待人物进入画面")
@@ -1324,7 +1957,14 @@ class VerifierWindow(QMainWindow):
                 row = self.track_tree.rowCount()
                 self.track_tree.insertRow(row)
                 self._table_rows[item_id] = row
-            values = (str(track.track_id), subject, decision.kind.value, track.automation.message, score)
+            values = (
+                str(track.track_id),
+                track.action_type,
+                subject,
+                decision.kind.value,
+                track.automation.message,
+                score,
+            )
             tag = self._track_visual_tag(decision.kind.value)
             for column, value in enumerate(values):
                 item = self.track_tree.item(row, column)
@@ -1354,6 +1994,7 @@ class VerifierWindow(QMainWindow):
             row = self._table_rows.pop(item_id, None)
             if row is not None:
                 self.track_tree.removeRow(row)
+        self._refresh_manual_action_targets(result.tracks)
         self._table_rows = {
             self.track_tree.item(row, 0).text(): row
             for row in range(self.track_tree.rowCount())
@@ -1370,7 +2011,9 @@ class VerifierWindow(QMainWindow):
         self.status.setText(
             f"帧 {result.frame_index} | 目标 {len(result.tracks)} | 处理 {result.processing_seconds * 1000:.0f} ms"
         )
-        if request_message:
+        if result.transport_errors:
+            self.status.setText("动作事件传输失败：" + "；".join(result.transport_errors[:2]))
+        elif request_message:
             self.status.setText(request_message)
 
     def _poll_messages(self) -> None:
@@ -1396,6 +2039,8 @@ class VerifierWindow(QMainWindow):
                     QMessageBox.critical(self, "参数应用失败", message.text)
             elif isinstance(message, StatusMessage):
                 self.status.setText(message.text)
+                if message.level in {"ended", "error"}:
+                    self.transport_combo.setEnabled(True)
         if latest_frame is not None:
             self._update_frame(latest_frame.result)
 
@@ -1508,6 +2153,8 @@ class VerifierWindow(QMainWindow):
         self._message_timer.stop()
         if self.worker is not None:
             self.worker.stop(timeout=None)
+        if self.pipeline is not None:
+            self.pipeline.close()
         self.verifier.close()
         super().close()
 
@@ -1515,11 +2162,18 @@ class VerifierWindow(QMainWindow):
 def launch_gui(
     database_path: str = "data/verifier-production-v1.sqlite3",
     vision_backend: str = "production",
+    action_classifier_path: Path | None = None,
+    posec3d_checkpoint_path: Path | None = None,
 ) -> int:
     """Start the Qt GUI; all heavy work remains in the existing worker layer."""
 
     app = QApplication.instance() or QApplication(sys.argv)
-    window = VerifierWindow(database_path, vision_backend)
+    window = VerifierWindow(
+        database_path,
+        vision_backend,
+        action_classifier_path,
+        posec3d_checkpoint_path,
+    )
     window.show()
     return app.exec()
 

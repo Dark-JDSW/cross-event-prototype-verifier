@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/cross-event-rgb-gait-v1/tracks.schema.json",
+  "title": "Cross-event RGB gait track annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "tracks"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["track_id", "identity_id", "frames"],
+        "properties": {
+          "track_id": {"type": ["integer", "string"]},
+          "identity_id": {"type": "string", "minLength": 1},
+          "frames": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["frame_index", "timestamp", "bbox_xyxy", "detection_score", "posture_condition", "posture_confidence", "occlusion", "feet_visible"],
+              "properties": {
+                "frame_index": {"type": "integer", "minimum": 0},
+                "timestamp": {"type": "number", "minimum": 0},
+                "bbox_xyxy": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+                "detection_score": {"type": "number", "minimum": 0, "maximum": 1},
+                "posture_condition": {"type": "string", "enum": ["side", "oblique", "front", "back", "transition", "unknown"]},
+                "posture_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "occlusion": {"type": "number", "minimum": 0, "maximum": 1},
+                "feet_visible": {"type": "boolean"},
+                "track_id_switch": {"type": "boolean"},
+                "track_gap": {"type": "boolean"},
+                "detector_gap": {"type": "boolean"},
+                "box_truncated": {"type": "boolean"},
+                "missing_mask": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

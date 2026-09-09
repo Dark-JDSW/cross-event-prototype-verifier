@@ -12,10 +12,46 @@ from .actions import (
     ActionQuality,
     ActionRouter,
     ActionType,
+    MANUAL_ACTION_TYPES,
     conservative_walk_prediction,
+)
+from .action_classifier import (
+    ActionClassifierModel,
+    PoseActionClassifier,
+    extract_pose_action_features,
+)
+from .posec3d_action import (
+    PoseC3DActionClassifier,
+    PoseC3DPrediction,
+    PoseC3DError,
 )
 from .config import VerifierConfig
 from .engine import CrossEventVerifier
+from .ble_bridge import (
+    BleActionPublisher,
+    BleBridgeError,
+    BleCommandMode,
+    BleConfig,
+    DEFAULT_COMMAND_UUID,
+    DEFAULT_SERVICE_UUID,
+    DEFAULT_STATUS_UUID,
+    LIGHT_OFF_OPCODE,
+    LIGHT_ON_OPCODE,
+)
+from .smart_home import (
+    ACTION_EVENT_PROTOCOL,
+    ActionPublisher,
+    MqttActionPublisher,
+    MqttConfig,
+    event_id,
+)
+from .transports import (
+    ActionTransportMode,
+    action_publisher_from_environment,
+    normalize_transport_mode,
+    transport_label,
+)
+from .transient_actions import ActionEvent, TransientActionConfig, TransientActionManager
 from .gait_readiness import GaitReadinessEvaluator
 from .evaluation import (
     EncoderEvaluation,
@@ -62,10 +98,38 @@ __all__ = [
     "ActionQuality",
     "ActionRouter",
     "ActionType",
+    "MANUAL_ACTION_TYPES",
     "conservative_walk_prediction",
+    "ActionClassifierModel",
+    "PoseActionClassifier",
+    "extract_pose_action_features",
+    "PoseC3DActionClassifier",
+    "PoseC3DPrediction",
+    "PoseC3DError",
     "AppearanceFirstGaitEnrollmentController",
     "AppearanceIdentityBinding",
     "CrossEventVerifier",
+    "ActionEvent",
+    "TransientActionConfig",
+    "TransientActionManager",
+    "ActionPublisher",
+    "ACTION_EVENT_PROTOCOL",
+    "MqttActionPublisher",
+    "MqttConfig",
+    "event_id",
+    "BleActionPublisher",
+    "BleBridgeError",
+    "BleCommandMode",
+    "BleConfig",
+    "DEFAULT_COMMAND_UUID",
+    "DEFAULT_SERVICE_UUID",
+    "DEFAULT_STATUS_UUID",
+    "LIGHT_OFF_OPCODE",
+    "LIGHT_ON_OPCODE",
+    "ActionTransportMode",
+    "action_publisher_from_environment",
+    "normalize_transport_mode",
+    "transport_label",
     "GaitReadinessEvaluator",
     "Decision",
     "DecisionKind",

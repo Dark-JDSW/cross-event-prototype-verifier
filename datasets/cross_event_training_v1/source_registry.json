@@ -1,0 +1,82 @@
+{
+  "registry_version": "2026-08-26",
+  "selected_primary_source": "mevid-v1",
+  "sources": [
+    {
+      "source_id": "mevid-v1",
+      "name": "MEVID: Multi-view Extended Videos with Identities",
+      "role": "primary_external_research_source",
+      "official_page": "https://github.com/Kitware/MEVID",
+      "paper": "https://openaccess.thecvf.com/content/WACV2023/papers/Davila_MEVID_Multi-View_Extended_Videos_With_Identities_for_Video_Person_Re-Identification_WACV2023_paper.pdf",
+      "license_or_access": "https://mevadata.org/resources/MEVA-data-license.txt",
+      "access_mode": "download_requires_external_data_access_and_license_review",
+      "reported_scale": {
+        "identities": 158,
+        "outfits": 598,
+        "tracklets": 8092,
+        "camera_views": 33,
+        "locations": 17,
+        "unique_dates": 9,
+        "date_window_days": 73,
+        "average_tracklet_frames": 590
+      },
+      "available_modalities": [
+        "rgb_tracklet_chips",
+        "source_video_urls",
+        "identity_id",
+        "outfit_id",
+        "camera_id"
+      ],
+      "must_be_recomputed_for_this_project": [
+        "full_frame_detector_boxes",
+        "bytetrack_track_ids",
+        "rtmpose_coco17_keypoints",
+        "raw_timestamps_and_frame_indices",
+        "walking_event_verification",
+        "occlusion_and_feet_visibility_review"
+      ],
+      "production_training_eligible_now": false,
+      "reason_not_ready": "External access, license, raw-video mapping, walking filtering, and RTMPose processing are not present in this repository."
+    },
+    {
+      "source_id": "fvg-b",
+      "name": "Front-View Gait Blurred Database",
+      "role": "auxiliary_front_view_stress_test",
+      "official_page": "https://cvlab.cse.msu.edu/frontal-view-gaitfvg-database.html",
+      "technical_report": "https://cvlab.cse.msu.edu/pdfs/FVG_B_Report.pdf",
+      "reported_scale": {
+        "identities": 226,
+        "videos": 2856,
+        "views": 3,
+        "sessions": 3,
+        "fps": 15,
+        "resolution": "1920x1080",
+        "repeated_across_2017_and_2018": 12
+      },
+      "production_training_eligible_now": false,
+      "reason_not_selected_as_primary": "Most identities do not have four independent sessions and two capture periods."
+    },
+    {
+      "source_id": "deepchange",
+      "name": "DeepChange",
+      "role": "external_long_term_reference_only",
+      "official_page": "https://github.com/PengBoXiangShang/deepchange",
+      "paper": "https://openaccess.thecvf.com/content/ICCV2023/papers/Xu_DeepChange_A_Long-Term_Person_Re-Identification_Benchmark_with_Clothes_Change_ICCV2023_paper.pdf",
+      "reported_scale": {
+        "identities": 1121,
+        "cameras": 17,
+        "bounding_boxes": 178407,
+        "collection_months": 12
+      },
+      "production_training_eligible_now": false,
+      "reason_not_selected_as_primary": "Official terms restrict use to non-commercial research and prohibit redistribution; the source is also not a walking-only RTMPose dataset."
+    },
+    {
+      "source_id": "local-project-proxy",
+      "name": "train/multi_action_dataset_v2.zip and val/*.mp4",
+      "role": "regression_and_smoke_test_only",
+      "production_training_eligible_now": false,
+      "reason_not_selected_as_primary": "The project requirements document and local README identify these files as proxy skeleton/single-person smoke data without the required RGB cross-event coverage."
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "schema_version": "cross-event-rgb-gait-v1",
+  "status": "pending_external_data",
+  "identity_to_split": {},
+  "reason": "Identity allocation is withheld until licensed source metadata and walking-event review are complete."
+}

@@ -41,6 +41,7 @@ class _AppearanceFirstTrackState:
     gait_window_start_timestamp: float | None = None
     conflict: bool = False
     subtracklet_id: str | None = None
+    action_segment_id: str | None = None
     last_appearance_generation: int | None = None
     action_type: ActionType | None = None
     action_gate_active: bool = False
@@ -109,6 +110,7 @@ class AppearanceFirstGaitEnrollmentController:
             state.gait_window_start_timestamp = None
             state.conflict = False
             state.subtracklet_id = None
+            state.action_segment_id = None
             state.last_appearance_generation = None
             state.action_type = None
             state.action_gate_active = False
@@ -133,6 +135,7 @@ class AppearanceFirstGaitEnrollmentController:
             state.gait_window_start_timestamp = None
             state.conflict = False
             state.subtracklet_id = None
+            state.action_segment_id = None
             state.last_appearance_generation = None
             state.action_type = None
             state.action_gate_active = False
@@ -211,6 +214,22 @@ class AppearanceFirstGaitEnrollmentController:
             state.action_type = None
             state.action_gate_active = False
         state.subtracklet_id = current
+
+    @staticmethod
+    def _sync_action_segment(
+        state: _AppearanceFirstTrackState,
+        observation: Observation,
+    ) -> None:
+        """Action boundaries clear gait evidence without breaking visual ID binding."""
+
+        value = observation.metadata.get("action_segment_id")
+        current = str(value) if value not in (None, "") else None
+        if current is None:
+            return
+        if state.action_segment_id is not None and state.action_segment_id != current:
+            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+        state.action_segment_id = current
 
     @staticmethod
     def _resolve_action(
@@ -419,6 +438,8 @@ class AppearanceFirstGaitEnrollmentController:
         if not features.has_appearance or quality < self.verifier.config.strong_appearance_quality:
             state.appearance_samples.clear()
             return None, "等待高质量外观样本", quality
+        if not self._accept_new_appearance_generation(state, observation):
+            return None, "等待新的 OSNet 外观推理样本", quality
         vector = np.asarray(features.appearance, dtype=np.float32)
         reference = self._unit_mean(state.appearance_samples)
         if reference is not None:
@@ -556,15 +577,8 @@ class AppearanceFirstGaitEnrollmentController:
         )
         if not features.has_appearance or quality < self.verifier.config.strong_appearance_quality:
             return None, "等待高质量外观样本", quality
-        generation = observation.metadata.get("appearance_generation")
-        if generation is not None:
-            try:
-                generation = int(generation)
-            except (TypeError, ValueError):
-                return None, "外观样本代次无效，等待新的 OSNet 推理", quality
-            if state.last_appearance_generation == generation:
-                return None, "等待新的 OSNet 外观推理样本", quality
-            state.last_appearance_generation = generation
+        if not self._accept_new_appearance_generation(state, observation):
+            return None, "等待新的 OSNet 外观推理样本", quality
         vector = np.asarray(features.appearance, dtype=np.float32)
         reference = self._unit_mean(state.appearance_samples)
         if reference is not None:
@@ -877,6 +891,41 @@ class AppearanceFirstGaitEnrollmentController:
         state = self._state(state_key)
         state.identity_id = identity_id
         state.appearance_samples.clear()
+        generation = self._appearance_generation(observation)
+        if generation is not None:
+            state.last_appearance_generation = generation
+
+    @staticmethod
+    def _appearance_generation(observation: Observation) -> int | None:
+        """Return the OSNet inference generation, if supplied."""
+
+        metadata = observation.metadata
+        if "appearance_generation" not in metadata:
+            return None
+        try:
+            generation = int(metadata["appearance_generation"])
+        except (TypeError, ValueError):
+            return None
+        return generation if generation >= 0 else None
+
+    @classmethod
+    def _accept_new_appearance_generation(
+        cls,
+        state: _AppearanceFirstTrackState,
+        observation: Observation,
+    ) -> bool:
+        """Accept only a fresh OSNet result; reject stale replayed vectors."""
+
+        metadata = observation.metadata
+        if "appearance_fresh" in metadata and not bool(metadata["appearance_fresh"]):
+            return False
+        if "appearance_generation" not in metadata:
+            return True
+        generation = cls._appearance_generation(observation)
+        if generation is None or state.last_appearance_generation == generation:
+            return False
+        state.last_appearance_generation = generation
+        return True
 
     def _bound_decision(
         self,
@@ -943,6 +992,7 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> tuple[Decision, AutomationStatus]:
         state = self._state(state_key)
         self._sync_subtracklet(state, observation)
+        self._sync_action_segment(state, observation)
         action_prediction = self._resolve_action(state, observation)
         was_unbound = state.identity_id is None
         bound_identity = state.identity_id or assigned_identity

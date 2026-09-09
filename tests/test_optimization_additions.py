@@ -169,6 +169,8 @@ class OptimizationAdditionTests(unittest.TestCase):
         controller = AutomaticVerificationController(verifier)
         state = controller._states.setdefault("candidate", _TrackAutomationState())
         state.subtracklet_id = "7:0"
+        state.identity_id = "P1"
+        state.pending_request_id = "request-1"
         state.gait_samples.append(np.array([1.0, 0.0]))
         state.gait_sample_weights.append(1.0)
         state.gait_window_start_timestamp = 1.0
@@ -180,6 +182,8 @@ class OptimizationAdditionTests(unittest.TestCase):
             self.assertEqual(len(state.gait_samples), 0)
             self.assertEqual(len(state.gait_sample_weights), 0)
             self.assertIsNone(state.gait_window_start_timestamp)
+            self.assertIsNone(state.identity_id)
+            self.assertIsNone(state.pending_request_id)
             self.assertEqual(state.subtracklet_id, "7:1")
         finally:
             verifier.close()

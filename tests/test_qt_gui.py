@@ -26,8 +26,31 @@ assert window.preload_progress.isHidden()
 assert window.preload_phase.isHidden()
 assert window._preload_controls_layout.indexOf(window.preload_progress) == -1
 assert window._preload_controls_layout.indexOf(window.preload_phase) == -1
-assert window.notebook.count() == 2
-assert window.track_tree.columnCount() == 5
+assert window.notebook.count() == 3
+assert window.notebook.tabText(2) == "03 / 地面控制点"
+for point_id, image, world in (
+    ("A", (0, 0), (0, 0)),
+    ("B", (100, 0), (2, 0)),
+    ("C", (100, 100), (2, 3)),
+    ("D", (0, 100), (0, 3)),
+):
+    window.gcp_point_id.setText(point_id)
+    window.gcp_image_u.setText(str(image[0]))
+    window.gcp_image_v.setText(str(image[1]))
+    window.gcp_world_x.setText(str(world[0]))
+    window.gcp_world_y.setText(str(world[1]))
+    window._gcp_upsert()
+assert window._gcp_check_homography() is not None
+assert window.gcp_table.rowCount() == 4
+assert window.track_tree.columnCount() == 6
+assert tuple(
+    window.manual_action_combo.itemText(index)
+    for index in range(window.manual_action_combo.count())
+) == ("SQUAT", "SIT_DOWN", "STAND_UP", "HAND_UP", "WAVE")
+assert tuple(
+    window.transport_combo.itemText(index)
+    for index in range(window.transport_combo.count())
+) == ("MQTT", "BLE Light")
 assert window.video_stack.currentWidget() is window.video_standby
 key = "verifier.gait_novelty_threshold"
 assert key in window.parameter_scales

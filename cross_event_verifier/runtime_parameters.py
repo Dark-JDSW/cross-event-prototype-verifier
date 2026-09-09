@@ -13,7 +13,6 @@ from dataclasses import dataclass, replace
 import math
 from typing import TYPE_CHECKING, Literal, Mapping
 
-from .automation import AutomationPolicy
 from .calibration import ScoreCalibrator
 
 if TYPE_CHECKING:
