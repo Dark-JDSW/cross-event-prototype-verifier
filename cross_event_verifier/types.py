@@ -274,6 +274,12 @@ class TrackQuality:
     detector_gap_frames: int = 0
     track_gap_frames: int = 0
     timestamp_span_seconds: float = 0.0
+    # Audit-only lower-body and continuity measurements.  They deliberately do
+    # not alter the existing gait score until calibrated on target-camera data.
+    lower_body_mean_score: float | None = None
+    longest_leg_gap_frames: int = 0
+    track_gap_ratio: float = 0.0
+    pose_jitter: float | None = None
     gait_cycles: float = 0.0
     walking_ratio: float = 0.0
     view_angle: str | None = None

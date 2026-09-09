@@ -41,6 +41,23 @@
         "source_sha256": "a3e495ed886681e27119a723fe110e84d381b073f25b9bffd32c1608075aca12",
         "postprocess": "extract_model"
       }
+    },
+    "posec3d_hmdb51_split1.pth": {
+      "bytes": 12276729,
+      "sha256": "17eaa484bff7e4840ea9a3bd24bea87af25092e8f8bc52fb7dc72309fc236dd2",
+      "download": {
+        "url": "https://download.openmmlab.com/mmaction/v1.0/skeleton/posec3d/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint_20220815-17eaa484.pth"
+      },
+      "metadata": {
+        "model": "PoseC3D SlowOnly-R50 HMDB51 split1 keypoint",
+        "num_classes": 51,
+        "walk_class_index": 49,
+        "clip_length": 48,
+        "input": "COCO-17 2D keypoint plus score to pose heatmaps",
+        "config": "models/posec3d_hmdb51_runtime.py",
+        "label_map": "models/hmdb51_label_map.txt",
+        "preprocess_version": "mmaction2-posec3d-hmdb51-u48-heatmap-v1"
+      }
     }
   }
 }

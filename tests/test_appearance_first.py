@@ -394,6 +394,46 @@ class AppearanceFirstTests(unittest.TestCase):
         self.assertGreaterEqual(len(appearance_prototypes), 2)
         verifier.close()
 
+    def test_replayed_generation_cannot_create_a_new_visual_identity(self) -> None:
+        verifier = CrossEventVerifier(
+            VerifierConfig(appearance_identity_min_samples=2)
+        )
+        controller = AppearanceFirstGaitEnrollmentController(
+            verifier,
+            AutomationPolicy(minimum_track_frames=1),
+        )
+        vector = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        state_key = "cam:appearance-session:track-7"
+        try:
+            first, _ = controller.verify(
+                replace(
+                    _appearance_only_observation(vector, 1.0),
+                    metadata={"appearance_generation": 1, "appearance_fresh": True},
+                ),
+                candidate_id=state_key,
+            )
+            replay, _ = controller.verify(
+                replace(
+                    _appearance_only_observation(vector, 2.0),
+                    metadata={"appearance_generation": 1, "appearance_fresh": False},
+                ),
+                candidate_id=state_key,
+            )
+            self.assertIsNone(first.identity_id)
+            self.assertIsNone(replay.identity_id)
+            self.assertEqual(verifier.formal_identities, ())
+            created, _ = controller.verify(
+                replace(
+                    _appearance_only_observation(vector, 3.0),
+                    metadata={"appearance_generation": 2, "appearance_fresh": True},
+                ),
+                candidate_id=state_key,
+            )
+            self.assertEqual(created.kind, DecisionKind.VISUAL_IDENTITY_CREATED)
+            self.assertEqual(verifier.formal_identities, ("P1",))
+        finally:
+            verifier.close()
+
     def test_replayed_appearance_generation_cannot_enroll_a_new_prototype(self) -> None:
         verifier = CrossEventVerifier()
         verifier.register_identity(

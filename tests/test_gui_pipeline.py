@@ -119,6 +119,26 @@ class StrongThenWeakVision(FakeVision):
         return (item,)
 
 
+class TimelineVision(FakeVision):
+    def process(self, frame_bgr: np.ndarray) -> tuple[VisionTrack, ...]:
+        item = super().process(frame_bgr)[0]
+        item = replace(
+            item,
+            metadata={
+                "camera_view_timeline": (
+                    {
+                        "frame_index": 7,
+                        "timestamp": 100.0,
+                        "view_angle": "side",
+                        "missing": False,
+                    },
+                )
+            },
+        )
+        self.latest[7] = item
+        return (item,)
+
+
 class KnownAndNovelVision(FakeVision):
     def process(self, frame_bgr: np.ndarray) -> tuple[VisionTrack, ...]:
         known = super().process(frame_bgr)[0]
@@ -137,6 +157,25 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
+    def test_pipeline_attaches_camera_id_to_timed_view_timeline(self) -> None:
+        verifier = CrossEventVerifier()
+        pipeline = VideoVerifierPipeline(verifier, TimelineVision(), camera_id="cam-timeline")
+        captured = []
+        original_verify = pipeline.automation.verify_batch
+
+        def capture(observations, *, candidate_ids):
+            captured.extend(observations)
+            return original_verify(observations, candidate_ids=candidate_ids)
+
+        pipeline.automation.verify_batch = capture
+        pipeline.process_frame(np.zeros((220, 120, 3), dtype=np.uint8), timestamp=101.0)
+
+        metadata = captured[0].metadata
+        self.assertEqual(metadata["camera_id"], "cam-timeline")
+        self.assertEqual(metadata["pipeline_frame_index"], 1)
+        self.assertEqual(metadata["camera_view_timeline"][0]["camera_id"], "cam-timeline")
+        verifier.close()
+
     def test_track_candidate_key_survives_active_count_changes(self) -> None:
         """同一 Track 增减同框人数时仍保持视觉身份 must-link。"""
 
@@ -178,7 +217,8 @@ class GuiPipelineTests(unittest.TestCase):
             window = VerifierWindow(":memory:", "demo")
         window.root.withdraw()
         try:
-            self.assertEqual(len(window.notebook.tabs()), 2)
+            self.assertEqual(len(window.notebook.tabs()), 3)
+            self.assertEqual(window.notebook.tab(2, "text"), "03 / 地面控制点")
             self.assertIn(
                 "verifier.gait_novelty_threshold",
                 window.parameter_entries,
@@ -213,6 +253,33 @@ class GuiPipelineTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_gcp_page_records_points_and_checks_homography(self) -> None:
+        with patch(
+            "cross_event_verifier.gui.build_vision_adapter",
+            return_value=FakeVision(),
+        ):
+            window = VerifierWindow(":memory:", "demo")
+        window.root.withdraw()
+        try:
+            for point_id, image, world in (
+                ("A", (0, 0), (0, 0)),
+                ("B", (100, 0), (2, 0)),
+                ("C", (100, 100), (2, 3)),
+                ("D", (0, 100), (0, 3)),
+            ):
+                window.gcp_point_id.set(point_id)
+                window.gcp_image_u.set(str(image[0]))
+                window.gcp_image_v.set(str(image[1]))
+                window.gcp_world_x.set(str(world[0]))
+                window.gcp_world_y.set(str(world[1]))
+                window._gcp_upsert()
+            check = window._gcp_check_homography()
+            self.assertIsNotNone(check)
+            self.assertEqual(len(window.gcp_tree.get_children()), 4)
+            self.assertIn("校核通过", window.gcp_status.get())
+        finally:
+            window.close()
+
     def test_nasapunk_theme_keeps_parameter_controls_styled(self) -> None:
         """视觉主题应落在现有控件上，不替换参数控件或其行为。"""
 
@@ -242,6 +309,7 @@ class GuiPipelineTests(unittest.TestCase):
                 window.background_canvas,
                 window.monitor_background_canvas,
                 window.parameter_background_canvas,
+                window.gcp_background_canvas,
             ):
                 grid_items = canvas.find_withtag(ENGINEERING_GRID_TAG)
                 self.assertGreater(len(grid_items), 0)
@@ -405,6 +473,48 @@ class GuiPipelineTests(unittest.TestCase):
         self.assertEqual(repeated.tracks[0].decision.kind.value, "formal_match")
         self.assertIsNone(repeated.tracks[0].decision.appearance_request_id)
         self.assertIsNone(pipeline.appearance_request_id)
+        verifier.close()
+
+    def test_manual_action_is_released_only_after_known_identity(self) -> None:
+        """GUI commands become normal events without entering gait evidence."""
+
+        class Publisher:
+            def __init__(self) -> None:
+                self.events = []
+
+            def publish(self, event) -> None:
+                self.events.append(event)
+
+            def close(self) -> None:
+                pass
+
+        verifier = CrossEventVerifier()
+        publisher = Publisher()
+        pipeline = VideoVerifierPipeline(
+            verifier,
+            FakeVision(),
+            camera_id="cam-manual-action",
+            action_publisher=publisher,
+            auto_action_publisher=False,
+        )
+        frame = np.zeros((220, 120, 3), dtype=np.uint8)
+        pipeline.process_frame(frame, timestamp=120.0)
+        pipeline.register_current_track("P-manual-action")
+        pipeline.process_frame(frame, timestamp=121.0)
+
+        pipeline.queue_manual_action(7, "WAVE")
+        result = pipeline.process_frame(frame, timestamp=122.0)
+
+        self.assertEqual(len(result.action_events), 1)
+        event = result.action_events[0]
+        self.assertEqual(event.identity_id, "P-manual-action")
+        self.assertEqual(event.action.value, "WAVE")
+        self.assertEqual(event.confidence, 1.0)
+        self.assertEqual(result.tracks[0].action_type, "WAVE")
+        self.assertEqual(publisher.events, [event])
+        # An operator command never creates a gait enrollment event.
+        self.assertEqual(len(verifier.store.load_gait_enrollment_events()), 0)
+        pipeline.close()
         verifier.close()
 
     def test_manual_registration_uses_recent_strong_gait_snapshot(self) -> None:

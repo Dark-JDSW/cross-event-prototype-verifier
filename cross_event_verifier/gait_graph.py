@@ -16,7 +16,6 @@ from typing import Sequence
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
 _COCO_CONNECT = np.asarray(

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -150,6 +152,56 @@ def main(argv: list[str] | None = None) -> int:
         help="GUI vision backend; production is the safe default",
     )
     parser.add_argument(
+        "--action-classifier",
+        type=Path,
+        default=None,
+        help=(
+            "optional trained pose-action classifier (.npz); when omitted, "
+            "production uses the conservative kinematic gate"
+        ),
+    )
+    parser.add_argument(
+        "--posec3d-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "optional official HMDB51 PoseC3D checkpoint; when set, the WALK "
+            "gate requires PoseC3D semantic WALK and the existing kinematic gate"
+        ),
+    )
+    parser.add_argument(
+        "--action-transport",
+        choices=["mqtt", "ble", "ble-light"],
+        default=None,
+        help="GUI action-event transport (mqtt or ble-light; ble is a compatibility alias); overrides CROSS_EVENT_TRANSPORT",
+    )
+    parser.add_argument(
+        "--ble-address",
+        default=None,
+        help="ESP32-S3 BLE address; used with --action-transport ble-light",
+    )
+    parser.add_argument(
+        "--mqtt-host",
+        default=None,
+        help="MQTT broker host; used with --action-transport mqtt",
+    )
+    parser.add_argument(
+        "--mqtt-port",
+        type=int,
+        default=None,
+        help="MQTT broker port override",
+    )
+    parser.add_argument(
+        "--ble-light-on-action",
+        default=None,
+        help="Action label mapped to BLE Light ON (default: HAND_UP)",
+    )
+    parser.add_argument(
+        "--ble-light-off-action",
+        default=None,
+        help="Action label mapped to BLE Light OFF (default: WAVE)",
+    )
+    parser.add_argument(
         "--model",
         action="append",
         dest="models",
@@ -168,6 +220,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "download-models":
         return run_download_models(args.models, args.force)
     if args.command == "gui":
+        if args.action_transport is not None:
+            os.environ["CROSS_EVENT_TRANSPORT"] = args.action_transport
+        if args.ble_address is not None:
+            os.environ["CROSS_EVENT_BLE_ADDRESS"] = args.ble_address
+        if args.mqtt_host is not None:
+            os.environ["CROSS_EVENT_MQTT_HOST"] = args.mqtt_host
+        if args.mqtt_port is not None:
+            os.environ["CROSS_EVENT_MQTT_PORT"] = str(args.mqtt_port)
+        if args.ble_light_on_action is not None:
+            os.environ["CROSS_EVENT_BLE_LIGHT_ON_ACTION"] = args.ble_light_on_action
+        if args.ble_light_off_action is not None:
+            os.environ["CROSS_EVENT_BLE_LIGHT_OFF_ACTION"] = args.ble_light_off_action
         try:
             from .gui import launch_gui
         except ImportError as error:
@@ -176,7 +240,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"details: {error}"
             )
         try:
-            return launch_gui(args.database, args.vision_backend)
+            return launch_gui(
+                args.database,
+                args.vision_backend,
+                action_classifier_path=args.action_classifier,
+                posec3d_checkpoint_path=args.posec3d_checkpoint,
+            )
         except RuntimeError as error:
             parser.error(str(error))
     return 0

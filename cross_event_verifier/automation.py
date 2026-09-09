@@ -119,6 +119,7 @@ class _TrackAutomationState:
     gait_event_proposals: dict[str, "_GaitProposal"] = field(default_factory=dict)
     gait_window_start_timestamp: float | None = None
     subtracklet_id: str | None = None
+    action_segment_id: str | None = None
     action_type: ActionType | None = None
     action_gate_active: bool = False
 
@@ -309,6 +310,7 @@ class AutomaticVerificationController:
             self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             state.subtracklet_id = None
+            state.action_segment_id = None
             if discard_unpreserved and candidate_id not in keep:
                 del self._states[candidate_id]
                 self.verifier.delete_gait_event_proposals(candidate_id)
@@ -385,7 +387,30 @@ class AutomaticVerificationController:
             state.gait_window_start_timestamp = None
             state.action_type = None
             state.action_gate_active = False
+            # A ByteTrack ID is not an identity credential.  Once the visual
+            # adapter reports a new clean segment, the legacy gait-first path
+            # must also drop its local binding and one-shot appearance token;
+            # otherwise a hard switch could continue writing evidence to the
+            # previous person.
+            state.identity_id = None
+            state.pending_request_id = None
         state.subtracklet_id = current
+
+    @staticmethod
+    def _sync_action_segment(
+        state: _TrackAutomationState,
+        observation: Observation,
+    ) -> None:
+        """Keep a visual binding but never aggregate gait across actions."""
+
+        value = observation.metadata.get("action_segment_id")
+        current = str(value) if value not in (None, "") else None
+        if current is None:
+            return
+        if state.action_segment_id is not None and state.action_segment_id != current:
+            AutomaticVerificationController._clear_gait_window(state)
+            state.gait_window_start_timestamp = None
+        state.action_segment_id = current
 
     @staticmethod
     def _resolve_action(
@@ -452,6 +477,7 @@ class AutomaticVerificationController:
         向量会与滚动单位中心比较。突然不匹配时只重置该轨迹的未完成窗口，
         防止把两个人或两个轨迹身份的样本平均到一起。
         """
+        self._sync_action_segment(state, observation)
         action_prediction = self._resolve_action(state, observation)
         if state.action_gate_active and not ActionRouter().allows_walk(action_prediction):
             self._clear_gait_window(state)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
+import os
 import time
 from typing import Sequence
 from uuid import uuid4
@@ -11,6 +12,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from .actions import ActionType, MANUAL_ACTION_TYPES
 from .automation import (
     AutomationPolicy,
     AutomationStatus,
@@ -23,8 +25,14 @@ from .runtime_parameters import (
     RuntimeParameterSpec,
     RuntimeParameterState,
 )
+from .smart_home import ActionPublisher
+from .transient_actions import ActionEvent, TransientActionManager
+from .transports import action_publisher_from_environment
 from .types import Decision, FeatureBundle, Observation, TrackQuality
 from .vision import Box, VisionAdapter, VisionTrack
+
+
+MANUAL_ACTION_TTL_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,7 @@ class PipelineTrack:
     quality: TrackQuality
     decision: Decision
     automation: AutomationStatus
+    action_type: str = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -50,6 +59,8 @@ class FrameResult:
     processing_seconds: float
     formal_identities: tuple[str, ...]
     pending_request_ids: tuple[str, ...]
+    action_events: tuple[ActionEvent, ...] = ()
+    transport_errors: tuple[str, ...] = ()
 
 
 class VideoVerifierPipeline:
@@ -73,6 +84,9 @@ class VideoVerifierPipeline:
         camera_id: str = "camera-1",
         automation_policy: AutomationPolicy | None = None,
         appearance_first: bool = False,
+        action_manager: TransientActionManager | None = None,
+        action_publisher: ActionPublisher | None = None,
+        auto_action_publisher: bool = True,
     ) -> None:
         """连接验证器、可替换视觉适配器和自动化策略。
 
@@ -178,6 +192,14 @@ class VideoVerifierPipeline:
             self.automation,
             vision,
         )
+        self.action_manager = action_manager or TransientActionManager()
+        self.action_publisher = (
+            action_publisher
+            if action_publisher is not None or not auto_action_publisher
+            else action_publisher_from_environment(
+                os.getenv("CROSS_EVENT_TRANSPORT", "mqtt").strip() or "mqtt"
+            )
+        )
         self.camera_id = camera_id
         self.capture_session_id = f"capture-{uuid4().hex}"
         # A stable candidate is an explicit enrollment correlation supplied by
@@ -192,6 +214,13 @@ class VideoVerifierPipeline:
         self._track_candidate_ids: dict[int, str] = {}
         self.frame_index = 0
         self._latest: dict[int, VisionTrack] = {}
+        # GUI actions are control-plane requests, not pose evidence. Keep
+        # them short-lived and consume them only after the same frame confirms
+        # a known identity; stale or unknown Tracks never become commands.
+        self._manual_action_requests: dict[
+            int, tuple[ActionType, float, str | None]
+        ] = {}
+        self._latest_identity_ids: dict[int, str | None] = {}
         # 保留一段输入源本地的短期历史供操作员登记使用。生产环境中的单帧可能
         # 短暂丢失腿部关键点或触碰边界，即使同一 Track 之前已经提供了强步态证据。
         # 手工登记应使用那份有效证据，而不是让最后一个瞬时帧决定结果。
@@ -262,6 +291,9 @@ class VideoVerifierPipeline:
         self.frame_index = 0
         self._latest.clear()
         self._track_history.clear()
+        self._manual_action_requests.clear()
+        self._latest_identity_ids.clear()
+        self.action_manager.reset()
         self.automation.reset_tracks(
             preserve_candidate_ids=(normalized_candidate,)
             if normalized_candidate is not None
@@ -279,6 +311,49 @@ class VideoVerifierPipeline:
 
         self.automation.set_registration_enabled(enabled)
 
+    def queue_manual_action(
+        self,
+        track_id: int,
+        action: ActionType | str,
+    ) -> None:
+        """Queue one operator-selected action for a currently visible Track.
+
+        The request is a control-plane command: it is neither persisted nor
+        fed into gait/identity evidence. It is released on a later frame only
+        when the same Track still has the same confirmed identity. If the
+        Track is not currently known, the request remains display-only and is
+        discarded at the identity boundary or after its short TTL.
+        """
+
+        normalized_track_id = int(track_id)
+        if normalized_track_id not in self._latest:
+            raise ValueError(f"Track {normalized_track_id} is not currently detected")
+        normalized_action = ActionType.parse(action)
+        if normalized_action not in MANUAL_ACTION_TYPES:
+            allowed = ", ".join(item.value for item in MANUAL_ACTION_TYPES)
+            raise ValueError(f"manual action must be one of: {allowed}")
+        self._manual_action_requests[normalized_track_id] = (
+            normalized_action,
+            time.monotonic(),
+            self._latest_identity_ids.get(normalized_track_id),
+        )
+
+    def _pending_manual_action(
+        self,
+        track_id: int,
+    ) -> tuple[ActionType, str | None] | None:
+        """Return an unexpired manual action and its identity binding."""
+
+        normalized_track_id = int(track_id)
+        request = self._manual_action_requests.get(normalized_track_id)
+        if request is None:
+            return None
+        action, requested_at, expected_identity = request
+        if time.monotonic() - requested_at > MANUAL_ACTION_TTL_SECONDS:
+            self._manual_action_requests.pop(normalized_track_id, None)
+            return None
+        return action, expected_identity
+
     def clear_gallery(self) -> None:
         """清空持久化身份，并丢弃当前帧管线中的短期状态。"""
 
@@ -287,8 +362,11 @@ class VideoVerifierPipeline:
         self._latest.clear()
         self._track_history.clear()
         self._track_candidate_ids.clear()
+        self._manual_action_requests.clear()
+        self._latest_identity_ids.clear()
         self._enrollment_track_id = None
         self.frame_index = 0
+        self.action_manager.reset()
         self.vision.reset()
 
     def set_appearance_request(
@@ -363,12 +441,12 @@ class VideoVerifierPipeline:
 
     @staticmethod
     def _label(track: PipelineTrack) -> str:
-        """为叠加层格式化身份、决策、分数和请求状态。"""
+        """为叠加层格式化动作、身份、决策、分数和请求状态。"""
         decision = track.decision
         subject = decision.identity_id or decision.candidate_id or f"T{track.track_id}"
         score = "-" if decision.score is None else f"{decision.score:.2f}"
         request = "  gait->appearance" if decision.appearance_request_id else ""
-        return f"{subject} | {decision.kind.value} | {score}{request}"
+        return f"{subject} | {track.action_type} | {decision.kind.value} | {score}{request}"
 
     def _annotate(self, frame: np.ndarray, tracks: Sequence[PipelineTrack]) -> np.ndarray:
         """在帧副本上绘制检测框和紧凑的决策标签。"""
@@ -425,13 +503,27 @@ class VideoVerifierPipeline:
             )
             clean_subtracklet = item.clean_subtracklet
             observation_metadata = dict(getattr(item, "metadata", {}) or {})
+            timeline = observation_metadata.get("camera_view_timeline")
+            if isinstance(timeline, (tuple, list)):
+                observation_metadata["camera_view_timeline"] = tuple(
+                    {**sample, "camera_id": self.camera_id}
+                    for sample in timeline
+                    if isinstance(sample, dict)
+                )
             observation_metadata.update({
                 "source": "standalone-gui",
                 "vision_adapter": type(self.vision).__name__,
                 "vision_backend": str(
                     getattr(self.vision, "backend_status", "unknown")
                 ),
+                # Production gait writes are fail-closed.  Legacy/direct API
+                # callers retain compatibility unless they explicitly opt in.
+                "gait_action_evidence_required": type(self.vision).__name__
+                == "ProductionVisionAdapter",
                 "track_box": tuple(item.box),
+                "camera_id": self.camera_id,
+                "pipeline_frame_index": self.frame_index,
+                "pipeline_timestamp": now,
                 "active_track_count": len(vision_tracks),
                 "candidate_key": candidate_id,
             })
@@ -527,12 +619,100 @@ class VideoVerifierPipeline:
                     ),
                 )
             )
+            self.action_manager.observe(
+                item.track_id,
+                item.pose_keypoints,
+                item.box,
+                timestamp=now,
+                segment_id=(
+                    item.clean_subtracklet.segment_id
+                    if item.clean_subtracklet is not None
+                    else None
+                ),
+            )
         verified = self.automation.verify_batch(
             [item[2] for item in prepared],
             candidate_ids=[item[1] for item in prepared],
         )
         tracks: list[PipelineTrack] = []
+        action_events: list[ActionEvent] = []
+        transport_errors: list[str] = []
         for (item, _, _), (decision, automation) in zip(prepared, verified):
+            identity_id = (
+                decision.identity_id if decision.open_set_label == "KNOWN" else None
+            )
+            manual_request = self._pending_manual_action(item.track_id)
+            manual_action = manual_request[0] if manual_request is not None else None
+            expected_identity = (
+                manual_request[1] if manual_request is not None else None
+            )
+            released = self.action_manager.authorize(
+                item.track_id,
+                identity_id,
+                timestamp=now,
+                camera_id=self.camera_id,
+            )
+            events_for_track = list(released)
+            manual_event: ActionEvent | None = None
+            if (
+                manual_action is not None
+                and expected_identity is not None
+                and identity_id == expected_identity
+            ):
+                # For an explicit GUI command confidence means command
+                # acceptance, not model confidence. The normal ActionEvent
+                # contract is retained for both MQTT and BLE Light.
+                manual_event = ActionEvent(
+                    identity_id=identity_id,
+                    track_id=int(item.track_id),
+                    action=manual_action,
+                    confidence=1.0,
+                    timestamp=now,
+                    camera_id=self.camera_id,
+                )
+                events_for_track.append(manual_event)
+                self._manual_action_requests.pop(int(item.track_id), None)
+            elif (
+                manual_action is not None
+                and expected_identity is not None
+                and identity_id != expected_identity
+            ):
+                # A temporary identity loss or ID switch is a hard boundary;
+                # never replay the command for a different person.
+                self._manual_action_requests.pop(int(item.track_id), None)
+            action_events.extend(events_for_track)
+            if self.action_publisher is not None:
+                for event in events_for_track:
+                    try:
+                        self.action_publisher.publish(event)
+                    except Exception as error:
+                        # A device/broker outage must not stop visual tracking.
+                        # Keep the completed event in FrameResult so callers can
+                        # audit the failed delivery and surface a clear status.
+                        transport_errors.append(
+                            f"{event.action.value}（{event.identity_id}）：{error}"
+                        )
+            transient_action = self.action_manager.current_action(
+                item.track_id,
+                timestamp=now,
+            )
+            display_action = (
+                manual_event.action.value
+                if manual_event is not None
+                else (
+                    manual_action.value
+                    if manual_action is not None
+                    else (
+                        transient_action.value
+                        if transient_action is not None
+                        else str(
+                            item.metadata.get("action_type", "UNKNOWN")
+                            if getattr(item, "metadata", None)
+                            else "UNKNOWN"
+                        )
+                    )
+                )
+            )
             tracks.append(
                 PipelineTrack(
                     track_id=item.track_id,
@@ -541,11 +721,20 @@ class VideoVerifierPipeline:
                     quality=item.quality,
                     decision=decision,
                     automation=automation,
+                    action_type=display_action,
                 )
             )
             self._latest[item.track_id] = item
+            self._latest_identity_ids[item.track_id] = identity_id
             self._remember_track(item)
         active_ids = {item.track_id for item in vision_tracks}
+        self.action_manager.expire(active_ids, timestamp=now)
+        for track_id in tuple(self._manual_action_requests):
+            if track_id not in active_ids:
+                self._manual_action_requests.pop(track_id, None)
+        for track_id in tuple(self._latest_identity_ids):
+            if track_id not in active_ids:
+                self._latest_identity_ids.pop(track_id, None)
         for track_id in tuple(self._latest):
             if track_id not in active_ids:
                 # 跟踪器仍存活时保留最新快照；一旦它从适配器输出中消失，就丢弃。
@@ -564,7 +753,25 @@ class VideoVerifierPipeline:
                 item.request_id
                 for item in self.verifier.pending_appearance_requests(now=now)
             ),
+            action_events=tuple(action_events),
+            transport_errors=tuple(transport_errors),
         )
+
+    def close(self) -> None:
+        """Release the optional action transport owned by this pipeline."""
+
+        if self.action_publisher is not None:
+            self.action_publisher.close()
+
+    def set_action_publisher(self, publisher: ActionPublisher | None) -> None:
+        """Replace the event transport after the current source has stopped."""
+
+        if publisher is self.action_publisher:
+            return
+        previous = self.action_publisher
+        self.action_publisher = publisher
+        if previous is not None:
+            previous.close()
 
     def latest_track_ids(self) -> tuple[int, ...]:
         """返回登记控件当前可用的轨迹 ID。"""

@@ -15,6 +15,7 @@ from typing import Literal, Mapping
 
 import cv2
 
+from .actions import ActionType
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterState
 
@@ -312,6 +313,21 @@ class FrameWorker:
             return
         self._commands.put(("parameters", payload, None))
 
+    def trigger_manual_action(self, track_id: int, action: ActionType | str) -> None:
+        """Queue one GUI-selected action at a safe frame boundary."""
+
+        normalized_action = ActionType.parse(action)
+        if not self.running:
+            self.pipeline.queue_manual_action(track_id, normalized_action)
+            self._put(
+                StatusMessage(
+                    "info",
+                    f"已选择 Track {int(track_id)} 执行动作 {normalized_action.value}；等待下一帧确认身份",
+                )
+            )
+            return
+        self._commands.put(("manual_action", normalized_action.value, int(track_id)))
+
     def _apply_runtime_parameters(
         self,
         values: dict[str, object],
@@ -353,6 +369,26 @@ class FrameWorker:
             if command == "parameters":
                 if isinstance(payload, dict):
                     self._apply_runtime_parameters(payload, generation=generation)
+                continue
+            if command == "manual_action":
+                try:
+                    normalized_action = ActionType.parse(payload)
+                    self.pipeline.queue_manual_action(
+                        int(track_id) if track_id is not None else -1,
+                        normalized_action,
+                    )
+                    self._put(
+                        StatusMessage(
+                            "info",
+                            f"已选择 Track {int(track_id)} 执行动作 {normalized_action.value}；等待下一帧确认身份",
+                        ),
+                        generation=generation,
+                    )
+                except Exception as error:
+                    self._put(
+                        StatusMessage("error", f"手动动作未排队：{error}"),
+                        generation=generation,
+                    )
                 continue
             if command != "register":
                 continue

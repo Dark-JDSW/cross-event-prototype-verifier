@@ -53,3 +53,33 @@ The tensor-only state dictionary included here was derived from the official
 checkpoint to permit safe `weights_only=True` loading; that transformation does
 not remove upstream usage restrictions. Obtain separate permission or replace
 this gait backend before commercial deployment.
+
+## MMAction2 / PoseC3D-HMDB51
+
+- Project: <https://github.com/open-mmlab/mmaction2>
+- Code license: Apache-2.0
+- Checkpoint source:
+  <https://download.openmmlab.com/mmaction/v1.0/skeleton/posec3d/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint_20220815-17eaa484.pth>
+- Model: `models/posec3d_hmdb51_split1.pth`
+- Runtime: the optional adapter in `cross_event_verifier/posec3d_action.py`
+  uses the official MMAction2 inference API and the vendored
+  `models/posec3d_hmdb51_runtime.py` pipeline.
+
+The checkpoint is trained on HMDB51. Verify the dataset and checkpoint terms
+separately before redistribution or commercial deployment; the MMAction2 code
+license does not grant rights to the underlying dataset or weights.
+
+## Bleak
+
+- Project: <https://github.com/hbldh/bleak>
+- License: MIT
+- Use: optional Windows/Linux/macOS BLE GATT client used by
+  `cross_event_verifier/ble_bridge.py` to send action events to the ESP32-S3
+  firmware.
+
+## ESP-IDF NimBLE firmware
+
+- Project: <https://github.com/espressif/esp-idf>
+- License: Apache-2.0 (see the upstream repository for the complete notices)
+- Use: the standalone `firmware/esp32s3_ble` project uses the ESP-IDF NimBLE
+  host and GATT server APIs; ESP-IDF must be installed separately.

@@ -1,0 +1,15 @@
+{
+  "schema_version": "cross-event-rgb-gait-v1",
+  "status": "pending_external_data",
+  "source_id": "mevid-v1",
+  "event_count": 0,
+  "identity_count": 0,
+  "pose_and_track_files_present": false,
+  "production_training_eligible": false,
+  "pending_reasons": [
+    "MEVID access and license approval are not present in the repository.",
+    "Raw source-video to tracklet mapping and SHA-256 values are not present.",
+    "Walking-event verification and manual quality review are not present.",
+    "No project detector/tracker/RTMPose outputs have been generated."
+  ]
+}

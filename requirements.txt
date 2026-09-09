@@ -19,7 +19,13 @@ PyQt6>=6.7,<7
 ultralytics==8.3.163
 lap==0.5.13
 onnxruntime-gpu==1.27.0; platform_system == "Windows"
-onnxruntime-gpu>=1.20; platform_system != "Windows"
+onnxruntime-gpu>=1.27,<1.28; platform_system != "Windows"
+
+# 身份确认后的动作事件发布到 Home Assistant / MQTT：
+paho-mqtt>=2.1,<3
+
+# ESP32-S3 BLE GATT 客户端桥接（需要 Windows 蓝牙适配器）：
+bleak>=0.22,<2
 
 # 可选加速器：
 # scipy>=1.10       # 超大批量数据的精确匈牙利指派

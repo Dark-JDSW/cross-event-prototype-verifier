@@ -8,13 +8,16 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+import os
 import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
+import numpy as np
 
+from .actions import ActionType, MANUAL_ACTION_TYPES
 from .engine import CrossEventVerifier
 from .gui_theme import (
     INDUSTRIAL_NAVY,
@@ -27,10 +30,8 @@ from .gui_theme import (
     RETRO_ORANGE,
     RETRO_WHITE,
     SIGNAL_RED,
-    SOLAR_YELLOW,
     STATUS_GREEN,
     STATUS_PENDING,
-    VINTAGE_PAPER,
     configure_theme,
     draw_engineering_grid,
     draw_header_orbit,
@@ -45,9 +46,22 @@ from .media import (
     StatusMessage,
 )
 from .automation import AutomationPolicy
+from .ground_control import (
+    GroundControlPoint,
+    HomographyCheck,
+    compute_ground_homography,
+    load_ground_control_file,
+    parse_ground_control_point,
+    save_ground_control_file,
+)
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterSpec, RuntimeParameterState
 from .storage import SqliteStore
+from .transports import (
+    action_publisher_from_environment,
+    normalize_transport_mode,
+    transport_label,
+)
 from .vision_factory import build_vision_adapter
 
 
@@ -87,13 +101,15 @@ class VerifierWindow:
     """GUI 外壳；媒体和验证复杂性隐藏在工作线程接口之后。
 
     第一个 notebook 页面是监控页，第二个页面公开非 GUI 控制器使用的同一套
-    参数说明。这样标签、默认值和校验规则只有一个真实来源。
+    参数说明，第三个页面独立管理地面控制点标定。
     """
 
     def __init__(
         self,
         database_path: str = "data/verifier-production-v1.sqlite3",
         vision_backend: str = "production",
+        action_classifier_path: Path | None = None,
+        posec3d_checkpoint_path: Path | None = None,
     ) -> None:
         """创建验证器，并在生产后端下后台预加载模型后再启用采集。"""
         self.root = tk.Tk()
@@ -117,6 +133,14 @@ class VerifierWindow:
         self.pipeline = None
         self.worker = None
         self._photo: tk.PhotoImage | None = None
+        self.action_classifier_path = (
+            Path(action_classifier_path) if action_classifier_path is not None else None
+        )
+        self.posec3d_checkpoint_path = (
+            Path(posec3d_checkpoint_path)
+            if posec3d_checkpoint_path is not None
+            else None
+        )
 
         database = Path(database_path)
         if str(database) != ":memory:":
@@ -127,13 +151,21 @@ class VerifierWindow:
         self._initialize_variables(loading=selected != "demo")
         self._build_layout()
         if selected == "demo":
-            self.vision = build_vision_adapter(vision_backend)
+            self.vision = build_vision_adapter(
+                vision_backend,
+                action_classifier_path=self.action_classifier_path,
+                posec3d_checkpoint_path=self.posec3d_checkpoint_path,
+            )
             self._finish_runtime_initialization()
         else:
             self._preload_after_id = self.root.after(50, self._poll_preload)
             self._preload_thread = threading.Thread(
                 target=self._preload_backend,
-                args=(vision_backend,),
+                args=(
+                    vision_backend,
+                    self.action_classifier_path,
+                    self.posec3d_checkpoint_path,
+                ),
                 name="cross-event-model-preload",
                 daemon=True,
             )
@@ -147,6 +179,19 @@ class VerifierWindow:
         self.video_path = tk.StringVar()
         self.video_repeat_count = tk.StringVar(value="1")
         self.camera_id = tk.StringVar(value="camera-1")
+        raw_transport = os.getenv("CROSS_EVENT_TRANSPORT", "mqtt").strip()
+        try:
+            transport = normalize_transport_mode(raw_transport).value
+        except ValueError:
+            transport = "mqtt"
+        self.transport_mode = tk.StringVar(value=transport_label(transport))
+        self.transport_status = tk.StringVar(
+            value=f"{transport_label(transport)}：未配置"
+        )
+        self._active_transport_mode: str | None = None
+        self.manual_action_target = tk.StringVar()
+        self.manual_action_type = tk.StringVar(value=MANUAL_ACTION_TYPES[0].value)
+        self._manual_action_targets: dict[str, int] = {}
         self.identity_id = tk.StringVar(value="P1")
         self.candidate_id = tk.StringVar()
         self.automatic_registration = tk.BooleanVar(value=False)
@@ -170,6 +215,24 @@ class VerifierWindow:
         self.parameter_specs: dict[str, RuntimeParameterSpec] = {}
         self._parameter_syncing = False
         self._runtime_parameter_state = None
+        self.gcp_camera_id = tk.StringVar(value=self.camera_id.get())
+        self.gcp_coordinate_frame = tk.StringVar(value="ground-meters")
+        self.gcp_unit = tk.StringVar(value="m")
+        self.gcp_point_id = tk.StringVar(value="P1")
+        self.gcp_image_u = tk.StringVar()
+        self.gcp_image_v = tk.StringVar()
+        self.gcp_world_x = tk.StringVar()
+        self.gcp_world_y = tk.StringVar()
+        self.gcp_image_size = tk.StringVar(value="未加载")
+        self.gcp_status = tk.StringVar(value="请加载一张固定机位画面，然后在画布上点击地面点")
+        self.gcp_matrix = tk.StringVar(value="H 尚未校核")
+        self.gcp_rows: dict[str, GroundControlPoint] = {}
+        self.gcp_check: HomographyCheck | None = None
+        self._gcp_image: object | None = None
+        self._gcp_photo: tk.PhotoImage | None = None
+        self._gcp_display_scale = 1.0
+        self._gcp_display_offset = (0.0, 0.0)
+        self._gcp_image_size_value: tuple[int, int] | None = None
 
     def _publish_preload(self, text: str, progress: float) -> None:
         """在线程安全队列中记录预加载阶段，Tk 只在主线程消费它。"""
@@ -177,7 +240,12 @@ class VerifierWindow:
         if not self._preload_cancel.is_set():
             self._preload_messages.put(("stage", text, progress, None))
 
-    def _preload_backend(self, backend: str) -> None:
+    def _preload_backend(
+        self,
+        backend: str,
+        action_classifier_path: Path | None = None,
+        posec3d_checkpoint_path: Path | None = None,
+    ) -> None:
         """在后台构造视觉适配器、加载模型并执行 Dummy warmup。"""
 
         try:
@@ -185,6 +253,8 @@ class VerifierWindow:
                 backend,
                 preload=True,
                 on_stage=self._publish_preload,
+                action_classifier_path=action_classifier_path,
+                posec3d_checkpoint_path=posec3d_checkpoint_path,
             )
         except Exception as error:
             self._preload_messages.put(
@@ -243,7 +313,12 @@ class VerifierWindow:
             self.vision,
             automation_policy=AutomationPolicy(enabled=automatic_capable),
             appearance_first=True,
+            action_publisher=self._new_action_publisher(self.transport_mode.get()),
+            auto_action_publisher=False,
         )
+        self._active_transport_mode = normalize_transport_mode(
+            self.transport_mode.get()
+        ).value
         self.worker = FrameWorker(self.pipeline)
         self._runtime_parameter_state = self.pipeline.runtime_parameter_state()
         self.automatic_registration.set(automatic_capable)
@@ -493,12 +568,32 @@ class VerifierWindow:
             controls,
             textvariable=self.backend_status,
             style="Retro.Muted.TLabel",
-        ).grid(row=1, column=3, columnspan=9, padx=8, pady=(0, 2), sticky="w")
+        ).grid(row=1, column=3, columnspan=5, padx=8, pady=(0, 2), sticky="w")
         ttk.Label(
             controls,
             text="MODULE / 01  ·  INPUT ARRAY",
             style="Retro.PanelMarker.TLabel",
         ).grid(row=1, column=0, columnspan=3, padx=8, pady=(0, 2), sticky="w")
+        ttk.Label(controls, text="事件传输").grid(
+            row=1, column=8, padx=(8, 3), pady=(0, 2), sticky="e"
+        )
+        self.transport_combo = ttk.Combobox(
+            controls,
+            textvariable=self.transport_mode,
+            values=("MQTT", "BLE Light"),
+            state="readonly",
+            width=10,
+        )
+        self.transport_combo.grid(row=1, column=9, padx=3, pady=(0, 2), sticky="w")
+        self.transport_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._transport_mode_changed(),
+        )
+        ttk.Label(
+            controls,
+            textvariable=self.transport_status,
+            style="Retro.Muted.TLabel",
+        ).grid(row=1, column=10, columnspan=2, padx=(5, 8), pady=(0, 2), sticky="w")
         self.preload_frame = ttk.Frame(controls)
         self.preload_frame.columnconfigure(1, weight=1)
         self.preload_phase = tk.StringVar(value="正在后台准备生产视觉后端…")
@@ -529,9 +624,12 @@ class VerifierWindow:
         self.notebook.grid(row=2, column=0, padx=24, pady=(6, 12), sticky="nsew")
         monitor_page = ttk.Frame(self.notebook)
         parameter_page = ttk.Frame(self.notebook)
+        gcp_page = ttk.Frame(self.notebook)
         self.parameter_page = parameter_page
+        self.gcp_page = gcp_page
         self.notebook.add(monitor_page, text="01 / 实时识别")
         self.notebook.add(parameter_page, text="02 / 实时参数")
+        self.notebook.add(gcp_page, text="03 / 地面控制点")
 
         monitor_grid = tk.Canvas(
             monitor_page,
@@ -567,6 +665,22 @@ class VerifierWindow:
         )
         self._after_idle(
             lambda canvas=parameter_grid: self._redraw_page_engineering_grid(canvas)
+        )
+
+        gcp_grid = tk.Canvas(
+            gcp_page,
+            background=RETRO_WHITE,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.gcp_background_canvas = gcp_grid
+        gcp_grid.place(relx=0, rely=0, relwidth=1, relheight=1)
+        gcp_grid.bind(
+            "<Configure>",
+            lambda _event, canvas=gcp_grid: self._redraw_page_engineering_grid(canvas),
+        )
+        self._after_idle(
+            lambda canvas=gcp_grid: self._redraw_page_engineering_grid(canvas)
         )
 
         body = ttk.Frame(monitor_page)
@@ -673,12 +787,13 @@ class VerifierWindow:
         ).pack(anchor="w", pady=(0, 6))
         self.track_tree = ttk.Treeview(
             side,
-            columns=("track", "identity", "kind", "automation", "score"),
+            columns=("track", "action", "identity", "kind", "automation", "score"),
             show="headings",
             height=18,
         )
         for column, heading, width in (
             ("track", "Track", 58),
+            ("action", "动作", 86),
             ("identity", "身份/候选", 105),
             ("kind", "结果", 125),
             ("automation", "自动流程", 170),
@@ -708,6 +823,58 @@ class VerifierWindow:
             background=PALE_RED,
         )
         self.track_tree.pack(fill="x", expand=False)
+        self.track_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: self._sync_manual_action_target(),
+        )
+
+        action_box = ttk.LabelFrame(
+            side,
+            text="手动动作触发",
+            style="Retro.Module.TLabelframe",
+        )
+        action_box.pack(fill="x", pady=(14, 0))
+        ttk.Label(action_box, text="目标（Track / 身份）").grid(
+            row=0, column=0, padx=6, pady=(8, 4), sticky="w"
+        )
+        self.manual_action_target_combo = ttk.Combobox(
+            action_box,
+            textvariable=self.manual_action_target,
+            values=(),
+            state="disabled",
+            width=34,
+        )
+        self.manual_action_target_combo.grid(
+            row=0, column=1, padx=6, pady=(8, 4), sticky="ew"
+        )
+        ttk.Label(action_box, text="动作").grid(
+            row=1, column=0, padx=6, pady=4, sticky="w"
+        )
+        self.manual_action_combo = ttk.Combobox(
+            action_box,
+            textvariable=self.manual_action_type,
+            values=tuple(item.value for item in MANUAL_ACTION_TYPES),
+            state="disabled",
+            width=18,
+        )
+        self.manual_action_combo.grid(
+            row=1, column=1, padx=6, pady=4, sticky="ew"
+        )
+        self.manual_action_button = ttk.Button(
+            action_box,
+            text="按所选动作触发",
+            command=self.trigger_manual_action,
+            state="disabled",
+        )
+        self.manual_action_button.grid(
+            row=2, column=0, columnspan=2, padx=6, pady=(4, 6), sticky="ew"
+        )
+        ttk.Label(
+            action_box,
+            text="动作只在下一帧再次确认身份为 KNOWN 后发布；不会写入步态库。",
+            wraplength=470,
+        ).grid(row=3, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
+        action_box.columnconfigure(1, weight=1)
 
         enrollment = ttk.LabelFrame(
             side,
@@ -799,6 +966,7 @@ class VerifierWindow:
         ).pack(fill="x", padx=8, pady=(0, 8))
 
         self._build_parameter_page(parameter_page)
+        self._build_gcp_page(gcp_page)
         self._refresh_scroll_canvases()
 
         status = ttk.Label(
@@ -809,6 +977,449 @@ class VerifierWindow:
         )
         status.grid(row=3, column=0, padx=24, pady=(0, 14), sticky="ew")
         self._source_mode_changed()
+
+    def _build_gcp_page(self, page: ttk.Frame) -> None:
+        """构造独立的地面控制点标定页，不改变实时识别数据流。"""
+
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+        toolbar = ttk.Frame(page)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=24, pady=(14, 8))
+        ttk.Label(
+            toolbar,
+            text="MODULE / 05  ·  GROUND CONTROL POINTS",
+            style="Retro.PanelMarker.TLabel",
+        ).pack(side="left")
+        ttk.Button(toolbar, text="加载画面…", command=self._gcp_load_image).pack(
+            side="right"
+        )
+        ttk.Button(toolbar, text="导入标定…", command=self._gcp_import).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(
+            toolbar,
+            text="导出标定…",
+            command=self._gcp_export,
+            style="Retro.Primary.TButton",
+        ).pack(side="right", padx=(0, 8))
+
+        body = ttk.Frame(page)
+        body.grid(row=1, column=0, sticky="nsew", padx=22, pady=(0, 18))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        preview_panel = tk.Frame(
+            body,
+            background=PANEL_CREAM,
+            highlightbackground=INDUSTRIAL_NAVY,
+            highlightthickness=1,
+        )
+        preview_panel.grid(row=0, column=0, sticky="nsew")
+        preview_panel.columnconfigure(0, weight=1)
+        preview_panel.rowconfigure(0, weight=1)
+        self.gcp_canvas = tk.Canvas(
+            preview_panel,
+            background=PANEL_CREAM,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.gcp_canvas.grid(row=0, column=0, sticky="nsew")
+        self.gcp_canvas.bind("<Configure>", lambda _event: self._gcp_render())
+        self.gcp_canvas.bind("<Button-1>", self._gcp_canvas_click)
+        ttk.Label(
+            preview_panel,
+            text="点击地面控制点获取像素坐标；然后在右侧录入对应世界坐标。",
+            style="Retro.Muted.TLabel",
+        ).grid(row=1, column=0, padx=8, pady=6, sticky="w")
+
+        right = ttk.Frame(body)
+        right.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+
+        metadata = ttk.LabelFrame(
+            right,
+            text="标定元数据",
+            style="Retro.Module.TLabelframe",
+        )
+        metadata.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        metadata.columnconfigure(1, weight=1)
+        for row, label, variable in (
+            (0, "摄像头 ID", self.gcp_camera_id),
+            (1, "世界坐标系", self.gcp_coordinate_frame),
+            (2, "单位", self.gcp_unit),
+        ):
+            ttk.Label(metadata, text=label).grid(row=row, column=0, padx=6, pady=5, sticky="w")
+            ttk.Entry(metadata, textvariable=variable).grid(
+                row=row, column=1, padx=6, pady=5, sticky="ew"
+            )
+        ttk.Label(metadata, text="画面尺寸").grid(row=3, column=0, padx=6, pady=5, sticky="w")
+        ttk.Label(metadata, textvariable=self.gcp_image_size, style="Retro.Muted.TLabel").grid(
+            row=3, column=1, padx=6, pady=5, sticky="w"
+        )
+
+        point_form = ttk.LabelFrame(
+            right,
+            text="控制点标记 / 录入",
+            style="Retro.Module.TLabelframe",
+        )
+        point_form.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        point_form.columnconfigure(1, weight=1)
+        point_form.columnconfigure(3, weight=1)
+        fields = (
+            (0, 0, "点 ID", self.gcp_point_id),
+            (0, 2, "像素 U", self.gcp_image_u),
+            (1, 0, "像素 V", self.gcp_image_v),
+            (1, 2, "世界 X", self.gcp_world_x),
+            (2, 0, "世界 Y", self.gcp_world_y),
+        )
+        for row, column, label, variable in fields:
+            ttk.Label(point_form, text=label).grid(
+                row=row, column=column, padx=6, pady=5, sticky="w"
+            )
+            ttk.Entry(point_form, textvariable=variable, width=12).grid(
+                row=row, column=column + 1, padx=6, pady=5, sticky="ew"
+            )
+        ttk.Button(point_form, text="添加 / 更新", command=self._gcp_upsert).grid(
+            row=2, column=2, padx=6, pady=5, sticky="ew"
+        )
+        ttk.Button(point_form, text="删除选中", command=self._gcp_delete).grid(
+            row=2, column=3, padx=6, pady=5, sticky="ew"
+        )
+
+        table_box = ttk.LabelFrame(
+            right,
+            text="控制点清单",
+            style="Retro.Module.TLabelframe",
+        )
+        table_box.grid(row=2, column=0, sticky="nsew")
+        table_box.columnconfigure(0, weight=1)
+        table_box.rowconfigure(0, weight=1)
+        self.gcp_tree = ttk.Treeview(
+            table_box,
+            columns=("id", "u", "v", "x", "y", "check"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, heading, width in (
+            ("id", "ID", 52),
+            ("u", "U", 72),
+            ("v", "V", 72),
+            ("x", "X", 72),
+            ("y", "Y", 72),
+            ("check", "校核", 100),
+        ):
+            self.gcp_tree.heading(column, text=heading)
+            self.gcp_tree.column(column, width=width, anchor="center")
+        self.gcp_tree.tag_configure("inlier", foreground=STATUS_GREEN)
+        self.gcp_tree.tag_configure("outlier", foreground=SIGNAL_RED)
+        self.gcp_tree.grid(row=0, column=0, sticky="nsew")
+        gcp_scrollbar = ttk.Scrollbar(
+            table_box,
+            orient="vertical",
+            command=self.gcp_tree.yview,
+            style="Retro.Vertical.TScrollbar",
+        )
+        gcp_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.gcp_tree.configure(yscrollcommand=gcp_scrollbar.set)
+        self.gcp_tree.bind("<<TreeviewSelect>>", self._gcp_select)
+
+        footer = ttk.Frame(right)
+        footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Button(
+            footer,
+            text="计算并校核 Homography",
+            command=self._gcp_check_homography,
+            style="Retro.Primary.TButton",
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            footer,
+            text="清空控制点",
+            command=self._gcp_clear,
+            style="Retro.Danger.TButton",
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            footer,
+            textvariable=self.gcp_status,
+            wraplength=470,
+            style="Retro.Muted.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            footer,
+            textvariable=self.gcp_matrix,
+            wraplength=470,
+            style="Retro.Range.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+    def _gcp_next_id(self) -> str:
+        index = 1
+        while f"P{index}" in self.gcp_rows:
+            index += 1
+        return f"P{index}"
+
+    def _gcp_current_point(self) -> GroundControlPoint:
+        return parse_ground_control_point(
+            self.gcp_point_id.get(),
+            self.gcp_image_u.get(),
+            self.gcp_image_v.get(),
+            self.gcp_world_x.get(),
+            self.gcp_world_y.get(),
+        )
+
+    def _gcp_upsert(self) -> None:
+        try:
+            point = self._gcp_current_point()
+        except ValueError as error:
+            messagebox.showerror("控制点录入失败", str(error))
+            return
+        self.gcp_rows[point.point_id] = point
+        self.gcp_point_id.set(self._gcp_next_id())
+        self.gcp_check = None
+        self.gcp_matrix.set("H 尚未校核")
+        self._gcp_refresh_tree()
+        self._gcp_render()
+        self.gcp_status.set(f"已记录 {point.point_id}；还可继续点击画面标记下一点")
+
+    def _gcp_select(self, _event: tk.Event | None = None) -> None:
+        selection = self.gcp_tree.selection()
+        if not selection:
+            return
+        point = self.gcp_rows.get(selection[0])
+        if point is None:
+            return
+        self.gcp_point_id.set(point.point_id)
+        self.gcp_image_u.set(f"{point.image_u:.3f}")
+        self.gcp_image_v.set(f"{point.image_v:.3f}")
+        self.gcp_world_x.set(f"{point.world_x:.3f}")
+        self.gcp_world_y.set(f"{point.world_y:.3f}")
+
+    def _gcp_delete(self) -> None:
+        selection = self.gcp_tree.selection()
+        if not selection:
+            self.gcp_status.set("请先在清单中选择控制点")
+            return
+        self.gcp_rows.pop(selection[0], None)
+        self.gcp_check = None
+        self.gcp_matrix.set("H 尚未校核")
+        self._gcp_refresh_tree()
+        self._gcp_render()
+        self.gcp_status.set("已删除选中控制点")
+
+    def _gcp_refresh_tree(self) -> None:
+        for item in self.gcp_tree.get_children():
+            self.gcp_tree.delete(item)
+        for point_id, point in self.gcp_rows.items():
+            check_text = "未校核"
+            tag = ()
+            if self.gcp_check is not None:
+                index = list(self.gcp_rows).index(point_id)
+                inlier = self.gcp_check.inliers[index]
+                error = self.gcp_check.reprojection_errors[index]
+                check_text = f"{'内点' if inlier else '外点'} {error:.3f}"
+                tag = ("inlier" if inlier else "outlier",)
+            self.gcp_tree.insert(
+                "",
+                "end",
+                iid=point_id,
+                values=(
+                    point_id,
+                    f"{point.image_u:.2f}",
+                    f"{point.image_v:.2f}",
+                    f"{point.world_x:.3f}",
+                    f"{point.world_y:.3f}",
+                    check_text,
+                ),
+                tags=tag,
+            )
+
+    def _gcp_load_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择固定机位画面",
+            filetypes=(
+                ("图像", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                ("全部文件", "*.*"),
+            ),
+        )
+        if not path:
+            return
+        image = cv2.imread(path)
+        if image is None:
+            messagebox.showerror("画面加载失败", "无法读取所选图像")
+            return
+        self._gcp_image = image
+        height, width = image.shape[:2]
+        self._gcp_image_size_value = (int(width), int(height))
+        self.gcp_image_size.set(f"{width} × {height}")
+        self._gcp_render()
+        self.gcp_status.set(f"已加载画面 {Path(path).name}；点击地面点开始标记")
+
+    def _gcp_render(self) -> None:
+        if not hasattr(self, "gcp_canvas"):
+            return
+        canvas = self.gcp_canvas
+        canvas.delete("gcp-image")
+        canvas.delete("gcp-marker")
+        image = self._gcp_image
+        if image is None or not hasattr(image, "shape"):
+            canvas.create_text(
+                max(canvas.winfo_width() // 2, 1),
+                max(canvas.winfo_height() // 2, 1),
+                text="加载固定机位画面后，在此标记地面控制点",
+                fill=INDUSTRIAL_NAVY,
+                font=("Segoe UI", 11, "bold"),
+                tags="gcp-marker",
+            )
+            return
+        height, width = image.shape[:2]
+        available_width = max(canvas.winfo_width(), 2)
+        available_height = max(canvas.winfo_height(), 2)
+        scale = min(available_width / width, available_height / height)
+        scale = min(scale, 1.0)
+        display_width = max(1, int(round(width * scale)))
+        display_height = max(1, int(round(height * scale)))
+        display = cv2.resize(image, (display_width, display_height), interpolation=cv2.INTER_AREA)
+        self._gcp_photo = _frame_to_photo(
+            display,
+            maximum_width=display_width,
+            maximum_height=display_height,
+            master=canvas,
+        )
+        offset_x = (available_width - display_width) / 2.0
+        offset_y = (available_height - display_height) / 2.0
+        self._gcp_display_scale = scale
+        self._gcp_display_offset = (offset_x, offset_y)
+        canvas.create_image(
+            offset_x,
+            offset_y,
+            anchor="nw",
+            image=self._gcp_photo,
+            tags="gcp-image",
+        )
+        for point in self.gcp_rows.values():
+            x = offset_x + point.image_u * scale
+            y = offset_y + point.image_v * scale
+            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, outline=RETRO_ORANGE, width=2, tags="gcp-marker")
+            canvas.create_text(x + 8, y - 8, text=point.point_id, anchor="sw", fill=INDUSTRIAL_NAVY, font=("Consolas", 9, "bold"), tags="gcp-marker")
+        try:
+            pending_u = float(self.gcp_image_u.get())
+            pending_v = float(self.gcp_image_v.get())
+        except (TypeError, ValueError):
+            return
+        if 0 <= pending_u <= width and 0 <= pending_v <= height:
+            x = offset_x + pending_u * scale
+            y = offset_y + pending_v * scale
+            canvas.create_line(x - 8, y, x + 8, y, fill=NASA_BLUE, width=1, tags="gcp-marker")
+            canvas.create_line(x, y - 8, x, y + 8, fill=NASA_BLUE, width=1, tags="gcp-marker")
+
+    def _gcp_canvas_click(self, event: tk.Event) -> None:
+        image = self._gcp_image
+        if image is None or not hasattr(image, "shape"):
+            return
+        height, width = image.shape[:2]
+        offset_x, offset_y = self._gcp_display_offset
+        scale = self._gcp_display_scale
+        if scale <= 0:
+            return
+        image_u = (float(event.x) - offset_x) / scale
+        image_v = (float(event.y) - offset_y) / scale
+        if not (0 <= image_u <= width and 0 <= image_v <= height):
+            return
+        self.gcp_image_u.set(f"{image_u:.3f}")
+        self.gcp_image_v.set(f"{image_v:.3f}")
+        if not self.gcp_point_id.get().strip() or self.gcp_point_id.get() in self.gcp_rows:
+            self.gcp_point_id.set(self._gcp_next_id())
+        self.gcp_status.set(f"已标记像素坐标 ({image_u:.2f}, {image_v:.2f})；请输入世界坐标后添加")
+        self._gcp_render()
+
+    def _gcp_check_homography(self, *, show_error: bool = True) -> HomographyCheck | None:
+        try:
+            check = compute_ground_homography(list(self.gcp_rows.values()))
+        except ValueError as error:
+            self.gcp_check = None
+            self.gcp_matrix.set("H 尚未校核")
+            self.gcp_status.set(str(error))
+            if show_error:
+                messagebox.showerror("Homography 校核失败", str(error))
+            return None
+        self.gcp_check = check
+        self._gcp_refresh_tree()
+        matrix = np.asarray(check.matrix, dtype=float).reshape(3, 3)
+        matrix_text = "H = " + "; ".join(", ".join(f"{value:.5g}" for value in row) for row in matrix)
+        self.gcp_matrix.set(matrix_text)
+        self.gcp_status.set(
+            f"校核通过：{len(self.gcp_rows)} 点，内点 {sum(check.inliers)}，"
+            f"RMSE {check.rmse:.4f} {self.gcp_unit.get() or 'm'}，最大误差 {check.maximum_error:.4f}"
+        )
+        return check
+
+    def _gcp_clear(self) -> None:
+        self.gcp_rows.clear()
+        self.gcp_check = None
+        self.gcp_matrix.set("H 尚未校核")
+        self.gcp_point_id.set("P1")
+        self._gcp_refresh_tree()
+        self._gcp_render()
+        self.gcp_status.set("已清空控制点")
+
+    def _gcp_import(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入地面控制点标定",
+            filetypes=(("GCP JSON", "*.json"), ("全部文件", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            payload = load_ground_control_file(path)
+        except ValueError as error:
+            messagebox.showerror("标定导入失败", str(error))
+            return
+        self.gcp_camera_id.set(str(payload["camera_id"]))
+        self.gcp_coordinate_frame.set(str(payload["coordinate_frame"]))
+        self.gcp_unit.set(str(payload["unit"]))
+        image_size = payload.get("image_size")
+        if isinstance(image_size, list) and len(image_size) == 2:
+            self._gcp_image_size_value = (int(image_size[0]), int(image_size[1]))
+            self.gcp_image_size.set(
+                f"{self._gcp_image_size_value[0]} × {self._gcp_image_size_value[1]}"
+            )
+        self.gcp_rows = {point.point_id: point for point in payload["points"]}
+        self.gcp_point_id.set(self._gcp_next_id())
+        self._gcp_check_homography(show_error=False)
+        self._gcp_render()
+        self.gcp_status.set(f"已导入 {Path(path).name}；请确认画面与标定文件属于同一机位")
+
+    def _gcp_export(self) -> None:
+        check = self.gcp_check or self._gcp_check_homography()
+        if check is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出地面控制点标定",
+            defaultextension=".json",
+            filetypes=(("GCP JSON", "*.json"),),
+        )
+        if not path:
+            return
+        image_size: tuple[int, int] | None = None
+        if self._gcp_image is not None and hasattr(self._gcp_image, "shape"):
+            image_size = (int(self._gcp_image.shape[1]), int(self._gcp_image.shape[0]))
+        if image_size is None:
+            image_size = self._gcp_image_size_value
+        try:
+            save_ground_control_file(
+                path,
+                camera_id=self.gcp_camera_id.get(),
+                coordinate_frame=self.gcp_coordinate_frame.get(),
+                unit=self.gcp_unit.get(),
+                image_size=image_size,
+                points=list(self.gcp_rows.values()),
+                check=check,
+            )
+        except ValueError as error:
+            messagebox.showerror("标定导出失败", str(error))
+            return
+        self.gcp_status.set(f"已导出标定文件：{Path(path).name}")
 
     def _build_parameter_page(self, page: ttk.Frame) -> None:
         """根据运行时模块的参数说明构造可滚动页面。"""
@@ -1163,6 +1774,7 @@ class VerifierWindow:
         try:
             spec = self._source_spec()
             self.worker.start(spec)
+            self.transport_combo.configure(state="disabled")
             self._show_video_standby()
             repeat_text = (
                 f"（自动重复学习 {spec.repeat_count} 次）"
@@ -1179,7 +1791,57 @@ class VerifierWindow:
             self.status.set("模型仍在后台加载，请稍候")
             return
         self.worker.stop(timeout=None)
+        self.transport_combo.configure(state="readonly")
         self.status.set("已停止")
+
+    def _new_action_publisher(self, mode: str):
+        """Create the selected event transport without breaking model startup."""
+
+        selected = normalize_transport_mode(mode)
+        label = transport_label(selected)
+        try:
+            publisher = action_publisher_from_environment(selected)
+        except Exception as error:
+            self.transport_status.set(f"{label}：不可用")
+            self.status.set(f"{label} 初始化失败：{error}")
+            return None
+        if publisher is None:
+            self.transport_status.set(f"{label}：未配置")
+        else:
+            self.transport_status.set(f"{label}：已启用")
+        return publisher
+
+    def _transport_mode_changed(self) -> None:
+        """Switch event transport while the capture worker is stopped."""
+
+        try:
+            selected = normalize_transport_mode(self.transport_mode.get())
+        except ValueError:
+            self.status.set("不支持的动作传输方式；仅可选择 MQTT 或 BLE Light")
+            return
+        label = transport_label(selected)
+        if self.pipeline is None:
+            return
+        if self.worker is not None and self.worker.running:
+            if self._active_transport_mode is not None:
+                self.transport_mode.set(transport_label(self._active_transport_mode))
+            messagebox.showwarning("传输方式未切换", "请先停止采集，再切换 MQTT 或 BLE Light。")
+            return
+        try:
+            publisher = action_publisher_from_environment(selected)
+        except Exception as error:
+            if self._active_transport_mode is not None:
+                self.transport_mode.set(transport_label(self._active_transport_mode))
+            self.transport_status.set(f"{label}：不可用")
+            messagebox.showerror("传输方式不可用", str(error))
+            return
+        self.pipeline.set_action_publisher(publisher)
+        self._active_transport_mode = selected.value
+        if publisher is None:
+            self.transport_status.set(f"{label}：未配置")
+        else:
+            self.transport_status.set(f"{label}：已启用")
+        self.status.set(f"动作事件传输已切换为 {label}")
 
     def _toggle_automatic_registration(self) -> None:
         """排队切换自动化；拒绝在不安全诊断后端上启用自动注册。"""
@@ -1202,6 +1864,77 @@ class VerifierWindow:
             "自动注册：开启，OSNet 将先确认视觉身份，随后学习步态原型"
             if enabled
             else "自动注册：关闭；识别和外观令牌响应仍继续"
+        )
+
+    def _sync_manual_action_target(self) -> None:
+        """Mirror the selected Track row into the action target selector."""
+
+        selected = self.track_tree.selection()
+        if not selected:
+            return
+        try:
+            track_id = int(selected[0])
+        except (TypeError, ValueError):
+            return
+        for label, candidate_track_id in self._manual_action_targets.items():
+            if candidate_track_id == track_id:
+                self.manual_action_target.set(label)
+                return
+
+    def _refresh_manual_action_targets(self, tracks: tuple[object, ...]) -> None:
+        """Expose current Tracks and their known identity labels to the GUI."""
+
+        previous = self.manual_action_target.get()
+        targets: dict[str, int] = {}
+        for track in tracks:
+            track_id = int(track.track_id)
+            decision = track.decision
+            identity = (
+                decision.identity_id
+                if decision.open_set_label == "KNOWN" and decision.identity_id
+                else "未确认"
+            )
+            label = f"Track {track_id} · {identity}"
+            targets[label] = track_id
+        self._manual_action_targets = targets
+        labels = tuple(targets)
+        self.manual_action_target_combo.configure(values=labels)
+        if previous in targets:
+            self.manual_action_target.set(previous)
+        elif labels:
+            self.manual_action_target.set(labels[0])
+        else:
+            self.manual_action_target.set("")
+        state = "readonly" if labels else "disabled"
+        self.manual_action_target_combo.configure(state=state)
+        self.manual_action_combo.configure(state=state)
+        self.manual_action_button.configure(state="normal" if labels else "disabled")
+
+    def trigger_manual_action(self) -> None:
+        """Queue the selected action without bypassing identity authorization."""
+
+        if self.worker is None:
+            self.status.set("模型仍在后台加载，请稍候")
+            return
+        target = self._manual_action_targets.get(self.manual_action_target.get())
+        if target is None:
+            selected = self.track_tree.selection()
+            if selected:
+                try:
+                    target = int(selected[0])
+                except (TypeError, ValueError):
+                    target = None
+        if target is None:
+            messagebox.showwarning("未选择目标", "请先在当前目标表中选择一个 Track 或身份。")
+            return
+        action = ActionType.parse(self.manual_action_type.get())
+        try:
+            self.worker.trigger_manual_action(target, action)
+        except Exception as error:
+            messagebox.showerror("手动动作失败", str(error))
+            return
+        self.status.set(
+            f"已为 Track {target} 排队 {action.value}；下一帧将验证身份并发布动作事件"
         )
 
     def register_selected(self) -> None:
@@ -1249,6 +1982,11 @@ class VerifierWindow:
             return
         for item in self.track_tree.get_children():
             self.track_tree.delete(item)
+        self._manual_action_targets.clear()
+        self.manual_action_target.set("")
+        self.manual_action_target_combo.configure(values=(), state="disabled")
+        self.manual_action_combo.configure(state="disabled")
+        self.manual_action_button.configure(state="disabled")
         self.gallery_label.configure(text="无")
         self.pending_requests.set("无")
         self.automation_status.set("自动注册：开启，等待人物进入画面")
@@ -1325,6 +2063,7 @@ class VerifierWindow:
             tags = (visual_tag,) if visual_tag else ()
             values = (
                 track.track_id,
+                track.action_type,
                 subject,
                 decision.kind.value,
                 track.automation.message,
@@ -1352,6 +2091,7 @@ class VerifierWindow:
                 request_message = track.automation.message
         for item_id in existing_items - seen_items:
             self.track_tree.delete(item_id)
+        self._refresh_manual_action_targets(result.tracks)
         self.automation_status.set(
             " | ".join(automation_messages[:2])
             if automation_messages
@@ -1371,7 +2111,9 @@ class VerifierWindow:
             f"帧 {result.frame_index} | 目标 {len(result.tracks)} | "
             f"处理 {result.processing_seconds * 1000:.0f} ms"
         )
-        if request_message:
+        if result.transport_errors:
+            self.status.set("动作事件传输失败：" + "；".join(result.transport_errors[:2]))
+        elif request_message:
             self.status.set(request_message)
 
     def _poll_messages(self) -> None:
@@ -1411,6 +2153,8 @@ class VerifierWindow:
                     messagebox.showerror("参数应用失败", message.text)
             elif isinstance(message, StatusMessage):
                 self.status.set(message.text)
+                if message.level in {"ended", "error"}:
+                    self.transport_combo.configure(state="readonly")
         if latest_frame is not None:
             self._update_frame(latest_frame.result)
         if not self._closed:
@@ -1442,6 +2186,8 @@ class VerifierWindow:
         self._idle_after_ids.clear()
         if self.worker is not None:
             self.worker.stop(timeout=None)
+        if self.pipeline is not None:
+            self.pipeline.close()
         self.verifier.close()
         self.root.destroy()
 
@@ -1449,10 +2195,17 @@ class VerifierWindow:
 def launch_tk_gui(
     database_path: str = "data/verifier-production-v1.sqlite3",
     vision_backend: str = "production",
+    action_classifier_path: Path | None = None,
+    posec3d_checkpoint_path: Path | None = None,
 ) -> int:
     """启动独立桌面应用，并阻塞在 Tk 事件循环中。"""
 
-    window = VerifierWindow(database_path, vision_backend)
+    window = VerifierWindow(
+        database_path,
+        vision_backend,
+        action_classifier_path,
+        posec3d_checkpoint_path,
+    )
     window.root.mainloop()
     return 0
 
@@ -1460,6 +2213,8 @@ def launch_tk_gui(
 def launch_gui(
     database_path: str = "data/verifier-production-v1.sqlite3",
     vision_backend: str = "production",
+    action_classifier_path: Path | None = None,
+    posec3d_checkpoint_path: Path | None = None,
 ) -> int:
     """启动 Qt 表现层；保留 ``launch_tk_gui`` 作为兼容回退入口。"""
 
@@ -1470,7 +2225,12 @@ def launch_gui(
             "Qt GUI requires PyQt6; install it with `pip install -e .[gui-qt]`."
         ) from error
 
-    return launch_qt_gui(database_path, vision_backend)
+    return launch_qt_gui(
+        database_path,
+        vision_backend,
+        action_classifier_path,
+        posec3d_checkpoint_path,
+    )
 
 
 __all__ = ["VerifierWindow", "launch_gui", "launch_tk_gui"]

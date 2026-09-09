@@ -46,6 +46,10 @@ class VisionTrack:
     # ``appearance_change_suspected``; those are soft, auditable clothing/
     # appearance-drift signals and must not be treated as identity decisions.
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Current COCO-17 pose is process-local transient data.  The pipeline uses
+    # it for short actions, but deliberately excludes it from Observation
+    # metadata and therefore from identity evidence and persistence.
+    pose_keypoints: np.ndarray | None = None
 
 
 class VisionAdapter(Protocol):

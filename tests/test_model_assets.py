@@ -20,12 +20,19 @@ class ModelAssetTests(unittest.TestCase):
                 "rtmpose-s.onnx",
                 "osnet_ain_x1_0_dg.pth",
                 "gaitgraph2_grew_state.pt",
+                "posec3d_hmdb51_split1.pth",
             },
         )
         self.assertTrue(all(asset.url.startswith("https://") for asset in assets))
         self.assertTrue(
             all(asset.source_bytes > 0 and len(asset.source_sha256) == 64 for asset in assets)
         )
+
+        metadata = _read_manifest(MODEL_MANIFEST)["models"]["posec3d_hmdb51_split1.pth"][
+            "metadata"
+        ]
+        self.assertEqual(metadata["num_classes"], 51)
+        self.assertEqual(metadata["walk_class_index"], 49)
 
     def test_converted_assets_have_stable_tensor_fingerprints(self) -> None:
         manifest = _read_manifest(MODEL_MANIFEST)["models"]

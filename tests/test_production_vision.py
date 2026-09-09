@@ -16,9 +16,15 @@ from cross_event_verifier.production_vision import (
     ProductionVisionAdapter,
     ProductionVisionConfig,
     ProductionVisionError,
+    _LowLightEnhancer,
     _RtmposeEstimator,
+    _CameraViewSample,
     _canonical_pose,
+    _ground_speed,
+    _world_trajectory,
 )
+from cross_event_verifier.posec3d_action import PoseC3DPrediction
+from cross_event_verifier import ActionPrediction, ActionQuality, ActionType
 from cross_event_verifier.types import Prototype
 from cross_event_verifier.vector_index import NumpyVectorIndex
 from cross_event_verifier.vision import OpenCvDemoAdapter
@@ -151,6 +157,39 @@ class _FakeGait:
         self.warmup_calls += 1
 
 
+class _AlwaysSquatClassifier:
+    model_version = "test-action-v1"
+
+    def predict(self, *_args, **_kwargs):
+        return ActionPrediction(
+            ActionType.SQUAT,
+            0.95,
+            ActionQuality.STRONG,
+            1.0,
+            source="test-action-classifier",
+            model_version=self.model_version,
+        )
+
+
+class _WalkThenSquatClassifier:
+    model_version = "test-action-transition-v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def predict(self, *_args, **_kwargs):
+        self.calls += 1
+        action = ActionType.WALK if self.calls <= 8 else ActionType.SQUAT
+        return ActionPrediction(
+            action,
+            0.95,
+            ActionQuality.STRONG,
+            1.0,
+            source="test-action-classifier",
+            model_version=self.model_version,
+        )
+
+
 class _FakeTwoPersonDetector(_FakeDetector):
     def track(self, _frame):
         first = super().track(_frame)[0]
@@ -174,6 +213,123 @@ class _RecordingBatchModel:
 
 
 class ProductionVisionTests(unittest.TestCase):
+    def test_camera_view_timeline_keeps_frame_timestamp_and_ground_anchor(self) -> None:
+        config = ProductionVisionConfig(
+            ground_homography=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            ground_calibration_id="camera-1-v1",
+            ground_coordinate_frame="site-a-meters",
+        )
+        frame = np.zeros((200, 120, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            track = adapter.process_at(frame, timestamp=10.0)[0]
+            track = adapter.process_at(frame, timestamp=10.1)[0]
+
+        timeline = track.metadata["camera_view_timeline"]
+        self.assertEqual([item["frame_index"] for item in timeline], [1, 2])
+        self.assertEqual([item["timestamp"] for item in timeline], [10.0, 10.1])
+        self.assertTrue(all(item["ground_anchor_source"] == "ankle_midpoint" for item in timeline))
+        self.assertEqual(track.metadata["ground_calibration_id"], "camera-1-v1")
+        self.assertEqual(track.metadata["ground_coordinate_frame"], "site-a-meters")
+
+    def test_world_trajectory_rejects_a_ground_outlier(self) -> None:
+        points = ((0.0, 0.0), (1.0, 0.0), (20.0, 20.0), (3.0, 0.0))
+        timestamps = (0.0, 1.0, 2.0, 3.0)
+        baseline_speed = _ground_speed(points, timestamps)
+        trajectory = _world_trajectory(
+            points,
+            timestamps,
+            window_seconds=3.0,
+            maximum_speed_mps=6.0,
+        )
+
+        self.assertIsNotNone(baseline_speed)
+        self.assertGreater(float(baseline_speed), 20.0)
+        self.assertAlmostEqual(float(trajectory.speed), 1.0, places=6)
+        self.assertAlmostEqual(float(trajectory.displacement), 3.0, places=6)
+        self.assertEqual(trajectory.outlier_count, 1)
+
+    def test_world_trajectory_keeps_timeline_alignment_through_missing_slot(self) -> None:
+        samples = (
+            _CameraViewSample(1, 0.0, "side", "r1c1", (0.0, 0.0), "ankle_midpoint"),
+            _CameraViewSample(2, 0.1, None, None, None, None, missing=True),
+            _CameraViewSample(3, 0.2, "side", "r1c1", (0.2, 0.0), "ankle_midpoint"),
+        )
+        self.assertEqual([item.frame_index for item in samples], [1, 2, 3])
+        self.assertEqual([item.timestamp for item in samples], [0.0, 0.1, 0.2])
+        self.assertTrue(samples[1].missing)
+
+    def test_posec3d_fusion_requires_semantic_and_kinematic_walk(self) -> None:
+        heuristic = ActionPrediction(
+            ActionType.WALK,
+            0.92,
+            ActionQuality.STRONG,
+            1.0,
+            source="heuristic",
+            model_version="heuristic-v1",
+        )
+        semantic_walk = PoseC3DPrediction(
+            49,
+            "walk",
+            0.90,
+            0.05,
+            0.85,
+            reason="ok",
+        )
+        semantic_run = PoseC3DPrediction(
+            32,
+            "run",
+            0.02,
+            0.90,
+            0.88,
+            reason="ok",
+        )
+
+        allowed = ProductionVisionAdapter._fuse_action_predictions(
+            heuristic,
+            semantic_walk,
+            probability_threshold=0.80,
+            margin_threshold=0.15,
+            model_version="posec3d-v1",
+        )
+        rejected = ProductionVisionAdapter._fuse_action_predictions(
+            heuristic,
+            semantic_run,
+            probability_threshold=0.80,
+            margin_threshold=0.15,
+            model_version="posec3d-v1",
+        )
+
+        self.assertEqual(allowed.action_type, ActionType.WALK)
+        self.assertEqual(allowed.quality, ActionQuality.STRONG)
+        self.assertEqual(rejected.action_type, ActionType.UNKNOWN)
+
+        partial_heuristic = ActionPrediction(
+            ActionType.WALK,
+            0.92,
+            ActionQuality.PARTIAL,
+            1.0,
+            source="heuristic",
+            model_version="heuristic-v1",
+        )
+        partial = ProductionVisionAdapter._fuse_action_predictions(
+            partial_heuristic,
+            semantic_walk,
+            probability_threshold=0.80,
+            margin_threshold=0.15,
+            model_version="posec3d-v1",
+        )
+        self.assertEqual(partial.action_type, ActionType.UNKNOWN)
+
     def test_production_preload_reports_stages_and_warms_every_model(self) -> None:
         config = ProductionVisionConfig()
         stages: list[tuple[str, float]] = []
@@ -230,6 +386,24 @@ class ProductionVisionTests(unittest.TestCase):
 
     def test_production_config_uses_one_cuda_ordinal_for_all_runtimes(self) -> None:
         self.assertEqual(ProductionVisionConfig(device="cuda:1").cuda_device_index, 1)
+
+    def test_low_light_gate_uses_hysteresis_and_minimum_hold(self) -> None:
+        enhancer = _LowLightEnhancer(
+            threshold=100.0,
+            interval=1,
+            hysteresis=8.0,
+            min_hold_frames=3,
+        )
+        dark = np.full((8, 8, 3), 50, dtype=np.uint8)
+        medium = np.full((8, 8, 3), 105, dtype=np.uint8)
+        bright = np.full((8, 8, 3), 120, dtype=np.uint8)
+        enhancer.apply(dark)
+        self.assertTrue(enhancer.enabled)
+        enhancer.apply(bright)
+        enhancer.apply(medium)
+        self.assertTrue(enhancer.enabled)
+        enhancer.apply(bright)
+        self.assertFalse(enhancer.enabled)
 
     def test_production_process_rejects_invalid_frame_shape(self) -> None:
         with patch(
@@ -773,6 +947,73 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertEqual(track.features.normalized().appearance.shape, (512,))
         self.assertEqual(track.features.normalized().gait.shape, (384,))
         self.assertGreater(track.quality.gait_availability(), 0.7)
+
+    def test_non_walk_action_never_exposes_a_stale_gait_embedding(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+            appearance_stride=30,
+        )
+        frame = np.zeros((200, 120, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision._walking_metrics", return_value=(0.95, 1.0)),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            adapter.action_classifier = _AlwaysSquatClassifier()
+            tracks = [adapter.process(frame)[0] for _ in range(8)]
+
+        self.assertEqual(adapter.gait.batch_sizes, [])
+        self.assertIsNone(tracks[-1].features.gait)
+        self.assertEqual(tracks[-1].metadata["action_type"], ActionType.SQUAT.value)
+        self.assertEqual(tracks[-1].metadata["action_branch_id"], "gait_squat")
+
+    def test_action_transition_starts_a_clean_gait_window(self) -> None:
+        config = ProductionVisionConfig(
+            minimum_pose_frames=8,
+            gait_sequence_length=8,
+            appearance_stride=30,
+        )
+        frame = np.zeros((200, 120, 3), dtype=np.uint8)
+        with (
+            patch(
+                "cross_event_verifier.production_vision.production_readiness",
+                return_value=(True, ()),
+            ),
+            patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
+            patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
+            patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
+            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch(
+                "cross_event_verifier.production_vision._walking_metrics",
+                return_value=(0.95, 1.0),
+            ),
+        ):
+            adapter = ProductionVisionAdapter(config)
+            adapter.action_classifier = _WalkThenSquatClassifier()
+            walk_track = None
+            for _ in range(8):
+                walk_track = adapter.process(frame)[0]
+            pending_track = adapter.process(frame)[0]
+            self.assertTrue(pending_track.metadata["action_transition_pending"])
+            self.assertEqual(len(adapter.states[7].poses), 8)
+            squat_track = pending_track
+            for _ in range(config.action_stability_frames - 1):
+                squat_track = adapter.process(frame)[0]
+
+        self.assertIsNotNone(walk_track)
+        self.assertIsNotNone(walk_track.features.gait)
+        self.assertEqual(squat_track.metadata["action_type"], ActionType.SQUAT.value)
+        self.assertIsNone(squat_track.features.gait)
+        self.assertEqual(len(adapter.states[7].poses), 1)
+        self.assertGreater(squat_track.metadata["action_segment_id"], 0)
 
     def test_truncated_person_cannot_supply_strong_cached_evidence(self) -> None:
         config = ProductionVisionConfig(
