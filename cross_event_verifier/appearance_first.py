@@ -970,14 +970,7 @@ class AppearanceFirstGaitEnrollmentController:
                     )
         if appearance_decision is not None and appearance_decision.kind == DecisionKind.FORMAL_MATCH:
             return appearance_decision
-        return Decision(
-            kind=DecisionKind.FORMAL_MATCH,
-            state=VerificationState.CONFIRMED_IDENTITY,
-            identity_id=identity_id,
-            score=None,
-            reasons=("visual_identity_binding_continues",),
-            ranking=tuple(ranking),
-        )
+        return self.verifier._visual_identity_decision(identity_id, ranking=ranking)
 
     def _process_one(
         self,
@@ -1130,12 +1123,8 @@ class AppearanceFirstGaitEnrollmentController:
                 if created_identity is not None:
                     state.identity_id = created_identity
                     auto_registered = True
-                    base_decision = Decision(
-                        kind=DecisionKind.VISUAL_IDENTITY_CREATED,
-                        state=VerificationState.CONFIRMED_IDENTITY,
-                        identity_id=created_identity,
-                        score=appearance_quality,
-                        reasons=("osnet_visual_identity_created",),
+                    base_decision = self.verifier._visual_identity_decision(
+                        created_identity, created=True, score=appearance_quality,
                     )
                 else:
                     return (

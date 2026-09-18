@@ -235,6 +235,118 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(verifier.memory.candidate_ids(), ())
         self.assertEqual(verifier.get_candidate("C1").state, VerificationState.CONFIRMED_IDENTITY)
 
+    def test_promotion_preflight_rejects_incompatible_contract_without_partial_copy(self) -> None:
+        verifier = CrossEventVerifier()
+        verifier.register_identity("P1", FeatureBundle(appearance=[1, 0, 0]))
+        verifier.memory.add_formal(
+            "P1",
+            FeatureBundle(gait=[0, 1, 0]),
+            model_version="model-b",
+            feature_schema="gaitgraph2-other-v1",
+        )
+        formal_appearance_before = verifier.memory.formal_prototypes("P1", "appearance")
+        formal_gait_before = verifier.memory.formal_prototypes("P1", "gait")
+        self.assertEqual(len(formal_appearance_before), 1)
+        self.assertEqual(len(formal_gait_before), 1)
+
+        # 外观协议与目标兼容（但向量略有差异，一旦被复制就会改变正式向量），
+        # 步态协议不兼容；两个分支都在 minimum_quality 之上。
+        verifier.memory.add_quarantine(
+            "C1",
+            FeatureBundle(appearance=[0.9, 0.1, 0], gait=[0, 1, 0]),
+            appearance_quality=1.0,
+            gait_quality=1.0,
+        )
+        self.assertEqual(len(verifier.memory.quarantine_prototypes("C1")), 2)
+
+        with self.assertRaisesRegex(
+            ValueError, r"incompatible embedding contract for P1/gait"
+        ):
+            verifier.memory.promote_candidate("C1", "P1", minimum_quality=0.70)
+
+        formal_appearance_after = verifier.memory.formal_prototypes("P1", "appearance")
+        formal_gait_after = verifier.memory.formal_prototypes("P1", "gait")
+        self.assertEqual(len(formal_appearance_after), 1)
+        self.assertEqual(len(formal_gait_after), 1)
+        self.assertEqual(
+            formal_appearance_after[0].prototype_id,
+            formal_appearance_before[0].prototype_id,
+        )
+        self.assertTrue(
+            np.array_equal(
+                formal_appearance_after[0].vector,
+                formal_appearance_before[0].vector,
+            )
+        )
+        self.assertEqual(
+            formal_gait_after[0].prototype_id, formal_gait_before[0].prototype_id
+        )
+        self.assertTrue(
+            np.array_equal(
+                formal_gait_after[0].vector,
+                formal_gait_before[0].vector,
+            )
+        )
+
+        # 失败必须发生在任何状态变更之前：隔离候选人完整保留。
+        self.assertEqual(verifier.memory.candidate_ids(), ("C1",))
+        self.assertEqual(len(verifier.memory.quarantine_prototypes("C1")), 2)
+        verifier.close()
+
+    def test_public_promotion_rejects_incompatible_contract_without_state_change(self) -> None:
+        verifier = CrossEventVerifier()
+        verifier.register_identity("P1", FeatureBundle([1, 0, 0], [0, 1, 0]))
+        formal_before = verifier.memory.formal_prototypes("P1")
+        self.assertEqual(len(formal_before), 2)
+
+        candidate = verifier._get_or_create_candidate("C1")
+        candidate.state = VerificationState.ISOLATED_CANDIDATE
+        # Build the mixed-contract candidate directly: the normal query path
+        # rejects a mismatched observation before it can enter quarantine.
+        verifier.memory.add_quarantine(
+            "C1",
+            FeatureBundle(appearance=[0.9, 0.1, 0]),
+            appearance_quality=1.0,
+        )
+        verifier.memory.add_quarantine(
+            "C1",
+            FeatureBundle(gait=[0, 0.9, 0.1]),
+            gait_quality=1.0,
+            model_version="production-model-b",
+            feature_schema="gaitgraph2-hrnet-v2",
+        )
+        quarantine_before = verifier.memory.quarantine_prototypes("C1")
+        self.assertEqual(len(quarantine_before), 2)
+
+        with self.assertRaisesRegex(
+            ValueError, r"incompatible embedding contract for P1/"
+        ):
+            verifier.promote_candidate("C1", identity_id="P1", force=True)
+
+        formal_after = verifier.memory.formal_prototypes("P1")
+        self.assertEqual(len(formal_after), len(formal_before))
+        self.assertEqual(
+            [prototype.prototype_id for prototype in formal_after],
+            [prototype.prototype_id for prototype in formal_before],
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.stack([prototype.vector for prototype in formal_after]),
+                np.stack([prototype.vector for prototype in formal_before]),
+            )
+        )
+        self.assertEqual(verifier.memory.candidate_ids(), ("C1",))
+        quarantine_after = verifier.memory.quarantine_prototypes("C1")
+        self.assertEqual(
+            [prototype.prototype_id for prototype in quarantine_after],
+            [prototype.prototype_id for prototype in quarantine_before],
+        )
+        self.assertEqual(
+            verifier.get_candidate("C1").state,
+            VerificationState.ISOLATED_CANDIDATE,
+        )
+        verifier.close()
+
     def test_same_capture_session_is_not_independent(self) -> None:
         verifier = CrossEventVerifier(VerifierConfig(minimum_frames=2))
         for event_id, camera in (("e1", "cam-a"), ("e2", "cam-b")):

@@ -165,7 +165,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
    asyncio.run(main())
    ```
 
-   找到名称为 `CEPV-ESP32S3` 的设备后，记录操作系统返回的 `address`。Windows 通常显示蓝牙 MAC 地址；macOS/Linux 可能显示系统生成的标识，必须使用当前平台扫描到的值。若系统要求配对，请先在 Windows“蓝牙和设备”中完成配对，再运行上位机。
+   找到名称为 `CEPV-ESP32S3` 的设备后，记录操作系统返回的 `address`。Windows 通常显示蓝牙 MAC 地址；macOS/Linux 可能显示系统生成的标识，必须使用当前平台扫描到的值。BLE Light 按无配对直连约定工作；若系统弹出 Passkey、数字比较或配对确认窗口，应取消操作并检查是否刷入了旧固件或启用了错误的安全配置。
 
 3. **配置上位机环境。** 在启动 GUI 的同一个 PowerShell 窗口设置 BLE 模式和设备地址；服务、命令、状态 UUID 已有默认值，只有地址是必需项：
 
@@ -187,7 +187,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 5. **触发首次连接并验证回执。** Bleak 客户端采用按需连接：不会在打开 GUI 时持续占用连接，而是在已确认身份完成动作后，首次调用 `publish()` 时连接设备、发现服务、订阅 Status 特征并向 Command 特征写入数据。`BLE Light` 只写入 `0x01`（开灯）或 `0x00`（关灯），未映射动作不会产生 BLE 写入。状态特征应回送带 `command` 的 `accepted`、`executed` 或 `duplicate` 结果；拒绝、格式错误和应用层回执超时会显示为动作事件传输失败。
 
-6. **确认接口边界。** `BLE Light` 只发送一个灯光 opcode，不携带身份、Track、摄像头、动作文本或时间字段。ESP32-S3 固件必须校验写入长度和值、调用灯光处理函数，并以 Status 特征回送处理结果；具体 GPIO、米家设备或继电器映射仍由固件/上层自动化实现。生产部署还应在 `menuconfig` 启用验证过的 BLE 配对与加密。
+6. **确认接口边界。** `BLE Light` 只发送一个灯光 opcode，不携带身份、Track、摄像头、动作文本或时间字段。ESP32-S3 固件必须校验写入长度和值、调用灯光处理函数，并以 Status 特征回送处理结果；具体灯光执行仍由固件/上层自动化实现。该端点按无配对直连约定工作，不要求配对、绑定、Passkey、MITM 或用户确认；因此不适合依赖 BLE 主机认证的高风险设备。
 
 7. **断线重连。** 每次写入失败时 bridge 会断开旧客户端；下一条已授权动作会重新连接。若连续失败，检查开发板是否仍在广播、地址是否变化、电脑蓝牙适配器权限、串口日志和服务 UUID；不要通过降低身份阈值来“测试”连接。BLE Light 应只写入一个字节（`0x01` 或 `0x00`）；长度和值错误、服务不存在或未订阅 Status 都会被报告为传输错误。
 
@@ -322,7 +322,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 - 用不同日期、服装、行走方向和摄像头采集独立事件；不要用连续回放同一个文件制造“多事件”假象。
 - 注册和首次学习阶段优先保证光照、无遮挡和稳定跟踪，再逐步引入真实部署中的遮挡与视角变化。
 - 对灯光、门锁、燃气等高风险设备增加 Home Assistant 条件、冷却时间和人工确认；不要仅凭一次 `HAND_UP` 直接执行不可逆操作。
-- MQTT 使用非 retain 的动作消息和可追踪 `event_id`；自动化侧应做幂等和身份/区域二次校验。BLE Light 端点上线前应在 ESP-IDF 中启用配对/加密，并在固件严格验证单字节 opcode。
+- MQTT 使用非 retain 的动作消息和可追踪 `event_id`；自动化侧应做幂等和身份/区域二次校验。BLE Light 端点应保持无配对直连，并在固件严格验证单字节 opcode；由于没有 BLE 主机认证，不要把它用于高风险执行器。
 - 将数据库、模型清单、校准文件和运行参数一起纳入部署记录；不在日志、环境变量或 MQTT payload 中暴露不必要的个人信息和密码。
 
 ## 当前限制
@@ -332,7 +332,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 - 步态匹配对视角、服装、遮挡、跟踪断裂和关键点质量敏感；25/45 帧、覆盖率和多事件门槛是当前默认工程参数，不是跨场景保证。
 - 当前轻量动作检测器只保守覆盖下蹲、坐下、站起、举手和挥手；`RUNNING`、搬运、推拉等标签可被路由隔离，但没有同等成熟的几何 FSM。可选 PoseC3D/HMDB51 仍需额外 MMAction2 环境和目标域校准。
 - 项目没有原生米家设备协议适配。当前路径是 MQTT 交给 Home Assistant（再由其接入米家）或自定义 BLE GATT 交给 ESP32-S3；米家账号、设备配网和具体自动化不在视觉仓库内。
-- ESP32-S3 固件目前是 NimBLE GATT 传输演示：`BLE Light` 只接收 `0x01`/`0x00` 并需要实现灯光回调；仓库示例仍不默认执行 GPIO/家电动作，也没有替用户完成安全配对，必须先做硬件、射频、断线重连和权限验证。
+- ESP32-S3 固件目前是 NimBLE GATT 传输演示：`BLE Light` 只接收 `0x01`/`0x00` 并需要实现灯光回调；端点按无配对、无绑定、无 Passkey 的方式允许手机和桌面端直连，仓库示例仍不默认执行具体家电动作，必须先完成广播、连接、断线重连和无配对行为验证。
 - 数据库为本地 SQLite，尚无多主机同步、云端权限、集中密钥管理或跨节点冲突合并服务；Track ID、BLE 地址和相机来源也不能跨部署直接复用。
 - 同一视频的重复学习仍属于同一个采集会话；实际摄像头、Home Assistant、BLE 硬件和不同光照服装下的验收需要使用者自行完成。
 - 依赖和模型各自受上游许可证、权重条款及数据集使用范围约束，不能仅依据本项目许可证推断所有组件均可商用。
@@ -345,7 +345,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 ## Roadmap
 
-- **近期：部署闭环**：在目标 Windows 机器上固定模型哈希和 CUDA/ONNX provider，完成 MQTT broker、Home Assistant 自动化、ESP32-S3 BLE 连接、断线重连、事件幂等和安全配对测试。
+- **近期：部署闭环**：在目标 Windows 机器上固定模型哈希和 CUDA/ONNX provider，完成 MQTT broker、Home Assistant 自动化、ESP32-S3 BLE 手机/桌面端直连、断线重连、事件幂等和无配对行为测试。
 - **近期：质量校准**：为每个摄像头建立真实验证集，调节 gait/action 阈值、遮挡处理、冷却时间和 open-set 拒识；记录误接受、误拒绝、未知和冲突比例。
 - **中期：数据与运维**：完成 `cross_event_training_v1` 的合法数据处理与事件分割，补充跨服装/跨视角评测、模型版本迁移、集中配置和可观测性。
 - **中期：动作扩展**：在现有几何 FSM 上加入双手举起、弯腰、躺下和动作组合；对喝水、拿取、开门等复杂行为，再评估 PoseC3D、ST-GCN++ 或定域训练分类器，而不是默认增加大型模型。
@@ -361,6 +361,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 - `models/README.md`：生产模型清单、下载方式、哈希和可选 PoseC3D 运行条件。
 - `datasets/cross_event_training_v1/README.md`：训练数据集构建、事件分割、合法来源和验证工具。
 - `firmware/esp32s3_ble/README.md`：ESP32-S3 NimBLE GATT 服务、UUID、编译、烧录和安全注意事项。
+- `firmware/esp32s3_ble/ESP32S3_DEVICE_REQUIREMENTS.md`：ESP-IDF、GATT、手机/桌面端无配对直连、单字节灯光协议、联调和验收要求。
 - `THIRD_PARTY_NOTICES.md`：Ultralytics、OpenGait、MMAction2、Bleak、ESP-IDF 等第三方组件和模型说明。
 - `CONTRIBUTING.md` 与 `LICENSE`：贡献约定、Apache-2.0 项目许可和发布要求。
 
@@ -402,7 +403,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 **如何编译 ESP32-S3 固件？**
 
-安装支持 ESP32-S3 的 ESP-IDF 后，在 `firmware/esp32s3_ble` 执行 `idf.py set-target esp32s3`、`idf.py build`，再用实际串口执行 `idf.py -p COM7 flash monitor`。首次接入生产执行器前，必须在 `menuconfig` 启用配对/加密并替换仅记录日志的处理函数。
+安装支持 ESP32-S3 的 ESP-IDF 后，在 `firmware/esp32s3_ble` 执行 `idf.py set-target esp32s3`、`idf.py build`，再用实际串口执行 `idf.py -p COM7 flash monitor`。固件应保持无配对直连并替换仅记录日志的灯光处理函数；若出现 Passkey 或配对提示，应先检查安全配置。
 
 **如何处理模型下载或 GUI 启动失败？**
 

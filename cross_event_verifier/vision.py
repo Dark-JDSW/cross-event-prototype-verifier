@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from math import hypot
 from typing import Any, Mapping, Protocol, Sequence
 
-import cv2
 import numpy as np
 
 from .adapters import occlusion_scores
@@ -176,6 +175,11 @@ class OpenCvDemoAdapter:
         detection_stride: int = 1,
     ) -> None:
         """准备 HOG/前景检测、质心跟踪和缓存。"""
+        # Domain contracts must be importable with the base (NumPy-only) install.
+        # OpenCV belongs to the concrete demo runtime, not VisionTrack.
+        global cv2
+        import cv2
+
         self.max_processing_dimension = max(320, int(max_processing_dimension))
         self.max_detections = max(1, int(max_detections))
         self.detection_stride = max(1, int(detection_stride))

@@ -364,6 +364,30 @@ class CrossEventVerifier:
             not in blocked
         )
 
+    def _visual_identity_decision(
+        self,
+        identity_id: str,
+        *,
+        created: bool = False,
+        score: float | None = None,
+        ranking: Sequence[ScoreBreakdown] = (),
+    ) -> Decision:
+        """Issue the existing appearance-first workflow result inside Identity Core.
+
+        Internal to the identity enrollment controller, never an interaction or
+        spatial extension point. The controller retains its existing sampling,
+        binding and conflict checks; this method neither enrolls nor promotes.
+        """
+        return Decision(
+            kind=(DecisionKind.VISUAL_IDENTITY_CREATED if created else DecisionKind.FORMAL_MATCH),
+            state=VerificationState.CONFIRMED_IDENTITY,
+            identity_id=identity_id,
+            score=score,
+            reasons=(("osnet_visual_identity_created",) if created
+                     else ("visual_identity_binding_continues",)),
+            ranking=tuple(ranking),
+        )
+
     def register_identity(
         self,
         identity_id: str,

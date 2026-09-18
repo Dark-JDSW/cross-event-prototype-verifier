@@ -265,6 +265,26 @@ class PrototypeMemory:
         self._evict_redundant(group, maximum=maximum_prototypes)
         return "append", nearest_score, prototype.prototype_id
 
+    @staticmethod
+    def _contract_mismatch(existing: Prototype, candidate: Prototype) -> bool:
+        """判断两个原型是否可以在同一区域共享同一模态。
+
+        维度与 :meth:`_add_to_zone` 的兼容性检查保持一致，供晋升前的原子
+        预检复用，避免把不兼容协议的隔离向量复制进正式图库。
+        """
+        return (
+            existing.vector.size != candidate.vector.size
+            or existing.model_version != candidate.model_version
+            or existing.feature_schema != candidate.feature_schema
+            or existing.artifact_sha256 != candidate.artifact_sha256
+            or existing.preprocess_version != candidate.preprocess_version
+            or existing.joint_format != candidate.joint_format
+            or existing.sequence_length != candidate.sequence_length
+            or existing.tta_mode != candidate.tta_mode
+            or existing.coordinate_contract != candidate.coordinate_contract
+            or dict(existing.embedding_dimensions) != dict(candidate.embedding_dimensions)
+        )
+
     def _add_to_zone(
         self,
         zone: dict[str, dict[str, list[Prototype]]],
@@ -541,6 +561,30 @@ class PrototypeMemory:
         candidate = self.quarantine.get(candidate_id)
         if not candidate:
             raise KeyError(f"candidate has no quarantined prototypes: {candidate_id}")
+        # 原子预检：在触碰正式区或隔离区之前，确认所有会被复制的候选原型
+        # 都能与目标模态的现有原型共享嵌入协议。
+        for modality, prototypes in candidate.items():
+            existing = self.formal.get(identity_id, {}).get(modality)
+            if not existing:
+                continue
+            for source in prototypes:
+                if source.quality < minimum_quality:
+                    continue
+                for current in existing:
+                    if not self._contract_mismatch(current, source):
+                        continue
+                    raise ValueError(
+                        "incompatible embedding contract for "
+                        f"{identity_id}/{modality}: "
+                        f"existing={current.model_version}/"
+                        f"{current.feature_schema}/"
+                        f"{current.artifact_sha256}/"
+                        f"{current.vector.size}, "
+                        f"new={source.model_version}/"
+                        f"{source.feature_schema}/"
+                        f"{source.artifact_sha256}/"
+                        f"{source.vector.size}"
+                    )
         target = self.formal.setdefault(identity_id, {})
         copied = 0
         for modality, prototypes in candidate.items():

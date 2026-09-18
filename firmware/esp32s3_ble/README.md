@@ -6,6 +6,10 @@ desktop application selects this endpoint as **BLE Light**; the application
 protocol is deliberately limited to a single light opcode, not a general
 action-event transport.
 
+For the complete DevKit1 wiring, security, build, discovery, troubleshooting and
+acceptance checklist, see
+[`ESP32S3_DEVICE_REQUIREMENTS.md`](ESP32S3_DEVICE_REQUIREMENTS.md).
+
 | Attribute | UUID | Properties | Purpose |
 | --- | --- | --- | --- |
 | CEPV service | `8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d10` | — | Service container |
@@ -42,8 +46,11 @@ Command characteristic has this contract:
 When Status notifications are enabled, the endpoint should return a JSON
 result for the same command, using `command: "ON"` or `command: "OFF"`. The
 result should be one of `accepted`, `executed`, `duplicate`, or `rejected`,
-with an optional `reason` for rejection. Pairing/bonding and encrypted writes
-should be enabled before exposing the endpoint beyond a trusted test bench.
+with an optional `reason` for rejection. This endpoint intentionally accepts
+direct unpaired connections: do not require pairing, bonding, Passkey, MITM,
+or a user confirmation step. Because an unpaired endpoint cannot authenticate
+the connecting host, BLE Light is intended only for low-risk light control
+whose identity gate is enforced by CEPV.
 
 ## Build and flash
 
@@ -63,6 +70,8 @@ in `CROSS_EVENT_BLE_ADDRESS`.
 The Python bridge waits for an application-level status notification by default.
 Set `CROSS_EVENT_BLE_ACK_TIMEOUT` to change the wait (default 3 seconds), or
 `CROSS_EVENT_BLE_REQUIRE_ACK=0` only for a deliberately fire-and-forget
-deployment. Before using the endpoint for a safety-sensitive actuator, enable
-an authenticated NimBLE pairing policy in `menuconfig`, validate the opcode on
-the device, and replace the log-only handler with the required hardware action.
+deployment. In `menuconfig` and application code, keep pairing, bonding,
+Passkey, MITM and automatic security-manager prompts disabled so a phone or
+desktop client can connect directly without confirmation. Validate the opcode
+on the device and replace the log-only handler with the device project's light
+execution callback.
