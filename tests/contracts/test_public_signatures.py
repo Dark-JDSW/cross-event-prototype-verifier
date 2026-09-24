@@ -2,6 +2,8 @@ from inspect import signature
 
 import pytest
 from cross_event_verifier import CrossEventVerifier, FeatureBundle, Observation, VerifierConfig
+from cross_event_verifier.automation import AutomaticVerificationController
+from cross_event_verifier.appearance_first import AppearanceFirstGaitEnrollmentController
 from cross_event_verifier.smart_home import ActionPublisher
 from cross_event_verifier.vision import VisionAdapter
 
@@ -20,6 +22,9 @@ from cross_event_verifier.vision import VisionAdapter
         'artifact_sha256': 'a', 'preprocess_version': 'p', 'joint_format': 'j',
         'sequence_length': 60, 'tta_mode': 'off', 'coordinate_contract': 'c',
         'embedding_dimensions': {'gait': 2}}),
+    ('enroll_gait_identity', (None, Observation()), {}),
+    ('enroll_gait_identity', (None, Observation()), {
+        'identity_id': 'P1', 'candidate_id': 'c', 'gait_confidence': .9}),
     ('promote_candidate', (None, 'c'), {}),
     ('promote_candidate', (None, 'c'), {'identity_id': 'P1', 'force': True}),
     ('get_candidate', (None, 'c'), {}), ('list_candidates', (None,), {}),
@@ -35,3 +40,14 @@ def test_vision_and_publisher_call_shapes():
     signature(VisionAdapter.reset).bind(None)
     signature(ActionPublisher.publish).bind(None, object())
     signature(ActionPublisher.close).bind(None)
+
+
+def test_orchestration_legacy_call_shapes():
+    signature(AutomaticVerificationController.verify).bind(
+        None, Observation(), candidate_id='candidate')
+    signature(AutomaticVerificationController.verify_batch).bind(
+        None, [], candidate_ids=[])
+    signature(AppearanceFirstGaitEnrollmentController.verify).bind(
+        None, Observation(), candidate_id='candidate')
+    signature(AppearanceFirstGaitEnrollmentController.verify_batch).bind(
+        None, [], candidate_ids=[])

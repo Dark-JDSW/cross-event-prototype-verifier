@@ -21,6 +21,15 @@ from .aggregation import (
     weighted_unit_mean,
 )
 from .engine import CrossEventVerifier
+from .orchestration import (
+    TrackStateRegistry,
+    append_gait_sample,
+    clear_gait_window,
+    independent_event_key,
+    resolve_action,
+    sync_action_segment,
+    sync_metadata_boundary,
+)
 from .types import (
     Decision,
     DecisionKind,
@@ -158,7 +167,8 @@ class AutomaticVerificationController:
         self.verifier = verifier
         self.policy = policy or AutomationPolicy()
         self._registration_enabled = self.policy.enabled
-        self._states: dict[str, _TrackAutomationState] = {}
+        self._state_registry = TrackStateRegistry(_TrackAutomationState)
+        self._states = self._state_registry.states
         self._manual_request_id: str | None = None
         self._hydrate_event_proposals()
 
@@ -304,38 +314,46 @@ class AutomaticVerificationController:
         取消/作废流程才应设置 ``discard_unpreserved=True``。
         """
 
-        keep = {value for value in preserve_candidate_ids if value}
-        for candidate_id in tuple(self._states):
-            state = self._states[candidate_id]
+        def reset_state(state: _TrackAutomationState) -> None:
             self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
             state.subtracklet_id = None
             state.action_segment_id = None
-            if discard_unpreserved and candidate_id not in keep:
-                del self._states[candidate_id]
+
+        self._state_registry.reset_tracks(
+            preserve_candidate_ids=preserve_candidate_ids,
+            discard_unpreserved=discard_unpreserved,
+            reset_state=reset_state,
+            on_discard=lambda candidate_id, _state: (
                 self.verifier.delete_gait_event_proposals(candidate_id)
+            ),
+        )
 
     def discard_candidate(self, candidate_id: str) -> None:
         """显式作废一个采集任务及其跨会话步态事件。"""
 
-        self._states.pop(candidate_id, None)
-        self.verifier.delete_gait_event_proposals(candidate_id)
+        self._state_registry.discard(
+            candidate_id,
+            on_discard=lambda value, _state: (
+                self.verifier.delete_gait_event_proposals(value)
+            ),
+        )
 
     def discard_candidates(self, candidate_ids: Sequence[str]) -> None:
         """同步清除验证器维护任务撤销的候选人状态。"""
 
-        for candidate_id in candidate_ids:
-            self.discard_candidate(candidate_id)
+        self._state_registry.discard_many(
+            candidate_ids,
+            on_discard=lambda value, _state: (
+                self.verifier.delete_gait_event_proposals(value)
+            ),
+        )
 
     @staticmethod
     def _gait_event_key(observation: Observation) -> str:
         """选择独立步态事件的来源键。"""
 
-        if observation.challenge_id:
-            return f"challenge:{observation.challenge_id}"
-        if observation.capture_session_id and observation.capture_session_id != "unknown-session":
-            return f"session:{observation.capture_session_id}"
-        return f"event:{observation.event_id}"
+        return independent_event_key(observation, challenge_first=True)
 
     def bind_request(
         self,
@@ -345,7 +363,7 @@ class AutomaticVerificationController:
         identity_id: str | None = None,
     ) -> None:
         """把步态签发的外观请求绑定到恰好一条轨迹键。"""
-        state = self._states.setdefault(candidate_id, _TrackAutomationState())
+        state = self._state_registry.get(candidate_id)
         state.pending_request_id = request_id
         state.identity_id = identity_id
 
@@ -361,15 +379,14 @@ class AutomaticVerificationController:
         if candidate_id is None:
             self._manual_request_id = value
             return
-        state = self._states.setdefault(candidate_id, _TrackAutomationState())
+        state = self._state_registry.get(candidate_id)
         state.pending_request_id = value
 
     @staticmethod
     def _clear_gait_window(state: _TrackAutomationState) -> None:
         """Clear vectors and their aligned quality weights together."""
 
-        state.gait_samples.clear()
-        state.gait_sample_weights.clear()
+        clear_gait_window(state)
 
     @staticmethod
     def _sync_subtracklet(
@@ -378,23 +395,24 @@ class AutomaticVerificationController:
     ) -> None:
         """让旧 ByteTrack 子轨迹的未完成步态窗口不能污染新窗口。"""
 
-        value = observation.metadata.get("subtracklet_id")
-        current = str(value) if value not in (None, "") else None
-        if current is None:
-            return
-        if state.subtracklet_id is not None and state.subtracklet_id != current:
-            AutomaticVerificationController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-            state.action_type = None
-            state.action_gate_active = False
-            # A ByteTrack ID is not an identity credential.  Once the visual
-            # adapter reports a new clean segment, the legacy gait-first path
-            # must also drop its local binding and one-shot appearance token;
-            # otherwise a hard switch could continue writing evidence to the
-            # previous person.
-            state.identity_id = None
-            state.pending_request_id = None
-        state.subtracklet_id = current
+        def reset_boundary(item: _TrackAutomationState) -> None:
+            clear_gait_window(item)
+            item.gait_window_start_timestamp = None
+            item.action_type = None
+            item.action_gate_active = False
+            # A ByteTrack ID is not an identity credential. Once the visual
+            # adapter reports a new clean segment, drop its local binding and
+            # one-shot appearance token.
+            item.identity_id = None
+            item.pending_request_id = None
+
+        sync_metadata_boundary(
+            state,
+            observation,
+            metadata_key="subtracklet_id",
+            state_attribute="subtracklet_id",
+            on_change=reset_boundary,
+        )
 
     @staticmethod
     def _sync_action_segment(
@@ -403,14 +421,7 @@ class AutomaticVerificationController:
     ) -> None:
         """Keep a visual binding but never aggregate gait across actions."""
 
-        value = observation.metadata.get("action_segment_id")
-        current = str(value) if value not in (None, "") else None
-        if current is None:
-            return
-        if state.action_segment_id is not None and state.action_segment_id != current:
-            AutomaticVerificationController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-        state.action_segment_id = current
+        sync_action_segment(state, observation)
 
     @staticmethod
     def _resolve_action(
@@ -419,20 +430,7 @@ class AutomaticVerificationController:
     ) -> ActionPrediction | None:
         """更新动作路由状态；未接入动作分类器时返回 ``None``。"""
 
-        prediction = ActionRouter.from_metadata(observation.metadata)
-        if prediction is None:
-            if state.action_gate_active:
-                # Once an explicit action stream starts, a missing next label
-                # is not silently treated as WALK.  This prevents a classifier
-                # dropout from reopening the legacy gait path.
-                return None
-            return None
-        if state.action_gate_active and state.action_type != prediction.action_type:
-            AutomaticVerificationController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-        state.action_type = prediction.action_type
-        state.action_gate_active = True
-        return prediction
+        return resolve_action(state, observation)
 
     @staticmethod
     def _unit_mean(
@@ -613,36 +611,24 @@ class AutomaticVerificationController:
                 gait_quality_band=quality_band.value,
             )
 
-        vector = np.asarray(features.gait, dtype=np.float32).reshape(-1)
-        reference = self._unit_mean(
-            state.gait_samples,
-            state.gait_sample_weights,
+        window = append_gait_sample(
+            state,
+            np.asarray(features.gait, dtype=np.float32),
+            weight=sample_weight,
+            timestamp=observation.timestamp,
+            maximum_samples=self.policy.gait_sample_window,
+            minimum_similarity=self.policy.minimum_sample_similarity,
         )
-        if reference is not None:
-            if reference.shape != vector.shape:
-                self._clear_gait_window(state)
-                state.gait_window_start_timestamp = observation.timestamp
-            else:
-                similarity = float(np.dot(reference, vector))
-                if similarity < self.policy.minimum_sample_similarity:
-                    self._clear_gait_window(state)
-                    state.gait_window_start_timestamp = observation.timestamp
-                    state.gait_samples.append(vector.copy())
-                    state.gait_sample_weights.append(sample_weight)
-                    return None, AutomationStatus(
-                        AutomationStage.GAIT_UNSTABLE,
-                        f"步态波动，重新采集（相似度 {similarity:.2f}）",
-                        progress=1.0 / self.policy.minimum_stable_gait_samples,
-                        gait_quality_band=quality_band.value,
-                    )
+        if window.restarted_for_instability:
+            return None, AutomationStatus(
+                AutomationStage.GAIT_UNSTABLE,
+                f"步态波动，重新采集（相似度 {window.similarity:.2f}）",
+                progress=1.0 / self.policy.minimum_stable_gait_samples,
+                gait_quality_band=quality_band.value,
+            )
 
-        state.gait_samples.append(vector.copy())
-        state.gait_sample_weights.append(sample_weight)
-        while len(state.gait_samples) > self.policy.gait_sample_window:
-            state.gait_samples.popleft()
-            state.gait_sample_weights.popleft()
-        sample_count = len(state.gait_samples)
-        sample_mass = float(sum(state.gait_sample_weights))
+        sample_count = window.sample_count
+        sample_mass = window.sample_mass
         required_mass = (
             self.policy.minimum_stable_gait_samples
             * self.verifier.config.minimum_weighted_gait_mass
@@ -676,10 +662,7 @@ class AutomaticVerificationController:
                 gait_quality_band=quality_band.value,
             )
 
-        centroid = self._unit_mean(
-            state.gait_samples,
-            state.gait_sample_weights,
-        )
+        centroid = window.centroid
         if centroid is None:
             self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
@@ -812,7 +795,7 @@ class AutomaticVerificationController:
     ) -> tuple[Decision, AutomationStatus]:
         """验证一条轨迹，并推进其自动建号协议。"""
 
-        state = self._states.setdefault(candidate_id, _TrackAutomationState())
+        state = self._state_registry.get(candidate_id)
         self._sync_subtracklet(state, observation)
         request_id = self._live_token(state, observation.appearance_request_id)
         effective_observation = (
@@ -849,7 +832,7 @@ class AutomaticVerificationController:
             tuple[Observation, str, _TrackAutomationState, str | None]
         ] = []
         for observation, candidate_id in zip(observations, candidate_ids):
-            state = self._states.setdefault(candidate_id, _TrackAutomationState())
+            state = self._state_registry.get(candidate_id)
             self._sync_subtracklet(state, observation)
             request_id = self._live_token(state, observation.appearance_request_id)
             effective = (

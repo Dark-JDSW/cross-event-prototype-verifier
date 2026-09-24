@@ -17,6 +17,8 @@ def test_base_import_and_verification_without_optional_runtimes():
         import cross_event_verifier as c
         from cross_event_verifier.vision import VisionTrack, VisionAdapter
         from cross_event_verifier.contexts import ContextComposer
+        from cross_event_verifier.gui_presenter import GuiPresenter
+        from cross_event_verifier.orchestration import TrackStateRegistry
         from cross_event_verifier.spatial import VisionMetadataSpatialProvider
         from cross_event_verifier.interaction import ContextRule
         v = c.CrossEventVerifier()

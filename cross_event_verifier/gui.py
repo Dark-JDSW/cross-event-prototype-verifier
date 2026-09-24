@@ -54,6 +54,7 @@ from .ground_control import (
     parse_ground_control_point,
     save_ground_control_file,
 )
+from .gui_presenter import GuiPresenter
 from .pipeline import FrameResult, VideoVerifierPipeline
 from .runtime_parameters import RuntimeParameterSpec, RuntimeParameterState
 from .storage import SqliteStore
@@ -118,6 +119,7 @@ class VerifierWindow:
         self.root.minsize(980, 640)
         configure_theme(self.root)
 
+        self._presenter = GuiPresenter()
         self._closed = False
         self._preload_cancel = threading.Event()
         self._preload_messages: queue.Queue[tuple[str, str, float, object | None]] = (
@@ -1690,12 +1692,10 @@ class VerifierWindow:
         if self.worker is None or self._runtime_parameter_state is None:
             self.status.set("模型仍在后台加载，请稍候")
             return
-        available = set(self._runtime_parameter_state.available_keys)
-        values = {
-            key: variable.get()
-            for key, variable in self.parameter_vars.items()
-            if key in available
-        }
+        values = self._presenter.runtime_parameter_updates(
+            self._runtime_parameter_state.available_keys,
+            {key: variable.get() for key, variable in self.parameter_vars.items()},
+        )
         self.worker.set_runtime_parameters(values)
         self.parameter_status.set("参数更新已排队，将在下一帧前整组生效")
 
@@ -1741,30 +1741,15 @@ class VerifierWindow:
 
     def _source_spec(self) -> SourceSpec:
         """校验输入源控件，并将其转换为工作线程使用的 ``SourceSpec``。"""
-        candidate_id = self.candidate_id.get().strip() or None
-        if self.source_kind.get() == "file":
-            path = self.video_path.get().strip()
-            if not path:
-                raise ValueError("请先选择视频文件")
-            try:
-                repeat_count = int(self.video_repeat_count.get().strip())
-            except ValueError as error:
-                raise ValueError("视频重复学习次数必须是正整数") from error
-            if repeat_count < 1:
-                raise ValueError("视频重复学习次数必须是正整数")
-            return SourceSpec(
-                "file",
-                path,
-                Path(path).name,
-                candidate_id,
-                repeat_count,
-            )
-        try:
-            index = int(self.camera_index.get().strip())
-        except ValueError as error:
-            raise ValueError("摄像头设备号必须是整数") from error
-        label = self.camera_id.get().strip() or f"camera-{index}"
-        return SourceSpec("camera", index, label, candidate_id)
+        selection = self._presenter.source_selection(
+            source_kind=self.source_kind.get(),
+            camera_index=self.camera_index.get(),
+            camera_id=self.camera_id.get(),
+            video_path=self.video_path.get(),
+            video_repeat_count=self.video_repeat_count.get(),
+            candidate_id=self.candidate_id.get(),
+        )
+        return SourceSpec(*selection.as_source_args())
 
     def start(self) -> None:
         """校验所选摄像头或文件输入源后开始采集。"""
@@ -1845,26 +1830,28 @@ class VerifierWindow:
 
     def _toggle_automatic_registration(self) -> None:
         """排队切换自动化；拒绝在不安全诊断后端上启用自动注册。"""
-        if self.worker is None:
-            self.automatic_registration.set(False)
-            self.status.set("模型仍在后台加载，请稍候")
-            return
-        enabled = self.automatic_registration.get()
-        if enabled and not bool(
-            getattr(self.vision, "supports_automatic_registration", False)
-        ):
-            self.automatic_registration.set(False)
+        requested = self.automatic_registration.get()
+        model = self._presenter.automatic_registration(
+            requested,
+            runtime_ready=self.worker is not None,
+            backend_supported=bool(
+                getattr(self.vision, "supports_automatic_registration", False)
+            ),
+        )
+        self.automatic_registration.set(model.enabled)
+        if model.warning_message:
             messagebox.showwarning(
                 "自动注册已阻止",
-                "HOG 诊断后端不能提供强步态证据，请使用 production 后端。",
+                model.warning_message,
             )
             return
-        self.worker.set_automatic_registration(enabled)
-        self.automation_status.set(
-            "自动注册：开启，OSNet 将先确认视觉身份，随后学习步态原型"
-            if enabled
-            else "自动注册：关闭；识别和外观令牌响应仍继续"
-        )
+        if not model.enqueue or self.worker is None:
+            if model.status_text:
+                self.status.set(model.status_text)
+            return
+        self.worker.set_automatic_registration(model.enabled)
+        if model.status_text:
+            self.automation_status.set(model.status_text)
 
     def _sync_manual_action_target(self) -> None:
         """Mirror the selected Track row into the action target selector."""
@@ -1884,27 +1871,14 @@ class VerifierWindow:
     def _refresh_manual_action_targets(self, tracks: tuple[object, ...]) -> None:
         """Expose current Tracks and their known identity labels to the GUI."""
 
-        previous = self.manual_action_target.get()
-        targets: dict[str, int] = {}
-        for track in tracks:
-            track_id = int(track.track_id)
-            decision = track.decision
-            identity = (
-                decision.identity_id
-                if decision.open_set_label == "KNOWN" and decision.identity_id
-                else "未确认"
-            )
-            label = f"Track {track_id} · {identity}"
-            targets[label] = track_id
-        self._manual_action_targets = targets
-        labels = tuple(targets)
+        model = self._presenter.manual_action_targets(
+            tracks,
+            previous_label=self.manual_action_target.get(),
+        )
+        self._manual_action_targets = dict(model.targets)
+        labels = model.labels
         self.manual_action_target_combo.configure(values=labels)
-        if previous in targets:
-            self.manual_action_target.set(previous)
-        elif labels:
-            self.manual_action_target.set(labels[0])
-        else:
-            self.manual_action_target.set("")
+        self.manual_action_target.set(model.selected_label)
         state = "readonly" if labels else "disabled"
         self.manual_action_target_combo.configure(state=state)
         self.manual_action_combo.configure(state=state)
@@ -1916,14 +1890,16 @@ class VerifierWindow:
         if self.worker is None:
             self.status.set("模型仍在后台加载，请稍候")
             return
-        target = self._manual_action_targets.get(self.manual_action_target.get())
-        if target is None:
-            selected = self.track_tree.selection()
-            if selected:
-                try:
-                    target = int(selected[0])
-                except (TypeError, ValueError):
-                    target = None
+        selected = self.track_tree.selection()
+        try:
+            fallback = int(selected[0]) if selected else None
+        except (TypeError, ValueError):
+            fallback = None
+        target = self._presenter.selected_action_target(
+            self._manual_action_targets,
+            self.manual_action_target.get(),
+            fallback,
+        )
         if target is None:
             messagebox.showwarning("未选择目标", "请先在当前目标表中选择一个 Track 或身份。")
             return
@@ -2000,44 +1976,18 @@ class VerifierWindow:
         if self.worker is None:
             self.status.set("模型仍在后台加载，请稍候")
             return
-        request_id = self.appearance_request_id.get().strip()
+        request_id = self.appearance_request_id.get()
         selected = self.track_tree.selection()
         track_id = int(selected[0]) if selected else None
-        self.worker.set_appearance_request(request_id or None, track_id)
-        self.status.set(
-            "已清除外观响应令牌"
-            if not request_id
-            else (
-                f"外观响应令牌已绑定到 Track {track_id}"
-                if track_id is not None
-                else "外观响应令牌将应用到后续目标"
-            )
-        )
+        normalized, message = self._presenter.appearance_request(request_id, track_id)
+        self.worker.set_appearance_request(normalized, track_id)
+        self.status.set(message)
 
     @staticmethod
     def _track_visual_tag(kind: str) -> str:
         """把既有决策类别映射为仅用于显示的状态色标签。"""
 
-        if kind in {
-            "formal_match",
-            "visual_identity_created",
-            "appearance_response_accepted",
-        }:
-            return "verified"
-        if kind == "conflict":
-            return "conflict"
-        if kind in {"unknown", "ambiguous"}:
-            return "unknown"
-        if kind == "appearance_requested":
-            return "waiting"
-        if kind in {
-            "deferred",
-            "need_more_data",
-            "candidate_created",
-            "candidate_updated",
-        }:
-            return "learning"
-        return ""
+        return GuiPresenter.track_visual_tag(kind)
 
     def _update_frame(self, result: FrameResult) -> None:
         """渲染一帧处理结果、决策、自动化阶段和图库 ID。"""
@@ -2050,71 +2000,41 @@ class VerifierWindow:
             self._hide_video_standby()
         except Exception as error:
             self.status.set(f"画面显示失败：{error}")
+        view = self._presenter.frame(
+            result,
+            automatic_registration_enabled=(
+                self.pipeline is not None
+                and self.pipeline.automatic_registration_enabled
+            ),
+            previous_action_target=self.manual_action_target.get(),
+        )
         existing_items = set(self.track_tree.get_children())
         seen_items: set[str] = set()
-        request_message = ""
-        automation_messages: list[str] = []
-        for track in result.tracks:
-            decision = track.decision
-            subject = decision.identity_id or decision.candidate_id or "-"
-            score = "-" if decision.score is None else f"{decision.score:.3f}"
-            item_id = str(track.track_id)
-            visual_tag = self._track_visual_tag(decision.kind.value)
-            tags = (visual_tag,) if visual_tag else ()
-            values = (
-                track.track_id,
-                track.action_type,
-                subject,
-                decision.kind.value,
-                track.automation.message,
-                score,
-            )
+        for row in view.rows:
+            item_id = row.track_id
+            tags = (row.visual_tag,) if row.visual_tag else ()
             if item_id in existing_items:
-                self.track_tree.item(item_id, values=values, tags=tags)
+                self.track_tree.item(item_id, values=row.values, tags=tags)
             else:
                 self.track_tree.insert(
                     "",
                     "end",
                     iid=item_id,
-                    values=values,
+                    values=row.values,
                     tags=tags,
                 )
             seen_items.add(item_id)
-            automation_messages.append(
-                f"T{track.track_id}: {track.automation.message}"
-            )
-            if decision.appearance_request_id:
-                self.appearance_request_id.set(decision.appearance_request_id)
-                request_message = track.automation.message
-            if decision.kind.value == "appearance_response_accepted":
-                self.appearance_request_id.set("")
-                request_message = track.automation.message
         for item_id in existing_items - seen_items:
             self.track_tree.delete(item_id)
         self._refresh_manual_action_targets(result.tracks)
-        self.automation_status.set(
-            " | ".join(automation_messages[:2])
-            if automation_messages
-            else (
-                "自动注册：开启，等待人物进入画面"
-                if self.pipeline.automatic_registration_enabled
-                else "自动注册：关闭"
-            )
-        )
-        self.gallery_label.configure(text=", ".join(result.formal_identities) or "无")
-        self.pending_requests.set(
-            "\n".join(result.pending_request_ids[:3])
-            if result.pending_request_ids
-            else "无"
-        )
-        self.status.set(
-            f"帧 {result.frame_index} | 目标 {len(result.tracks)} | "
-            f"处理 {result.processing_seconds * 1000:.0f} ms"
-        )
-        if result.transport_errors:
-            self.status.set("动作事件传输失败：" + "；".join(result.transport_errors[:2]))
-        elif request_message:
-            self.status.set(request_message)
+        if view.appearance_request_id is not None:
+            self.appearance_request_id.set(view.appearance_request_id)
+        elif view.clear_appearance_request:
+            self.appearance_request_id.set("")
+        self.automation_status.set(view.automation_text)
+        self.gallery_label.configure(text=view.gallery_text)
+        self.pending_requests.set(view.pending_requests_text)
+        self.status.set(view.status_text)
 
     def _poll_messages(self) -> None:
         """取出工作线程消息，并安排下一次 Tk 轮询。"""

@@ -17,6 +17,16 @@ from .aggregation import (
 )
 from .automation import AutomationPolicy, AutomationStage, AutomationStatus
 from .engine import CrossEventVerifier
+from .orchestration import (
+    TrackStateRegistry,
+    append_gait_sample,
+    clear_gait_window,
+    independent_event_key,
+    resolve_action,
+    sync_action_segment,
+    sync_metadata_boundary,
+    weighted_window_quality,
+)
 from .types import (
     Decision,
     DecisionKind,
@@ -71,7 +81,10 @@ class AppearanceFirstGaitEnrollmentController:
         self.verifier = verifier
         self.policy = policy or AutomationPolicy()
         self._registration_enabled = self.policy.enabled
-        self._states: dict[str, _AppearanceFirstTrackState] = {}
+        self._state_registry = TrackStateRegistry(
+            lambda: _AppearanceFirstTrackState(deque(), deque(), deque())
+        )
+        self._states = self._state_registry.states
         self._manual_request_id: str | None = None
         self._readiness_cache: dict[str, GaitReadinessReport] = {}
         self._action_router = ActionRouter()
@@ -124,12 +137,7 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> None:
         """在换源时清理短期 Track 窗口，正式身份和事件事实继续保留。"""
 
-        keep = {value for value in preserve_candidate_ids if value}
-        if discard_unpreserved:
-            self._states = {
-                key: value for key, value in self._states.items() if key in keep
-            }
-        for state in self._states.values():
+        def reset_state(state: _AppearanceFirstTrackState) -> None:
             state.appearance_samples.clear()
             self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
@@ -140,16 +148,21 @@ class AppearanceFirstGaitEnrollmentController:
             state.action_type = None
             state.action_gate_active = False
 
+        self._state_registry.reset_tracks(
+            preserve_candidate_ids=preserve_candidate_ids,
+            discard_unpreserved=discard_unpreserved,
+            reset_state=reset_state,
+        )
+
     def discard_candidate(self, candidate_id: str) -> None:
         """清除一个短期采集任务的视觉绑定窗口。"""
 
-        self._states.pop(candidate_id, None)
+        self._state_registry.discard(candidate_id)
 
     def discard_candidates(self, candidate_ids: Sequence[str]) -> None:
         """批量清除已过期的短期采集任务。"""
 
-        for candidate_id in candidate_ids:
-            self.discard_candidate(candidate_id)
+        self._state_registry.discard_many(candidate_ids)
 
     def bind_request(
         self,
@@ -160,10 +173,7 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> None:
         """兼容旧控制器调用；新的 OSNet-first 流程不依赖步态签发令牌。"""
 
-        state = self._states.setdefault(
-            candidate_id,
-            _AppearanceFirstTrackState(deque(), deque(), deque()),
-        )
+        state = self._state_registry.get(candidate_id)
         state.identity_id = identity_id
         self._manual_request_id = request_id
 
@@ -181,17 +191,11 @@ class AppearanceFirstGaitEnrollmentController:
     def _event_key(observation: Observation) -> str:
         """同一会话/挑战中的多个窗口只对应一个步态事件。"""
 
-        if observation.capture_session_id and observation.capture_session_id != "unknown-session":
-            return f"session:{observation.capture_session_id}"
-        if observation.challenge_id:
-            return f"challenge:{observation.challenge_id}"
-        return f"event:{observation.event_id}"
+        return independent_event_key(observation, challenge_first=False)
 
     @staticmethod
     def _clear_gait_window(state: _AppearanceFirstTrackState) -> None:
-        state.gait_samples.clear()
-        state.gait_sample_weights.clear()
-        state.gait_sample_qualities.clear()
+        clear_gait_window(state)
 
     @staticmethod
     def _sync_subtracklet(
@@ -200,20 +204,23 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> None:
         """在生产子轨迹切换时撤销旧的本地身份和证据窗口。"""
 
-        value = observation.metadata.get("subtracklet_id")
-        current = str(value) if value not in (None, "") else None
-        if current is None:
-            return
-        if state.subtracklet_id is not None and state.subtracklet_id != current:
-            state.appearance_samples.clear()
-            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-            state.identity_id = None
-            state.conflict = False
-            state.last_appearance_generation = None
-            state.action_type = None
-            state.action_gate_active = False
-        state.subtracklet_id = current
+        def reset_boundary(item: _AppearanceFirstTrackState) -> None:
+            item.appearance_samples.clear()
+            clear_gait_window(item)
+            item.gait_window_start_timestamp = None
+            item.identity_id = None
+            item.conflict = False
+            item.last_appearance_generation = None
+            item.action_type = None
+            item.action_gate_active = False
+
+        sync_metadata_boundary(
+            state,
+            observation,
+            metadata_key="subtracklet_id",
+            state_attribute="subtracklet_id",
+            on_change=reset_boundary,
+        )
 
     @staticmethod
     def _sync_action_segment(
@@ -222,14 +229,7 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> None:
         """Action boundaries clear gait evidence without breaking visual ID binding."""
 
-        value = observation.metadata.get("action_segment_id")
-        current = str(value) if value not in (None, "") else None
-        if current is None:
-            return
-        if state.action_segment_id is not None and state.action_segment_id != current:
-            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-        state.action_segment_id = current
+        sync_action_segment(state, observation)
 
     @staticmethod
     def _resolve_action(
@@ -238,15 +238,7 @@ class AppearanceFirstGaitEnrollmentController:
     ) -> ActionPrediction | None:
         """更新显式动作路由状态；旧调用没有动作元数据时保持兼容。"""
 
-        prediction = ActionRouter.from_metadata(observation.metadata)
-        if prediction is None:
-            return None
-        if state.action_gate_active and state.action_type != prediction.action_type:
-            AppearanceFirstGaitEnrollmentController._clear_gait_window(state)
-            state.gait_window_start_timestamp = None
-        state.action_type = prediction.action_type
-        state.action_gate_active = True
-        return prediction
+        return resolve_action(state, observation)
 
     @staticmethod
     def _unit_mean(
@@ -290,14 +282,7 @@ class AppearanceFirstGaitEnrollmentController:
         return True
 
     def _state(self, key: str) -> _AppearanceFirstTrackState:
-        return self._states.setdefault(
-            key,
-            _AppearanceFirstTrackState(
-                appearance_samples=deque(),
-                gait_samples=deque(),
-                gait_sample_weights=deque(),
-            ),
-        )
+        return self._state_registry.get(key)
 
     def _appearance_assignments(
         self,
@@ -674,47 +659,34 @@ class AppearanceFirstGaitEnrollmentController:
         # written merely because the event key already exists.
         if not state.gait_samples:
             state.gait_window_start_timestamp = observation.timestamp
-        vector = np.asarray(observation.features.normalized().gait, dtype=np.float32)
-        reference = self._unit_mean(
-            state.gait_samples,
-            state.gait_sample_weights,
+        window = append_gait_sample(
+            state,
+            np.asarray(observation.features.normalized().gait, dtype=np.float32),
+            weight=sample_weight,
+            quality=gait_quality,
+            timestamp=observation.timestamp,
+            maximum_samples=self.policy.gait_sample_window,
+            minimum_similarity=self.policy.minimum_sample_similarity,
         )
-        if reference is not None:
-            if reference.shape != vector.shape:
-                self._clear_gait_window(state)
-                state.gait_window_start_timestamp = observation.timestamp
-            else:
-                similarity = float(np.dot(reference, vector))
-                if similarity < self.policy.minimum_sample_similarity:
-                    self._clear_gait_window(state)
-                    state.gait_window_start_timestamp = observation.timestamp
-                    state.gait_samples.append(vector.copy())
-                    state.gait_sample_weights.append(sample_weight)
-                    state.gait_sample_qualities.append(gait_quality)
-                    return None, f"步态样本波动，重新采集（相似度 {similarity:.2f}）", band
-        state.gait_samples.append(vector.copy())
-        state.gait_sample_weights.append(sample_weight)
-        state.gait_sample_qualities.append(gait_quality)
-        while len(state.gait_samples) > self.policy.gait_sample_window:
-            state.gait_samples.popleft()
-            state.gait_sample_weights.popleft()
-            state.gait_sample_qualities.popleft()
+        if window.restarted_for_instability:
+            return (
+                None,
+                f"步态样本波动，重新采集（相似度 {window.similarity:.2f}）",
+                band,
+            )
         required = self.policy.minimum_stable_gait_samples
-        sample_mass = float(sum(state.gait_sample_weights))
+        sample_mass = window.sample_mass
         required_mass = required * self.verifier.config.minimum_weighted_gait_mass
-        if len(state.gait_samples) < required or sample_mass < required_mass:
+        if window.sample_count < required or sample_mass < required_mass:
             return (
                 None,
                 (
-                    f"步态样本采集中 {len(state.gait_samples)}/{required}"
+                    f"步态样本采集中 {window.sample_count}/{required}"
                     f"（质量权重 {sample_mass:.2f}/{required_mass:.2f}）"
                 ),
                 band,
             )
-        centroid = self._unit_mean(
-            state.gait_samples,
-            state.gait_sample_weights,
-        )
+        centroid = window.centroid
         if centroid is None:
             self._clear_gait_window(state)
             return None, "步态样本聚合失败，重新采集", band
@@ -723,23 +695,10 @@ class AppearanceFirstGaitEnrollmentController:
             centroid,
             state.gait_sample_weights,
         )
-        quality_values = np.asarray(tuple(state.gait_sample_qualities), dtype=np.float32)
-        weight_values = np.asarray(tuple(state.gait_sample_weights), dtype=np.float32)
-        total_weight = float(weight_values.sum())
-        if (
-            quality_values.shape[0] != len(state.gait_samples)
-            or weight_values.shape[0] != len(state.gait_samples)
-            or total_weight <= 1e-8
-        ):
+        aggregate_quality = weighted_window_quality(state)
+        if aggregate_quality is None:
             self._clear_gait_window(state)
             return None, "步态质量聚合失败，重新采集", GaitQualityBand.INVALID
-        aggregate_quality = float(
-            np.clip(
-                np.dot(weight_values, quality_values) / total_weight,
-                0.0,
-                1.0,
-            )
-        )
         aggregate_band = (
             GaitQualityBand.STRONG
             if aggregate_quality >= self.verifier.config.strong_gait_quality

@@ -3,6 +3,7 @@
 import unittest
 import tkinter as tk
 from dataclasses import replace
+from inspect import signature
 from pathlib import Path
 import threading
 import tempfile
@@ -16,6 +17,8 @@ from cross_event_verifier.gui import (
     GUI_POLL_INTERVAL_MS,
     VerifierWindow,
     _frame_to_photo,
+    launch_gui,
+    launch_tk_gui,
 )
 from cross_event_verifier.gui_theme import ENGINEERING_GRID_TAG
 from cross_event_verifier.media import FrameWorker, ParameterUpdateMessage, SourceSpec
@@ -157,6 +160,19 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
+    def test_gui_launcher_legacy_call_shapes_and_defaults(self) -> None:
+        for launcher in (launch_gui, launch_tk_gui):
+            signature(launcher).bind()
+            signature(launcher).bind(":memory:", "demo", None, None)
+            parameters = signature(launcher).parameters
+            self.assertEqual(
+                parameters["database_path"].default,
+                "data/verifier-production-v1.sqlite3",
+            )
+            self.assertEqual(parameters["vision_backend"].default, "production")
+            self.assertIsNone(parameters["action_classifier_path"].default)
+            self.assertIsNone(parameters["posec3d_checkpoint_path"].default)
+
     def test_pipeline_attaches_camera_id_to_timed_view_timeline(self) -> None:
         verifier = CrossEventVerifier()
         pipeline = VideoVerifierPipeline(verifier, TimelineVision(), camera_id="cam-timeline")
