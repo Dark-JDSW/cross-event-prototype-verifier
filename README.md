@@ -70,7 +70,7 @@ YOLO11L 检测 ──► ByteTrack 生成临时 Track
 
 ### 安装
 
-Windows 用户请在 Git Bash 中操作；Linux 用户使用 Linux 原生 shell。项目要求 Python 3.10 或更高版本。仓库中的 `requirements.txt` 面向包含 NVIDIA CUDA 运行时的生产部署，并固定了对应的 PyTorch、Ultralytics 和 ONNX Runtime 版本。
+Windows 用户请在 Git Bash 中操作；Linux 用户使用 Linux 原生 shell。项目要求 Python 3.10 或更高版本。仓库中的 `requirements.txt` 面向包含 NVIDIA CUDA 运行时的生产部署，并固定了对应的 PyTorch、Ultralytics 和 ONNX Runtime 版本。Linux 的 NVIDIA 驱动/CUDA、摄像头权限、BlueZ 和 SQLite 操作说明见[开发环境指引](docs/DEVELOPMENT_ENVIRONMENTS.md)。
 
 Windows（Git Bash）创建 Windows 虚拟环境：
 
@@ -130,7 +130,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 ### 第一次使用
 
-1. 安装依赖并运行 `doctor`，确认生产模型和推理 provider 均为 ready；没有 GPU 时先用 `demo` 或经过验证的 CPU/ONNX 配置，不要直接假设实时帧率满足要求。
+1. 安装依赖并运行 `doctor`，确认生产模型和推理 provider 均为 ready。当前生产视觉配置默认要求 CUDA；没有可用 NVIDIA GPU/CUDA provider 时可运行 `demo`，但本项目没有通过当前 CLI 启用的 CPU 生产模式，不要把演示后端当作生产替代，也不要假设实时帧率满足要求。
 2. 启动 GUI，在“输入源”选择“摄像头”并填写设备号，或选择“视频文件”并通过“浏览…”选取文件；为每个真实机位设置稳定的“来源 ID”。
 3. 让人物以完整身体进入画面，保证肩、髋、膝、踝等关键点尽量不被遮挡。先完成视觉身份注册，再用不同时间或机位采集独立步态事件。
 4. 在“人物注册”面板保持自动注册，或按“注册用户”步骤人工登记。观察右侧 Track 表中的身份、结果、动作和分数，确认未知/冲突目标没有被误吸收。
@@ -141,16 +141,25 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 本项目将 BLE 广播用于“让上位机发现 `CEPV-ESP32S3`”，再通过发现后的 GATT 连接写入 Command 特征。桌面应用的 `BLE Light` 通道只写入 `0x01`（开灯）或 `0x00`（关灯）；身份、Track、摄像头和时间等字段只留在应用内或 MQTT JSON 中，不经 BLE 发送。纯广播包不适合承载可靠动作指令或回执，因此广播负责发现，GATT 连接负责灯光 opcode 传输。
 
-1. **准备并烧录固件。** 本项目按 Espressif 官方 ESP-IDF 工程构建，目标板为 `ESP32-S3-DevKitC-1`（常简称 DevKit1）。安装支持 ESP32-S3 的 ESP-IDF，使用 USB 数据线连接开发板，在已配置 ESP-IDF 工具链的 Git Bash 窗口中执行：
+1. **准备并烧录固件。** 本项目按 Espressif 官方 ESP-IDF 工程构建，目标板为 `ESP32-S3-DevKitC-1`（常简称 DevKit1）。安装支持 ESP32-S3 的 ESP-IDF，使用 USB 数据线连接开发板，在已配置 ESP-IDF 工具链的终端中构建：
 
    ```bash
    cd firmware/esp32s3_ble
    idf.py set-target esp32s3
    idf.py build
-   idf.py -p COM7 flash monitor
    ```
 
-   将 `COM7` 换成设备管理器中实际的串口；DevKit1 可使用 USB-UART 或 USB-JTAG 暴露的实际 COM 端口。串口日志出现 `advertising as CEPV-ESP32S3` 后，说明 NimBLE GATT 服务已经开始广播。上位机的 `BLE Light` 通道只发送开关灯 opcode，固件负责实现灯光回调。固件默认服务名为 `CEPV-ESP32S3`，并使用以下固定 UUID：
+   按操作系统选择实际串口烧录：
+
+   ```bash
+   # Windows（Git Bash）：用设备管理器显示的实际 COM 端口替换 COM7
+   idf.py -p COM7 flash monitor
+
+   # Linux：通常是 /dev/ttyUSB0 或 /dev/ttyACM0；先检查设备节点
+   idf.py -p /dev/ttyUSB0 flash monitor
+   ```
+
+   Windows 下将 `COM7` 换成设备管理器中实际的串口；Linux 下若板卡枚举为 `/dev/ttyACM0`，将示例路径相应替换。可用 `ls /dev/ttyUSB* /dev/ttyACM*` 检查 Linux 串口设备。若普通用户无权限，可加入发行版的 `dialout` 组后注销并重新登录（部分发行版使用其他组名）；不要用 root 启动 GUI。DevKit1 可通过 USB-UART 或 USB-JTAG 暴露串口。串口日志出现 `advertising as CEPV-ESP32S3` 后，说明 NimBLE GATT 服务已经开始广播。上位机的 `BLE Light` 通道只发送开关灯 opcode，固件负责实现灯光回调。固件默认服务名为 `CEPV-ESP32S3`，并使用以下固定 UUID：
 
    | GATT 属性 | UUID | 用途 |
    | --- | --- | --- |
@@ -158,7 +167,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
    | Command | `8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d11` | `BLE Light` 写入单字节 `0x01`/`0x00` |
    | Status | `8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d12` | 读取/订阅 `ready`、`accepted`、`executed`、`duplicate` 或拒绝状态 |
 
-2. **确认电脑能发现开发板。** 上位机必须有可用的 Bluetooth LE 适配器。安装项目依赖后，可以用以下脚本列出附近 BLE 设备及地址：
+2. **确认电脑能发现开发板。** 上位机必须有可用的 Bluetooth LE 适配器。Linux 使用 BlueZ/D-Bus backend，需先启动 BlueZ 并确认当前桌面用户可访问适配器；Windows 使用系统 BLE backend。安装项目依赖后，可以用以下脚本列出附近 BLE 设备及地址：
 
    ```bash
    python -c "import bleak; print('bleak import ok')"
@@ -177,9 +186,9 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
    asyncio.run(main())
    ```
 
-   找到名称为 `CEPV-ESP32S3` 的设备后，记录操作系统返回的 `address`。Windows 通常显示蓝牙 MAC 地址；macOS/Linux 可能显示系统生成的标识，必须使用当前平台扫描到的值。BLE Light 按无配对直连约定工作；若系统弹出 Passkey、数字比较或配对确认窗口，应取消操作并检查是否刷入了旧固件或启用了错误的安全配置。
+   找到名称为 `CEPV-ESP32S3` 的设备后，记录操作系统返回的 `address`。Windows 通常显示蓝牙 MAC 地址；macOS/Linux 可能显示系统生成的标识，必须使用当前平台扫描到的值。BLE Light 按无配对直连约定工作；若系统弹出 Passkey、数字比较或配对确认窗口，应取消操作并检查是否刷入了旧固件或启用了错误的安全配置。Linux BlueZ 服务配置与权限详见[开发环境指引](docs/DEVELOPMENT_ENVIRONMENTS.md)。
 
-3. **配置上位机环境。** 在启动 GUI 的同一个 Git Bash 窗口设置 BLE 模式和设备地址；服务、命令、状态 UUID 已有默认值，只有地址是必需项：
+3. **配置上位机环境。** 在启动 GUI 的同一个 Git Bash 或 Linux shell 中设置 BLE 模式和设备地址；服务、命令、状态 UUID 已有默认值，只有地址是必需项。PowerShell 用户应将 `export NAME=value` 改为 `$env:NAME="value"`：
 
    ```bash
    export CROSS_EVENT_TRANSPORT="ble-light"
@@ -353,7 +362,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 当前代码已经具备从输入源到 GUI 决策的端到端原型：检测/跟踪、OSNet-first 注册、GPGait++ 跨事件状态、动作隔离、SQLite 审计、运行时参数和地面控制点页面均已接入；核心模块在 `tests/` 中有相应的状态、路由、动作和传输边界测试。
 
-MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端和 GUI 协议选择已提供可运行的集成边界，但需要真实 broker、Windows 蓝牙适配器、ESP32-S3 板卡和 Home Assistant/设备侧配置才能完成现场验收。模型二进制、目标摄像头验证集、米家自动化和 BLE 安全策略仍属于部署工作，不应视为仓库开箱即用的生产承诺。
+MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端和 GUI 协议选择已提供可运行的集成边界，但需要真实 broker、操作系统 BLE 适配器（Linux 使用 BlueZ/D-Bus）、ESP32-S3 板卡和 Home Assistant/设备侧配置才能完成现场验收。模型二进制、目标摄像头验证集、米家自动化和 BLE 安全策略仍属于部署工作，不应视为仓库开箱即用的生产承诺。
 
 ## Roadmap
 
@@ -381,7 +390,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 **必须有 GPU 才能运行吗？**
 
-不需要 GPU 才能运行 `demo`、核心 API 或部分诊断；生产 YOLO/RTMPose/OSNet/GPGait++ 链路对模型、驱动和推理 provider 有较高要求。先运行 `doctor`，再根据实际硬件选择生产或演示后端。
+不需要 GPU 才能运行 `demo`、核心 API 或部分诊断；当前生产 YOLO/RTMPose/OSNet/GPGait++ 配置默认要求 CUDA 和模型文件，缺少 GPU/provider 时会拒绝生产初始化。先运行 `doctor`；无 GPU 时使用 `demo`，不要假设当前 CLI 提供 CPU 生产模式。
 
 **为什么画面里有人却一直是 UNKNOWN 或 NEED_MORE_DATA？**
 
@@ -415,7 +424,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 **如何编译 ESP32-S3 固件？**
 
-安装支持 ESP32-S3 的 ESP-IDF 后，在 `firmware/esp32s3_ble` 执行 `idf.py set-target esp32s3`、`idf.py build`，再用实际串口执行 `idf.py -p COM7 flash monitor`。固件应保持无配对直连并替换仅记录日志的灯光处理函数；若出现 Passkey 或配对提示，应先检查安全配置。
+安装支持 ESP32-S3 的 ESP-IDF 后，在 `firmware/esp32s3_ble` 执行 `idf.py set-target esp32s3` 和 `idf.py build`。Windows Git Bash 使用设备管理器确认的 `COMx`（例如 `idf.py -p COM7 flash monitor`）；Linux 使用实际的 `/dev/ttyUSBn` 或 `/dev/ttyACMn`（例如 `idf.py -p /dev/ttyUSB0 flash monitor`），并确保当前用户有串口设备权限。固件应保持无配对直连并替换仅记录日志的灯光处理函数；若出现 Passkey 或配对提示，应先检查安全配置。
 
 **如何处理模型下载或 GUI 启动失败？**
 
