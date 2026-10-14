@@ -948,7 +948,7 @@ class CrossEventVerifier:
 
         这是 OSNet-first 流程的写入边界：视觉身份必须已经存在，当前事件必须
         通过强步态质量和稳定性门；该方法绝不会创建新身份，也不会签发旧的
-        一次性外观请求。GaitGraph2 权重保持只读，写入的只是其输出向量。
+        一次性外观请求。GPGait++ 权重保持只读，写入的只是其输出向量。
         传入 ``update_existing_event=True`` 时，同一采集会话的后续稳定窗口
         会更新该事件代表向量，但不会增加独立事件数量。
         ``aggregated_gait_quality`` 用于质量加权时序窗口：它代表整个稳定
@@ -1587,7 +1587,7 @@ class CrossEventVerifier:
         allowed_identity_ids: Sequence[str] | None = None,
         require_identity_quality: bool = False,
     ) -> Decision:
-        """只使用 GaitGraph2 分支检索视觉身份的步态原型。
+        """只使用 GPGait++ 分支检索视觉身份的步态原型。
 
         ``require_identity_quality`` 是 OSNet-first 生产路径使用的严格模式。
         它把“可以形成学习候选的步态样本”和“可以直接承担身份检索的步态

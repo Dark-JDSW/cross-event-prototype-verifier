@@ -70,6 +70,22 @@ GUI_POLL_INTERVAL_MS = 16
 VIDEO_STANDBY_TEXT = "◎\n\n没有画面\nNO VISUAL FEED\nCAMERA CHANNEL STANDBY"
 
 
+def _initial_window_geometry(
+    screen_width: int,
+    screen_height: int,
+) -> tuple[str, tuple[int, int]]:
+    """Return an on-screen startup size and position for the Tk window."""
+
+    screen_width = max(int(screen_width), 1)
+    screen_height = max(int(screen_height), 1)
+    width = min(1440, max(screen_width - 24, 1))
+    height = min(860, max(screen_height - 80, 1))
+    x = max((screen_width - width) // 2, 0)
+    y = max((screen_height - height) // 2, 0)
+    minimum_size = (min(980, width), min(640, height))
+    return f"{width}x{height}+{x}+{y}", minimum_size
+
+
 def _frame_to_photo(
     frame_bgr: object,
     maximum_width: int = 960,
@@ -107,7 +123,7 @@ class VerifierWindow:
 
     def __init__(
         self,
-        database_path: str = "data/verifier-production-v1.sqlite3",
+        database_path: str = "data/verifier-production-gpgaitpp-v1.sqlite3",
         vision_backend: str = "production",
         action_classifier_path: Path | None = None,
         posec3d_checkpoint_path: Path | None = None,
@@ -115,8 +131,12 @@ class VerifierWindow:
         """创建验证器，并在生产后端下后台预加载模型后再启用采集。"""
         self.root = tk.Tk()
         self.root.title("Cross-event Prototype Verifier")
-        self.root.geometry("1440x860")
-        self.root.minsize(980, 640)
+        geometry, minimum_size = _initial_window_geometry(
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+        )
+        self.root.geometry(geometry)
+        self.root.minsize(*minimum_size)
         configure_theme(self.root)
 
         self._presenter = GuiPresenter()
@@ -916,7 +936,7 @@ class VerifierWindow:
         ).grid(row=5, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="ew")
         ttk.Label(
             enrollment,
-            text="当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GaitGraph2 原型。",
+            text="当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GPGait++ 原型。",
             wraplength=470,
         ).grid(row=6, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
 
@@ -1983,12 +2003,6 @@ class VerifierWindow:
         self.worker.set_appearance_request(normalized, track_id)
         self.status.set(message)
 
-    @staticmethod
-    def _track_visual_tag(kind: str) -> str:
-        """把既有决策类别映射为仅用于显示的状态色标签。"""
-
-        return GuiPresenter.track_visual_tag(kind)
-
     def _update_frame(self, result: FrameResult) -> None:
         """渲染一帧处理结果、决策、自动化阶段和图库 ID。"""
         self.backend_status.set(
@@ -2113,7 +2127,7 @@ class VerifierWindow:
 
 
 def launch_tk_gui(
-    database_path: str = "data/verifier-production-v1.sqlite3",
+    database_path: str = "data/verifier-production-gpgaitpp-v1.sqlite3",
     vision_backend: str = "production",
     action_classifier_path: Path | None = None,
     posec3d_checkpoint_path: Path | None = None,
@@ -2131,7 +2145,7 @@ def launch_tk_gui(
 
 
 def launch_gui(
-    database_path: str = "data/verifier-production-v1.sqlite3",
+    database_path: str = "data/verifier-production-gpgaitpp-v1.sqlite3",
     vision_backend: str = "production",
     action_classifier_path: Path | None = None,
     posec3d_checkpoint_path: Path | None = None,

@@ -1,0 +1,36 @@
+{
+  "repo_url": "https://github.com/BNU-IVC/FastPoseGait",
+  "git_commit": "d3ce631971a01d806eeb3a154774d482c0951813",
+  "config_sha256": "05e200760d01acd3b01b9deca3ec622e40b3137403822cc1b575f181f125fc31",
+  "source_checkpoint_sha256": "7b468129ebd59f535e8f34f29aa7d464dd3e8db977632b0999fd43783df25a71",
+  "source_files": {
+    "modeling/graph/graph.py": "c057cee2ed6475a4194bf15f2cf5c35a47d1d67bb15e18b0fc134a39df909d9f",
+    "modeling/graph/partition.py": "4ebfa30956deaa332d73cdbc3c949daf1f7b81c7543813a2d41df34329d843b0",
+    "modeling/components/other_modules.py": "89d6ce88073f3898043d8f85a09995d44f9c44e854d64ed560153431ed9944aa",
+    "modeling/components/units/unit_conv2d.py": "8d2b47d5b3562d08212debd30e6808721022080cde76e864c3d6c0c470817aa7",
+    "modeling/components/units/unit_pagcn.py": "41ed5904d673da4d2c91cf28fda903c17014fe5078167bc3fbaf8649482bf20f",
+    "modeling/components/blocks.py": "0a233c28652c1afbfed7b6077c011d520fef770e050fc4fc198fea29dd16c184",
+    "modeling/components/head.py": "338c85668eda5afa1115321d0a8f2eeffa46eaf059e20ac56abd1de89b7e4142",
+    "modeling/models/gpgait++.py": "dcd594cccb1f7d641fb17222753e30fbb431461d03cf01a6edecfc6bb5cd7723",
+    "data/transform.py": "096ddf5afb7f6da521b1df3c3444a37f6944bf899a7d75bca090d951e355b963"
+  },
+  "model_cfg": {
+    "in_channels": [
+      2,
+      64,
+      64,
+      128,
+      256
+    ],
+    "num_class": 100,
+    "share_num": 3,
+    "mask": false
+  },
+  "transform": [
+    "Affine",
+    "RescaleCenter(scale=225,center=neck)",
+    "HOD_MultiInput(coco)",
+    "SkeletonInput"
+  ],
+  "upstream_license": "No standalone LICENSE file observed in pinned repository; upstream usage terms must be checked separately."
+}

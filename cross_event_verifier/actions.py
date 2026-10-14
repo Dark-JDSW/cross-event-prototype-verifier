@@ -1,6 +1,6 @@
 """动作类型、质量和路由契约。
 
-本模块定义动作证据和现有 WALK/GaitGraph2 分支的边界。具体分类器位于
+本模块定义动作证据和现有 WALK/GPGait++ 分支的边界。具体分类器位于
 ``action_classifier``，但下游不应再依赖未版本化的字符串或把低置信度动作
 当成 WALK。没有动作预测时保留旧 API 的兼容行为；一旦调用方显式提供动作
 结果，路由器就采用保守的显式门控。
@@ -127,7 +127,7 @@ class ActionPrediction:
 
 
 class ActionRouter:
-    """把显式动作预测转换为 WALK/GaitGraph2 是否可写的决定。"""
+    """把显式动作预测转换为 WALK/GPGait++ 是否可写的决定。"""
 
     def __init__(
         self,
@@ -148,7 +148,7 @@ class ActionRouter:
     def from_metadata(metadata: Mapping[str, Any] | None) -> ActionPrediction | None:
         """从观察元数据读取动作结果。
 
-        ``None`` 表示调用方没有接入动作分类器，此时旧的 WALK/GaitGraph2 API
+        ``None`` 表示调用方没有接入动作分类器，此时旧的 WALK/GPGait++ API
         保持兼容。显式提供 ``action_type`` 后，即使字段不完整也不会默认放行。
         """
 
@@ -168,7 +168,7 @@ class ActionRouter:
         )
 
     def allows_walk(self, prediction: ActionPrediction | None) -> bool:
-        """判断显式动作证据是否足够进入当前 WALK/GaitGraph2 分支。"""
+        """判断显式动作证据是否足够进入当前 WALK/GPGait++ 分支。"""
 
         return bool(
             prediction is not None

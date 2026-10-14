@@ -1,7 +1,7 @@
 """Quality-aware aggregation helpers for temporal biometric evidence.
 
 The helpers in this module operate on already extracted feature vectors. They
-do not alter the pose representation or the GaitGraph2 input contract; they
+do not alter the pose representation or the GPGait++ input contract; they
 only control how valid observations are accumulated.
 """
 

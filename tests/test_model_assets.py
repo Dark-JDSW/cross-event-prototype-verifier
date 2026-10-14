@@ -19,7 +19,7 @@ class ModelAssetTests(unittest.TestCase):
                 "yolo11l.pt",
                 "rtmpose-s.onnx",
                 "osnet_ain_x1_0_dg.pth",
-                "gaitgraph2_grew_state.pt",
+                "gpgaitpp_ccpg_state.pt",
                 "posec3d_hmdb51_split1.pth",
             },
         )
@@ -36,7 +36,7 @@ class ModelAssetTests(unittest.TestCase):
 
     def test_converted_assets_have_stable_tensor_fingerprints(self) -> None:
         manifest = _read_manifest(MODEL_MANIFEST)["models"]
-        for name in ("osnet_ain_x1_0_dg.pth", "gaitgraph2_grew_state.pt"):
+        for name in ("osnet_ain_x1_0_dg.pth", "gpgaitpp_ccpg_state.pt"):
             path = MODEL_MANIFEST.parent / name
             expected = manifest[name]["tensor_sha256"]
             self.assertEqual(tensor_state_fingerprint(path), expected)

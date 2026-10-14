@@ -17,6 +17,7 @@ from cross_event_verifier.gui import (
     GUI_POLL_INTERVAL_MS,
     VerifierWindow,
     _frame_to_photo,
+    _initial_window_geometry,
     launch_gui,
     launch_tk_gui,
 )
@@ -160,6 +161,16 @@ class KnownAndNovelVision(FakeVision):
 
 
 class GuiPipelineTests(unittest.TestCase):
+    def test_initial_window_geometry_is_centered_and_clamped_to_screen(self) -> None:
+        self.assertEqual(
+            _initial_window_geometry(1920, 1080),
+            ("1440x860+240+110", (980, 640)),
+        )
+        self.assertEqual(
+            _initial_window_geometry(800, 600),
+            ("776x520+12+40", (776, 520)),
+        )
+
     def test_gui_launcher_legacy_call_shapes_and_defaults(self) -> None:
         for launcher in (launch_gui, launch_tk_gui):
             signature(launcher).bind()
@@ -167,7 +178,7 @@ class GuiPipelineTests(unittest.TestCase):
             parameters = signature(launcher).parameters
             self.assertEqual(
                 parameters["database_path"].default,
-                "data/verifier-production-v1.sqlite3",
+                "data/verifier-production-gpgaitpp-v1.sqlite3",
             )
             self.assertEqual(parameters["vision_backend"].default, "production")
             self.assertIsNone(parameters["action_classifier_path"].default)
@@ -913,7 +924,7 @@ class GuiPipelineTests(unittest.TestCase):
                 self.capture = type(
                     "Video",
                     (),
-                    {"get": lambda _self, property_id: 0.0},
+                    {"get": lambda _self, _property_id: 0.0},
                 )()
                 self.read_count = 0
                 self.released = False

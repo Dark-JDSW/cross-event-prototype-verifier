@@ -740,7 +740,7 @@ class VerifierWindow(QMainWindow):
 
     def __init__(
         self,
-        database_path: str = "data/verifier-production-v1.sqlite3",
+        database_path: str = "data/verifier-production-gpgaitpp-v1.sqlite3",
         vision_backend: str = "production",
         action_classifier_path: Path | None = None,
         posec3d_checkpoint_path: Path | None = None,
@@ -1056,7 +1056,7 @@ class VerifierWindow(QMainWindow):
         enrollment_layout.addWidget(enrollment_note, 4, 0, 1, 2)
         enrollment_layout.addWidget(register_button, 5, 0, 1, 2)
         workflow_note = _named(
-            QLabel("当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GaitGraph2 原型。"),
+            QLabel("当前流程：OSNet 先确认视觉身份并编号；随后按独立步态事件采集 GPGait++ 原型。"),
             "mutedLabel",
         )
         workflow_note.setWordWrap(True)
@@ -1906,10 +1906,6 @@ class VerifierWindow(QMainWindow):
         self.worker.set_appearance_request(normalized, track_id)
         self.status.setText(message)
 
-    @staticmethod
-    def _track_visual_tag(kind: str) -> str:
-        return GuiPresenter.track_visual_tag(kind)
-
     def _update_frame(self, result: FrameResult) -> None:
         self.backend_status.setText(
             f"视觉后端：{getattr(self.vision, 'backend_status', type(self.vision).__name__)}"
@@ -2119,7 +2115,7 @@ class VerifierWindow(QMainWindow):
 
 
 def launch_gui(
-    database_path: str = "data/verifier-production-v1.sqlite3",
+    database_path: str = "data/verifier-production-gpgaitpp-v1.sqlite3",
     vision_backend: str = "production",
     action_classifier_path: Path | None = None,
     posec3d_checkpoint_path: Path | None = None,

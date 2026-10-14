@@ -139,10 +139,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--database",
-        default="data/verifier-production-v1.sqlite3",
+        default="data/verifier-production-gpgaitpp-v1.sqlite3",
         help=(
             "SQLite file used by the GUI "
-            "(default: data/verifier-production-v1.sqlite3)"
+            "(default: data/verifier-production-gpgaitpp-v1.sqlite3)"
         ),
     )
     parser.add_argument(

@@ -26,7 +26,7 @@ import numpy as np
 from .actions import ActionPrediction, ActionQuality, ActionRouter, ActionType
 from .action_classifier import PoseActionClassifier
 from .adapters import occlusion_scores
-from .gait_graph import TemporalGaitEncoder
+from .gpgaitpp import GPGaitPPEncoder
 from .model_assets import tensor_state_fingerprint
 from .osnet_ain import load_osnet_ain
 from .posec3d_action import PoseC3DActionClassifier, PoseC3DPrediction
@@ -62,7 +62,7 @@ class ProductionVisionConfig:
     tracker_path: Path = MODEL_DIRECTORY / "bytetrack-cross-event.yaml"
     pose_path: Path = MODEL_DIRECTORY / "rtmpose-s.onnx"
     appearance_path: Path = MODEL_DIRECTORY / "osnet_ain_x1_0_dg.pth"
-    gait_path: Path = MODEL_DIRECTORY / "gaitgraph2_grew_state.pt"
+    gait_path: Path = MODEL_DIRECTORY / "gpgaitpp_ccpg_state.pt"
     action_classifier_path: Path | None = None
     # Optional official HMDB51 PoseC3D semantic gate.  The existing
     # ``action_classifier_path`` remains reserved for the project's .npz
@@ -95,7 +95,7 @@ class ProductionVisionConfig:
     maximum_track_gap_seconds: float = 1.5
     # Optional image-to-ground homography.  It is deliberately inert until a
     # real per-camera calibration is supplied; gait model coordinates must
-    # remain in their GREW-compatible image-space contract.
+    # remain in image space before official GPGait++ preprocessing.
     ground_homography: tuple[float, ...] | None = None
     ground_calibration_id: str | None = None
     ground_coordinate_frame: str | None = None
@@ -773,7 +773,6 @@ class _TrackState:
     track_gap_frames: int = 0
     lifetime_track_gap_frames: int = 0
     last_seen_timestamp: float | None = None
-    last_valid_timestamp: float | None = None
     appearance: np.ndarray | None = None
     last_appearance_frame: int | None = None
     appearance_generation: int = 0
@@ -829,16 +828,6 @@ class _WorldTrajectory:
     outlier_count: int = 0
 
 
-def _finite_optional_float(value: object) -> float | None:
-    """Normalize optional plugin audit values without letting them break frames."""
-
-    try:
-        candidate = float(value)
-    except (TypeError, ValueError):
-        return None
-    return candidate if np.isfinite(candidate) else None
-
-
 def _box_valid(box: Box) -> bool:
     """在使用证据前拒绝过小或形状不合理的人物框。"""
     width, height = box[2] - box[0], box[3] - box[1]
@@ -853,9 +842,8 @@ def _canonical_pose(
 ) -> np.ndarray | None:
     """清理 RTMPose 点位并保留其原始全帧坐标。
 
-    GaitGraph2 的 GREW 检查点是在原图坐标上训练的。这里如果再按检测框
-    归一化，会把同一个人的全局位置和尺度改成一个与训练数据不兼容的分布，
-    最终表现为不同人物的 gait embedding 几乎完全重合。``box`` 保留在签名
+    GPGait++ 的官方预处理接收原图坐标；身体对齐和尺度转换由编码器承担。
+    此处只进行有限值与置信度清理，不提前按检测框归一化。``box`` 保留在签名
     中是为了让调用方继续显式传递检测上下文；它不应该参与模型输入变换。
     """
     if keypoints is None or np.asarray(keypoints).shape != (17, 3):
@@ -865,7 +853,7 @@ def _canonical_pose(
     points[~valid] = 0.0
     if not bool(valid.any()):
         return None
-    # Do not clip valid coordinates to the box. GREW stores raw image-space
+    # Do not clip valid coordinates before official GPGait++ alignment.
     # coordinates, and a detector/pose mismatch should be handled by quality
     # gates rather than silently changing the model's coordinate distribution.
     return points
@@ -1218,20 +1206,20 @@ class ProductionVisionAdapter:
     """
 
     supports_automatic_registration = True
-    # v2 records the checkpoint-compatible GREW input contract: raw full-frame
-    # RTMPose coordinates and OpenGait's partition-normalized COCO graph.  A
+    # The GPGait++ contract starts with raw full-frame
+    # RTMPose coordinates followed by official Affine / RescaleCenter / HOD.  A
     # database produced by the old bbox-normalized path must not be reused as
     # if its gait prototypes were comparable to this stream.
-    model_version = "yolo11l-bytetrack+rtmpose-s+osnet-ain+gaitgraph2-grew-opengait-input-v2"
+    model_version = "yolo11l-bytetrack+rtmpose-s+osnet-ain+gpgaitpp-ccpg-v1"
     feature_schema = (
         "osnet-ain-512-imagenet-v1|"
-        "gaitgraph2-grew-coco17-raw-full-frame-t60-tta3-v2"
+        "gpgaitpp-ccpg-coco17-affine-hod6-bnneck-v1"
     )
-    preprocess_version = "rtmpose-s-256x192-simcc2|opengait-coco17-raw-t60-tta3-v2"
+    preprocess_version = "rtmpose-s-256x192-simcc2|fastposegait-d3ce631-affine-rescalecenter-hod6-skeleton-v1"
     joint_format = "COCO-17"
-    tta_mode = "original+temporal-reverse+horizontal-flip"
-    coordinate_contract = "raw-full-frame-image-coordinates"
-    embedding_dimensions = {"appearance": 512, "gait": 384}
+    tta_mode = "none"
+    coordinate_contract = "raw-full-frame-image-coordinates->official-affine-scale225-neck"
+    embedding_dimensions = {"appearance": 512, "gait": 4864}
 
     @property
     def artifact_sha256(self) -> str:
@@ -1250,7 +1238,7 @@ class ProductionVisionAdapter:
 
     @property
     def sequence_length(self) -> int:
-        """返回当前 GaitGraph2 窗口长度。"""
+        """返回当前 GPGait++ 窗口长度。"""
         return int(self.config.gait_sequence_length)
     _RUNTIME_PARAMETER_NAMES = (
         "detector_confidence",
@@ -1276,7 +1264,7 @@ class ProductionVisionAdapter:
         self.detector: _YoloByteTracker | None = None
         self.pose: _RtmposeEstimator | None = None
         self.appearance: _OsnetAppearanceExtractor | None = None
-        self.gait: TemporalGaitEncoder | None = None
+        self.gait: GPGaitPPEncoder | None = None
         self.posec3d: PoseC3DActionClassifier | None = None
         self.action_classifier = (
             PoseActionClassifier.from_path(self.config.action_classifier_path)
@@ -1323,7 +1311,7 @@ class ProductionVisionAdapter:
         self,
         on_stage: Callable[[str, float], None] | None = None,
     ) -> None:
-        """按 YOLO、RTMPose、OSNet、可选 PoseC3D、GaitGraph2 顺序加载模型。"""
+        """按 YOLO、RTMPose、OSNet、可选 PoseC3D、GPGait++ 顺序加载模型。"""
 
         posec3d_ready = (
             self.config.posec3d_checkpoint_path is None or self.posec3d is not None
@@ -1369,26 +1357,25 @@ class ProductionVisionAdapter:
 
             self._notify_stage(
                 on_stage,
-                "正在加载 GaitGraph2…",
+                "正在加载 GPGait++…",
                 0.62 if self.posec3d is not None else 0.58,
             )
-            self.gait = TemporalGaitEncoder(
+            self.gait = GPGaitPPEncoder(
                 self.config.gait_path,
                 device=self.config.torch_device,
                 sequence_length=self.config.gait_sequence_length,
-                use_tta=True,
             )
             gait_dimension = getattr(self.gait, "output_dimension", None)
-            if gait_dimension is not None and gait_dimension != 384:
+            if gait_dimension is not None and gait_dimension != 4864:
                 raise ProductionVisionError(
-                    "GaitGraph2 production contract requires a 384-dimensional TTA embedding"
+                    "GPGait++ production contract requires a 4864-dimensional BN-neck embedding"
                 )
             appearance_dimension = getattr(self.appearance, "output_dimension", None)
             if appearance_dimension is not None and appearance_dimension != 512:
                 raise ProductionVisionError(
                     "OSNet-AIN production contract requires a 512-dimensional embedding"
                 )
-            self._notify_stage(on_stage, "GaitGraph2 已加载", 0.70)
+            self._notify_stage(on_stage, "GPGait++ 已加载", 0.70)
         except Exception:
             self.detector = None
             self.pose = None
@@ -1428,11 +1415,11 @@ class ProductionVisionAdapter:
 
         self._notify_stage(
             on_stage,
-            "正在预热 GaitGraph2…",
+            "正在预热 GPGait++…",
             0.94 if self.posec3d is not None else 0.91,
         )
         self.gait.warmup()
-        self._notify_stage(on_stage, "GaitGraph2 预热完成", 0.97)
+        self._notify_stage(on_stage, "GPGait++ 预热完成", 0.97)
 
     def _load(self) -> None:
         """兼容旧入口，只执行分阶段模型加载而不额外预热。"""
@@ -1468,7 +1455,7 @@ class ProductionVisionAdapter:
             f"YOLO/ByteTrack + RTMPose({pose_backend}{latency}) + "
             f"PoseActionClassifier({self.action_classifier.model_version}) + "
             f"{posec3d_status}"
-            "OSNet-AIN + GaitGraph2"
+            "OSNet-AIN + GPGait++"
         )
 
     def diagnostics(self) -> dict[str, object]:
@@ -1662,8 +1649,6 @@ class ProductionVisionAdapter:
         state: _TrackState,
         frame_index: int,
         reasons: Sequence[str],
-        *,
-        clear_appearance: bool = False,
     ) -> None:
         """关闭旧时序窗口，并从当前帧开始一个新的干净子轨迹。"""
 
@@ -1684,7 +1669,6 @@ class ProductionVisionAdapter:
         state.detector_gap_frames = 0
         state.track_gap_frames = 0
         state.id_switches = 0
-        state.last_valid_timestamp = None
         state.gait = None
         state.last_gait_frame = None
         state.appearance_similarity_to_previous = None
@@ -2040,7 +2024,6 @@ class ProductionVisionAdapter:
                     state,
                     self.frame_index,
                     ("track_id_switch",),
-                    clear_appearance=True,
                 )
             state.frame_count += 1
             state.lifetime_frame_count += 1
@@ -2094,8 +2077,6 @@ class ProductionVisionAdapter:
                 bool(np.mean(item[[11, 12, 13, 14, 15, 16], 2] > 0.0) >= 0.45)
                 for item in state.poses
             )
-            if canonical is not None:
-                state.last_valid_timestamp = timestamp
             walking_ratio, gait_cycles = _walking_metrics(
                 state.poses,
                 detection.box,
@@ -2159,7 +2140,7 @@ class ProductionVisionAdapter:
             )
             if (
                 state.valid_pose_frames >= self.config.minimum_pose_frames
-                # A complete cycle is required before GaitGraph2 sees the
+                # A complete cycle is required before GPGait++ sees the
                 # current action segment; half-cycle fixed windows are too
                 # easy to contaminate during entrance/exit transitions.
                 and gait_cycles >= 1.0
@@ -2463,7 +2444,7 @@ class ProductionVisionAdapter:
                     "action_candidate_frames": state.action_candidate_frames,
                     "action_unknown_frames": state.action_unknown_frames,
                     # These values are audit/conditioning metadata.  They do
-                    # not change GaitGraph2's image-coordinate input.
+                    # not change GPGait++'s image-coordinate input.
                     "camera_zone": _camera_zone(detection.box, frame_bgr.shape),
                     "frame_index": self.frame_index,
                     "frame_timestamp": float(timestamp),

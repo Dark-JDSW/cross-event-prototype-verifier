@@ -69,7 +69,7 @@ class VerifierConfig:
     appearance_conflict_similarity: float = 0.35
     appearance_request_ttl_seconds: float = 90.0
 
-    # OSNet-first visual identity and GaitGraph2 enrollment.  These thresholds
+    # OSNet-first visual identity and GPGait++ enrollment.  These thresholds
     # describe readiness of a visual identity's gait gallery; they do not
     # decide whether a Track may receive its initial visual label.
     appearance_identity_min_samples: int = 8
@@ -81,7 +81,7 @@ class VerifierConfig:
     gait_event_min_similarity: float = 0.70
     gait_holdout_min_similarity: float = 0.70
     gait_duplicate_event_similarity: float = 0.985
-    # GaitGraph2 can resample a short window to its fixed input length.  The
+    # The encoder requires its complete real-frame window.  The
     # shorter threshold is for learning an event; formal gait assignment needs
     # a longer real observation window and sufficient pose coverage.
     gait_learning_min_frames: int = 25

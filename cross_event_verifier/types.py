@@ -220,7 +220,7 @@ class CleanSubTracklet:
 class FeatureBundle:
     """视觉适配器提供的归一化外观和步态嵌入。
 
-    ``appearance`` 通常是 OSNet 向量，``gait`` 是时序 GaitGraph2 向量。接口字段
+    ``appearance`` 通常是 OSNet 向量，``gait`` 是时序 GPGait++ 向量。接口字段
     接受通用序列，因此测试和替代模型不必依赖特定张量库。验证器会在计算余弦
     相似度前调用 :meth:`normalized`。
     """

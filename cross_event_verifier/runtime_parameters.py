@@ -374,7 +374,7 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         -1.0,
         1.0,
         0.35,
-        "高质量外观低于此原始余弦时，禁止 GaitGraph2 覆盖已绑定视觉身份。",
+        "高质量外观低于此原始余弦时，禁止 GPGait++ 覆盖已绑定视觉身份。",
     ),
     _int_spec(
         "verifier.appearance_identity_min_samples",
@@ -473,7 +473,7 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         8,
         120,
         45,
-        "GaitGraph2 可以承担身份检索所需的真实有效姿态帧数。",
+        "GPGait++ 可以承担身份检索所需的真实有效姿态帧数。",
     ),
     _float_spec(
         "verifier.gait_min_pose_coverage",
@@ -572,7 +572,7 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         8,
         60,
         25,
-        "GaitGraph2 开始输出步态前要求的有效姿态帧数。",
+        "GPGait++ 开始输出步态前要求的有效姿态帧数。",
     ),
     _int_spec(
         "vision.appearance_stride",
@@ -590,7 +590,7 @@ RUNTIME_PARAMETER_SPECS: tuple[RuntimeParameterSpec, ...] = (
         1,
         30,
         3,
-        "姿态仍逐帧采集，但每隔多少 Track 帧批量刷新一次 GaitGraph2 嵌入。",
+        "姿态仍逐帧采集，但每隔多少 Track 帧批量刷新一次 GPGait++ 嵌入。",
     ),
     _float_spec(
         "vision.low_light_threshold",

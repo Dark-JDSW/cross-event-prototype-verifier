@@ -39,20 +39,27 @@ commercial deployment.
   checkpoint-compatible inference architecture; upstream training, datasets,
   evaluation and Cython code are not bundled.
 
-## OpenGait / GaitGraph2
+## FastPoseGait / GPGait++
 
-- Project: <https://github.com/ShiqiYu/OpenGait>
-- Checkpoint source:
-  <https://huggingface.co/opengait/OpenGait/tree/main/GREW/GaitGraph2/GaitGraph2/checkpoints>
-- Model: `models/gaitgraph2_grew_state.pt`
-- Adaptation: `cross_event_verifier/gait_graph.py` contains a compact,
-  inference-only checkpoint-compatible ResGCN implementation.
+- Project: <https://github.com/BNU-IVC/FastPoseGait>
+- Pinned commit: `d3ce631971a01d806eeb3a154774d482c0951813`
+- Model: `models/gpgaitpp_ccpg_state.pt`, official CCPG small, iteration 40000.
+- Official source checkpoint: <https://drive.google.com/file/d/1Y1XqjMbDVikslNfahHWzmXAQmG-Hommo>
+- Adaptation: `_gpgaitpp_network.py` contains the checkpoint-compatible inference
+  primitives; `gpgaitpp_preprocessing.py` preserves the official inference transforms.
+  Only CUDA-specific placement was generalized to the input device. Training,
+  optimizers, distributed data loaders and dataset evaluation are excluded.
+- Source file hashes, configuration and asset provenance: `models/gpgaitpp_source.json`.
 
-The OpenGait repository explicitly describes its code as academic-use only.
-The tensor-only state dictionary included here was derived from the official
-checkpoint to permit safe `weights_only=True` loading; that transformation does
-not remove upstream usage restrictions. Obtain separate permission or replace
-this gait backend before commercial deployment.
+The pinned upstream README explicitly limits its code to academic purposes and
+prohibits commercial use. Conversion to a tensor-only checkpoint does not change
+these terms. This application's Apache-2.0 license does not relicense upstream
+code or weights; obtain appropriate permission for other uses.
+
+The compatibility module `gait_graph.py` retains the earlier OpenGait/GaitGraph2
+inference API for existing import callers. It is not selected by the production
+adapter and its old checkpoint is no longer bundled. Its source remains subject
+to OpenGait's academic-use terms: <https://github.com/ShiqiYu/OpenGait>.
 
 ## MMAction2 / PoseC3D-HMDB51
 

@@ -148,7 +148,7 @@ class _FakeGait:
         self.batch_sizes.append(len(pose_sequences))
         output = []
         for index, _poses in enumerate(pose_sequences):
-            vector = np.zeros(384, dtype=np.float32)
+            vector = np.zeros(4864, dtype=np.float32)
             vector[index % len(vector)] = 1.0
             output.append(vector)
         return output
@@ -228,7 +228,7 @@ class ProductionVisionTests(unittest.TestCase):
             patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
             patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
             patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             track = adapter.process_at(frame, timestamp=10.0)[0]
@@ -347,7 +347,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             adapter.warmup(on_stage=lambda text, progress: stages.append((text, progress)))
@@ -361,7 +361,7 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertEqual(adapter.appearance.warmup_calls, 1)
         self.assertEqual(adapter.gait.warmup_calls, 1)
         self.assertEqual(stages[0], ("正在加载 YOLO/ByteTrack…", 0.16))
-        self.assertEqual(stages[-1], ("GaitGraph2 预热完成", 0.97))
+        self.assertEqual(stages[-1], ("GPGait++ 预热完成", 0.97))
         self.assertEqual(
             [progress for _text, progress in stages],
             sorted(progress for _text, progress in stages),
@@ -442,7 +442,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter()
             with self.assertRaisesRegex(
@@ -473,7 +473,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _DriftingAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             first = adapter.process(frame)
@@ -489,7 +489,7 @@ class ProductionVisionTests(unittest.TestCase):
         self.assertEqual(second[0].quality.id_switches, 0)
 
     def test_gait_pose_keeps_full_frame_coordinates(self) -> None:
-        """GaitGraph2 receives GREW-style image coordinates, not box coordinates."""
+        """GPGait++ receives full-frame image coordinates before official preprocessing."""
         points = np.zeros((17, 3), dtype=np.float32)
         points[:, 0] = 300.0
         points[:, 1] = 200.0
@@ -522,7 +522,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             tracks = adapter.process(frame)
@@ -560,7 +560,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             first = adapter.process_at(frame, timestamp=0.0)
@@ -598,7 +598,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             adapter.process(frame)
@@ -636,7 +636,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             track = tuple(adapter.process(frame)[0] for _ in range(81))[-1]
@@ -667,7 +667,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
         ):
             adapter = ProductionVisionAdapter(config)
             tracks = tuple(adapter.process(frame)[0] for _ in range(6))
@@ -791,7 +791,7 @@ class ProductionVisionTests(unittest.TestCase):
                 _FakeAppearance,
             ),
             patch(
-                "cross_event_verifier.production_vision.TemporalGaitEncoder",
+                "cross_event_verifier.production_vision.GPGaitPPEncoder",
                 _FakeGait,
             ),
             patch(
@@ -844,7 +844,7 @@ class ProductionVisionTests(unittest.TestCase):
                 _FakeAppearance,
             ),
             patch(
-                "cross_event_verifier.production_vision.TemporalGaitEncoder",
+                "cross_event_verifier.production_vision.GPGaitPPEncoder",
                 _FakeGait,
             ),
         ):
@@ -897,7 +897,7 @@ class ProductionVisionTests(unittest.TestCase):
                 _FakeAppearance,
             ),
             patch(
-                "cross_event_verifier.production_vision.TemporalGaitEncoder",
+                "cross_event_verifier.production_vision.GPGaitPPEncoder",
                 _FakeGait,
             ),
             patch(
@@ -930,7 +930,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
             patch(
                 "cross_event_verifier.production_vision._walking_metrics",
                 return_value=(0.95, 1.0),
@@ -945,7 +945,7 @@ class ProductionVisionTests(unittest.TestCase):
         track = tracks[0]
         self.assertEqual(track.track_id, 7)
         self.assertEqual(track.features.normalized().appearance.shape, (512,))
-        self.assertEqual(track.features.normalized().gait.shape, (384,))
+        self.assertEqual(track.features.normalized().gait.shape, (4864,))
         self.assertGreater(track.quality.gait_availability(), 0.7)
 
     def test_non_walk_action_never_exposes_a_stale_gait_embedding(self) -> None:
@@ -963,7 +963,7 @@ class ProductionVisionTests(unittest.TestCase):
             patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
             patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
             patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
             patch("cross_event_verifier.production_vision._walking_metrics", return_value=(0.95, 1.0)),
         ):
             adapter = ProductionVisionAdapter(config)
@@ -990,7 +990,7 @@ class ProductionVisionTests(unittest.TestCase):
             patch("cross_event_verifier.production_vision._YoloByteTracker", _FakeDetector),
             patch("cross_event_verifier.production_vision._RtmposeEstimator", _FakePose),
             patch("cross_event_verifier.production_vision._OsnetAppearanceExtractor", _FakeAppearance),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
             patch(
                 "cross_event_verifier.production_vision._walking_metrics",
                 return_value=(0.95, 1.0),
@@ -1036,7 +1036,7 @@ class ProductionVisionTests(unittest.TestCase):
                 "cross_event_verifier.production_vision._OsnetAppearanceExtractor",
                 _FakeAppearance,
             ),
-            patch("cross_event_verifier.production_vision.TemporalGaitEncoder", _FakeGait),
+            patch("cross_event_verifier.production_vision.GPGaitPPEncoder", _FakeGait),
             patch(
                 "cross_event_verifier.production_vision._walking_metrics",
                 return_value=(0.95, 1.0),

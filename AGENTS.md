@@ -4,6 +4,17 @@
 目标：stable outside, flexible inside。执行 **Prefer extension over modification**、
 **Allow composition, prohibit reverse invasion**。
 
+## 执行环境要求（所有 agent 必须遵守）
+
+- 先识别当前操作系统。Windows 环境下，部署、构建、测试和代码修改优先且尽可能全部通过 Git Bash 执行；Linux 环境下使用 Linux 原生 shell 和指令。WSL2 不再是默认工作区，Windows 项目目录是当前主工作区。
+- Windows 若 Git Bash 未安装或配置异常，先安装/修复 Git for Windows，再继续项目工作；仅允许用 PowerShell 启动 Git for Windows 官方安装程序等必要引导步骤，之后返回 Git Bash。官方安装来源为 https://git-scm.com/download/win，也可在 Windows 引导终端执行 winget install --id Git.Git -e。
+- Windows 默认 Git Bash 路径为 C:\Program Files\Git\bin\bash.exe。验证 bash --version、git --version 和 uname -s（应为 MINGW64_NT 或 MSYS_NT）。C:\Windows\System32\bash.exe 是 WSL 启动入口，绝不能误当作 Git Bash。
+- Windows Git Bash 使用 Windows Python 和 .venv/Scripts/python.exe；Linux 使用 .venv/bin/python。每个操作系统单独创建虚拟环境，禁止跨系统复用或复制 .venv。
+- Windows Git Bash 示例：cd /c/Users/wzige/PycharmProjects/cross-event-prototype-verifier && ./.venv/Scripts/python.exe -m pytest。Linux 示例：cd /path/to/cross-event-prototype-verifier && .venv/bin/python -m pytest。
+- 开始工作时核验 pwd、uname -s 与对应虚拟环境 Python 版本。Windows Git Bash 的路径通常写成 /c/...；Linux 使用 /...。路径含空格时必须引用，shell 脚本使用 LF。
+- Python wheel、CUDA/ONNX runtime、原生 DLL/共享库和系统依赖均可能因操作系统、Python ABI、驱动而不同；按当前平台安装项目声明的依赖，不要把另一平台的二进制包或环境变量设置照搬过来。
+- 环境选择不改变公共 API、身份门、模型契约或存储规则。跨平台环境、依赖与路径注意事项见 [开发环境指引](docs/DEVELOPMENT_ENVIRONMENTS.md)。agent.md 是入口说明，完整仓库约束以本文件为准。
+
 ## 1. Identity Decision Boundary
 
 - 正式识别数据流：Camera/Video → VisionAdapter → VisionTrack → Observation → CrossEventVerifier → Decision。

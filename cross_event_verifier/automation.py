@@ -489,7 +489,7 @@ class AutomaticVerificationController:
                 AutomationStage.ACTION_QUARANTINE,
                 (
                     f"动作 {action_type} 未通过 WALK 门控，"
-                    "不写入旧 GaitGraph2 步态图库"
+                    "不写入旧 GPGait++ 步态图库"
                 ),
                 action_type=action_type,
                 action_confidence=(

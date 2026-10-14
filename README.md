@@ -1,11 +1,14 @@
 # Cross-Event Prototype Verifier
+
+Windows 环境下，开发、构建、测试及代码修改优先使用 Git Bash；Linux 环境使用原生 shell。具体操作见 [开发环境指引](docs/DEVELOPMENT_ENVIRONMENTS.md) 和 [AGENTS.md](AGENTS.md)。
+
 > 面向跨摄像头、跨采集事件的开放集身份验证原型，支持用户注册、身份识别、视频回放与身份状态核验。
 
 ## 项目简介
 
 Cross-Event Prototype Verifier（CEPV）把同一个人的多次观测组织成可审计的原型，而不是把一次视频中的临时 `Track ID` 当作永久身份。系统以外观特征建立稳定的视觉身份，再用步态特征在不同时间、机位、视角和采集事件之间进行验证；无法达到开放集阈值时会保留为未知、候选或冲突状态，不强行匹配。
 
-项目提供 Python API、命令行入口和桌面 GUI。生产视觉链路由 YOLO11L、ByteTrack、OSNet-AIN、RTMPose-S 与 GaitGraph2 组成，状态和审计信息写入本地 SQLite。短时动作识别复用 RTMPose 的 COCO-17 关键点，在 Track 级内存状态机中识别下蹲、坐下、站起、举手和挥手，并可将已确认身份的动作事件发布到 MQTT 或 BLE Light（ESP32-S3 BLE GATT 灯光端点）。
+项目提供 Python API、命令行入口和桌面 GUI。生产视觉链路由 YOLO11L、ByteTrack、OSNet-AIN、RTMPose-S 与 GPGait++ 组成，状态和审计信息写入本地 SQLite。短时动作识别复用 RTMPose 的 COCO-17 关键点，在 Track 级内存状态机中识别下蹲、坐下、站起、举手和挥手，并可将已确认身份的动作事件发布到 MQTT 或 BLE Light（ESP32-S3 BLE GATT 灯光端点）。
 
 “注册用户”在本项目中指创建或确认 `P1`、`P2` 等伪匿名视觉身份，不等同于实名、账号密码或法律意义上的身份认证。姓名、权限和设备控制策略应由上层业务系统维护。
 
@@ -35,7 +38,7 @@ YOLO11L 检测 ──► ByteTrack 生成临时 Track
     │                         ├─► OSNet-AIN 外观特征 ──► 视觉身份 P1/P2
     │                         │                              │
     │                         └─► RTMPose COCO-17 ───────────┤
-    │                                                        ├─► GaitGraph2 步态事件/原型
+    │                                                        ├─► GPGait++ 步态事件/原型
     │                                                        └─► Track 级短时动作 FSM
     ▼
 开放集校准、一对一指派、状态机与 SQLite 审计
@@ -48,8 +51,8 @@ YOLO11L 检测 ──► ByteTrack 生成临时 Track
 
 1. 检测器找到人体，ByteTrack 在当前来源内维护临时轨迹。轨迹号只在本次来源中有效，不能作为跨视频身份。
 2. OSNet-AIN 对稳定外观窗口生成 embedding。生产 GUI 使用 OSNet-first 流程创建或重新绑定视觉身份；已有身份不会因为动作变化而改变。
-3. RTMPose-S 产生 COCO-17 关键点。明确的 `WALK` 且质量足够时才进入 GaitGraph2；下蹲、坐下等非行走窗口通过 `ActionRouter` 隔离，不能写入步态库。
-4. GaitGraph2 将足够长的真实帧序列变成步态 embedding。跨独立事件、机位和视角的原型经过校准后进行 open-set 匹配，并生成正式决策和状态迁移。
+3. RTMPose-S 产生 COCO-17 关键点。明确的 `WALK` 且质量足够时才进入 GPGait++；下蹲、坐下等非行走窗口通过 `ActionRouter` 隔离，不能写入步态库。
+4. GPGait++ 将足够长的真实帧序列变成步态 embedding。跨独立事件、机位和视角的原型经过校准后进行 open-set 匹配，并生成正式决策和状态迁移。
 5. 同一份姿态流同时进入内存中的 `TransientActionManager`。动作状态按 Track、分段和 TTL 管理；只有当前决策为已知身份时，最近已完成的动作才会释放为 `ActionEvent`。
 6. `ActionEvent` 可由 GUI 选择 MQTT 或 BLE Light 发布。视觉程序只发布事件，不直接保存米家设备 ID、灯光实体或 ESP32 GPIO 规则，具体自动化由 Home Assistant 或固件侧完成。操作员也可以在“手动动作触发”面板选中当前 Track/已确认身份并指定下蹲、坐下、站起、举手或挥手；该请求仍需下一帧通过 `KNOWN` 身份门控。
 
@@ -67,12 +70,25 @@ YOLO11L 检测 ──► ByteTrack 生成临时 Track
 
 ### 安装
 
-推荐在 Windows PowerShell 中使用独立虚拟环境。项目要求 Python 3.10 或更高版本；仓库中的 `requirements.txt` 面向包含 NVIDIA CUDA 运行时的生产部署，并固定了对应的 PyTorch、Ultralytics 和 ONNX Runtime 版本。
+Windows 用户请在 Git Bash 中操作；Linux 用户使用 Linux 原生 shell。项目要求 Python 3.10 或更高版本。仓库中的 `requirements.txt` 面向包含 NVIDIA CUDA 运行时的生产部署，并固定了对应的 PyTorch、Ultralytics 和 ONNX Runtime 版本。
 
-```powershell
-cd C:\Users\wzige\PycharmProjects\cross-event-prototype-verifier
+Windows（Git Bash）创建 Windows 虚拟环境：
+
+```bash
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/Scripts/activate
+```
+
+Linux 创建 Linux 虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+随后在已激活的环境中安装依赖：
+
+```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
@@ -80,13 +96,13 @@ python -m pip install -e .
 
 如果只做无模型的 API/演示或在已有环境中按需安装，可使用项目 extras：
 
-```powershell
+```bash
 python -m pip install -e ".[gui-qt,smart-home,ble]"
 ```
 
-生产运行还需要模型文件。按 `models/README.md` 的文件名准备 `yolo11l.pt`、`rtmpose-s.onnx`、`osnet_ain_x1_0_dg.pth`、`gaitgraph2_grew_state.pt` 和 `bytetrack-cross-event.yaml`，然后执行：
+生产运行还需要模型文件。按 `models/README.md` 的文件名准备 `yolo11l.pt`、`rtmpose-s.onnx`、`osnet_ain_x1_0_dg.pth`、`gpgaitpp_ccpg_state.pt` 和 `bytetrack-cross-event.yaml`，然后执行：
 
-```powershell
+```bash
 python -m cross_event_verifier download-models
 python -m cross_event_verifier doctor
 ```
@@ -95,11 +111,9 @@ python -m cross_event_verifier doctor
 
 ### 启动
 
-先激活环境，再选择所需入口：
+先按当前操作系统激活虚拟环境：Windows Git Bash 使用 source .venv/Scripts/activate，Linux 使用 source .venv/bin/activate。然后选择所需入口：
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-
+```bash
 # 最小化烟雾测试，不加载生产视觉模型
 python -m cross_event_verifier demo
 
@@ -107,9 +121,7 @@ python -m cross_event_verifier demo
 python -m cross_event_verifier gui --vision-backend production
 
 # 指定数据库和后端；auto 会在可用时选择生产适配器
-python -m cross_event_verifier gui `
-  --database data/verifier-production-v1.sqlite3 `
-  --vision-backend auto
+python -m cross_event_verifier gui --database data/verifier-production-gpgaitpp-v1.sqlite3 --vision-backend auto
 ```
 
 GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e ".[gui-qt]"`。代码仍保留 `launch_tk_gui` 兼容入口，但标准启动、功能展示和传输选择以 Qt GUI 为准。首次打开窗口会后台预加载模型，状态栏显示“正在后台准备生产视觉后端”，完成后才可开始采集。
@@ -129,9 +141,9 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 本项目将 BLE 广播用于“让上位机发现 `CEPV-ESP32S3`”，再通过发现后的 GATT 连接写入 Command 特征。桌面应用的 `BLE Light` 通道只写入 `0x01`（开灯）或 `0x00`（关灯）；身份、Track、摄像头和时间等字段只留在应用内或 MQTT JSON 中，不经 BLE 发送。纯广播包不适合承载可靠动作指令或回执，因此广播负责发现，GATT 连接负责灯光 opcode 传输。
 
-1. **准备并烧录固件。** 本项目按 Espressif 官方 ESP-IDF 工程构建，目标板为 `ESP32-S3-DevKitC-1`（常简称 DevKit1）。安装支持 ESP32-S3 的 ESP-IDF，使用 USB 数据线连接开发板，在 PowerShell 中执行：
+1. **准备并烧录固件。** 本项目按 Espressif 官方 ESP-IDF 工程构建，目标板为 `ESP32-S3-DevKitC-1`（常简称 DevKit1）。安装支持 ESP32-S3 的 ESP-IDF，使用 USB 数据线连接开发板，在已配置 ESP-IDF 工具链的 Git Bash 窗口中执行：
 
-   ```powershell
+   ```bash
    cd firmware/esp32s3_ble
    idf.py set-target esp32s3
    idf.py build
@@ -148,7 +160,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 2. **确认电脑能发现开发板。** 上位机必须有可用的 Bluetooth LE 适配器。安装项目依赖后，可以用以下脚本列出附近 BLE 设备及地址：
 
-   ```powershell
+   ```bash
    python -c "import bleak; print('bleak import ok')"
    ```
 
@@ -167,16 +179,16 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
    找到名称为 `CEPV-ESP32S3` 的设备后，记录操作系统返回的 `address`。Windows 通常显示蓝牙 MAC 地址；macOS/Linux 可能显示系统生成的标识，必须使用当前平台扫描到的值。BLE Light 按无配对直连约定工作；若系统弹出 Passkey、数字比较或配对确认窗口，应取消操作并检查是否刷入了旧固件或启用了错误的安全配置。
 
-3. **配置上位机环境。** 在启动 GUI 的同一个 PowerShell 窗口设置 BLE 模式和设备地址；服务、命令、状态 UUID 已有默认值，只有地址是必需项：
+3. **配置上位机环境。** 在启动 GUI 的同一个 Git Bash 窗口设置 BLE 模式和设备地址；服务、命令、状态 UUID 已有默认值，只有地址是必需项：
 
-   ```powershell
-   $env:CROSS_EVENT_TRANSPORT = "ble-light"
-   $env:CROSS_EVENT_BLE_ADDRESS = "AA:BB:CC:DD:EE:FF"
-   $env:CROSS_EVENT_BLE_LIGHT_ON_ACTION = "HAND_UP"
-   $env:CROSS_EVENT_BLE_LIGHT_OFF_ACTION = "WAVE"
-   $env:CROSS_EVENT_BLE_SERVICE_UUID = "8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d10"
-   $env:CROSS_EVENT_BLE_COMMAND_UUID = "8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d11"
-   $env:CROSS_EVENT_BLE_STATUS_UUID = "8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d12"
+   ```bash
+   export CROSS_EVENT_TRANSPORT="ble-light"
+   export CROSS_EVENT_BLE_ADDRESS="AA:BB:CC:DD:EE:FF"
+   export CROSS_EVENT_BLE_LIGHT_ON_ACTION="HAND_UP"
+   export CROSS_EVENT_BLE_LIGHT_OFF_ACTION="WAVE"
+   export CROSS_EVENT_BLE_SERVICE_UUID="8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d10"
+   export CROSS_EVENT_BLE_COMMAND_UUID="8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d11"
+   export CROSS_EVENT_BLE_STATUS_UUID="8b6ac2d0-2f4d-4d3e-9f6b-8f4a4b0a6d12"
    ```
 
    也可以在启动 GUI 时直接传入 `--action-transport ble-light --ble-address AA:BB:CC:DD:EE:FF`；CLI 参数只覆盖本次进程的环境配置。为兼容旧脚本，`--action-transport ble` 仍接受但会归一化为 `BLE Light`。
@@ -266,9 +278,9 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 ### 身份识别
 
 1. 启动来源后，系统对每个 Track 依次执行检测、跟踪、外观特征提取和姿态质量检查。
-2. 对已有视觉身份，OSNet 先给出稳定候选；当 GaitGraph2 已有足够的跨事件原型时，再按校准阈值融合步态证据。多人同时出现时使用一对一指派，避免一个身份被多个 Track 占用。
+2. 对已有视觉身份，OSNet 先给出稳定候选；当 GPGait++ 已有足够的跨事件原型时，再按校准阈值融合步态证据。多人同时出现时使用一对一指派，避免一个身份被多个 Track 占用。
 3. 右侧“当前目标”表的列依次显示 `Track`、`动作`、`身份/候选`、`结果`、`自动流程` 和 `分数`。`UNKNOWN`、`AMBIGUOUS`、`NEED_MORE_DATA` 等结果会保留为安全的非确认状态。
-4. 关键点不足、轨迹过短、动作不是明确 `WALK` 或出现身份冲突时，系统会隔离该窗口，不把失败伪装成某个身份的负证据，也不把非行走动作写入 GaitGraph2。
+4. 关键点不足、轨迹过短、动作不是明确 `WALK` 或出现身份冲突时，系统会隔离该窗口，不把失败伪装成某个身份的负证据，也不把非行走动作写入 GPGait++。
 5. 短时动作只在身份决策为已知时发布；“P1 正在挥手”是“已识别的 P1 做了动作”的描述，不会反过来证明该 Track 是 P1。
 
 ### 视频识别
@@ -339,7 +351,7 @@ GUI 入口默认为 PyQt6；安装失败时请补装 `python -m pip install -e "
 
 ## 项目状态
 
-当前代码已经具备从输入源到 GUI 决策的端到端原型：检测/跟踪、OSNet-first 注册、GaitGraph2 跨事件状态、动作隔离、SQLite 审计、运行时参数和地面控制点页面均已接入；核心模块在 `tests/` 中有相应的状态、路由、动作和传输边界测试。
+当前代码已经具备从输入源到 GUI 决策的端到端原型：检测/跟踪、OSNet-first 注册、GPGait++ 跨事件状态、动作隔离、SQLite 审计、运行时参数和地面控制点页面均已接入；核心模块在 `tests/` 中有相应的状态、路由、动作和传输边界测试。
 
 MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端和 GUI 协议选择已提供可运行的集成边界，但需要真实 broker、Windows 蓝牙适配器、ESP32-S3 板卡和 Home Assistant/设备侧配置才能完成现场验收。模型二进制、目标摄像头验证集、米家自动化和 BLE 安全策略仍属于部署工作，不应视为仓库开箱即用的生产承诺。
 
@@ -356,7 +368,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 - `CONTEXT.md`：领域术语、身份/步态状态、质量门槛和安全不变量。
 - `docs/architecture/README.md`、`docs/architecture/module-map.md`：模块边界、数据流和扩展入口。
-- `docs/research/`：跨视角、OSNet、GaitGraph2、动作识别、模型兼容性和 GUI 研究资料。
+- `docs/architecture/`：模块职责与接口说明。
 - `research results/cross-event-verifier_短时动作识别与智能家居扩展方案.md`：短时动作与智能家居的设计论证及分阶段实施方案。
 - `models/README.md`：生产模型清单、下载方式、哈希和可选 PoseC3D 运行条件。
 - `datasets/cross_event_training_v1/README.md`：训练数据集构建、事件分割、合法来源和验证工具。
@@ -369,7 +381,7 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 **必须有 GPU 才能运行吗？**
 
-不需要 GPU 才能运行 `demo`、核心 API 或部分诊断；生产 YOLO/RTMPose/OSNet/GaitGraph2 链路对模型、驱动和推理 provider 有较高要求。先运行 `doctor`，再根据实际硬件选择生产或演示后端。
+不需要 GPU 才能运行 `demo`、核心 API 或部分诊断；生产 YOLO/RTMPose/OSNet/GPGait++ 链路对模型、驱动和推理 provider 有较高要求。先运行 `doctor`，再根据实际硬件选择生产或演示后端。
 
 **为什么画面里有人却一直是 UNKNOWN 或 NEED_MORE_DATA？**
 
@@ -411,13 +423,15 @@ MQTT 发布器、Bleak GATT 客户端桥接、ESP-IDF ESP32-S3 NimBLE 服务端�
 
 ## License
 
-本项目代码以仓库根目录 `LICENSE` 中的 Apache License 2.0 发布。该许可不自动覆盖第三方依赖、预训练权重、数据集或厂商 SDK；发布和商用前必须同时阅读 `THIRD_PARTY_NOTICES.md` 及各上游条款。特别是 Ultralytics 的代码/模型许可、OpenGait/GaitGraph2 的研究与权重限制、MMAction2/PoseC3D 权重和数据集条款，需要按实际版本和用途确认；米家、Home Assistant、ESP-IDF 和具体硬件也各有独立商标与许可边界。
+本项目代码以仓库根目录 `LICENSE` 中的 Apache License 2.0 发布。该许可不自动覆盖第三方依赖、预训练权重、数据集或厂商 SDK；发布和商用前必须同时阅读 `THIRD_PARTY_NOTICES.md` 及各上游条款。特别是 Ultralytics 的代码/模型许可、FastPoseGait/GPGait++ 的研究与权重限制、MMAction2/PoseC3D 权重和数据集条款，需要按实际版本和用途确认；米家、Home Assistant、ESP-IDF 和具体硬件也各有独立商标与许可边界。
 
 ## Acknowledgements
 
 - 感谢 Ultralytics YOLO 与 ByteTrack 生态提供检测、跟踪基础。
-- 感谢 OSNet-AIN、OpenGait/GaitGraph2 及其研究工作提供外观和步态表示思路。
+- 感谢 OSNet-AIN、FastPoseGait/GPGait++ 及其研究工作提供外观和步态表示思路。
 - 感谢 OpenMMLab MMPose/RTMPose 与可选 MMAction2/PoseC3D 提供姿态和动作模型接口。
 - 感谢 PyTorch、ONNX Runtime、OpenCV、NumPy、SQLite 和 PyQt6/Tk 提供运行时与桌面基础设施。
 - 感谢 Eclipse Paho MQTT、Bleak 和 Espressif ESP-IDF/NimBLE 项目，使动作事件能够连接到消息总线和 ESP32-S3 GATT 端点。
 - 感谢 Home Assistant 及其 MQTT 自动化生态提供与灯、插座、空调、窗帘和场景编排的解耦接入路径。
+
+生产步态后端现为 GPGait++ CCPG small。官方预处理、4,864 维输出契约与图库隔离说明见 [GAIT_BACKEND_SWITCH.md](docs/GAIT_BACKEND_SWITCH.md)。旧 GaitGraph2 图库保留在原数据库中；新默认数据库为 `data/verifier-production-gpgaitpp-v1.sqlite3`，需要在新模型契约下重新采集。

@@ -1,7 +1,7 @@
 """Local, resumable first-pass screening for the downloaded MEVID videos.
 
 The first pass intentionally uses only YOLO/ByteTrack and RTMPose on sampled
-frames.  It does not load OSNet or GaitGraph2, does not claim identity,
+frames.  It does not load OSNet or GPGait++, does not claim identity,
 consent, or walking confirmation, and never promotes results into the
 production dataset.  Each completed video is flushed to a worker shard so an
 interrupted run can resume without losing the completed work.
@@ -526,7 +526,7 @@ def main() -> int:
     memory = _nvidia_memory()
     if args.workers == 0:
         # Auto mode leaves a large safety margin for the desktop and decoder.
-        # The measured 3-worker benchmark is about 4.5 GiB on an 8.1 GiB GPU.
+        # Bound parallel decoding/pose workers to avoid exhausting GPU memory.
         workers = 1 if memory is None else max(1, min(3, (memory[0] - memory[1]) // 1536))
     else:
         workers = args.workers

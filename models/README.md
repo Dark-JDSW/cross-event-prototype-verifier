@@ -7,7 +7,7 @@ The GUI production backend expects these local files:
 | `yolo11l.pt` | YOLO11L person detector used with ByteTrack |
 | `rtmpose-s.onnx` | top-down COCO-17 RTMPose model |
 | `osnet_ain_x1_0_dg.pth` | domain-generalized OSNet-AIN appearance encoder |
-| `gaitgraph2_grew_state.pt` | tensor-only GaitGraph2 GREW state dictionary |
+| `gpgaitpp_ccpg_state.pt` | tensor-only GPGait++ CCPG small state dictionary |
 | `posec3d_hmdb51_split1.pth` | optional official HMDB51 PoseC3D WALK semantic gate |
 | `bytetrack-cross-event.yaml` | tracker thresholds |
 
@@ -28,9 +28,11 @@ directory after the sibling `videotracker` directory is removed. Run
 `python -m cross_event_verifier doctor` to verify all assets and runtimes.
 
 The downloader validates each upstream source before writing. OSNet-AIN and
-GaitGraph2 are converted into tensor-only files, allowing runtime loading with
+GPGait++ are converted into tensor-only files, allowing runtime loading with
 `torch.load(..., weights_only=True)`. See `manifest.json` and
 `THIRD_PARTY_NOTICES.md` for source attribution and use restrictions.
 
 Expected source hashes, direct-file hashes and converted tensor fingerprints
 are recorded in `manifest.json`.
+
+GPGait++ uses the pinned official Affine → RescaleCenter → HOD_MultiInput → SkeletonInput pipeline, no TTA, and a [256,19] BN-neck embedding. The C-order 4,864-vector is globally L2 normalized for the existing Core cosine scorer. Network/preprocessing provenance is in `gpgaitpp_source.json`. The default window contains 60 real frames, without interpolation or padding. The new GUI database is `data/verifier-production-gpgaitpp-v1.sqlite3`; old gait prototypes cannot be relabeled or reused.

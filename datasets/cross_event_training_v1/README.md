@@ -95,7 +95,7 @@ python datasets/cross_event_training_v1/tools/download_and_batch_process_mevid.p
   --output-dir E:\datasets\mevid-cross-event\screen
 ```
 
-该步骤使用项目固定的 YOLO/ByteTrack/RTMPose/GaitGraph2 链路，输出：
+该步骤使用项目固定的 YOLO/ByteTrack/RTMPose/GPGait++ 链路，输出：
 
 - `auto_passed.jsonl`：只有一个稳定候选轨迹、步行和姿态质量都达到机器门槛的视频；
 - `review_queue.jsonl`：多轨迹、遮挡、低置信度、跟踪断裂、非完整步行或推理异常的视频；
@@ -133,7 +133,7 @@ python scripts\train_action_classifier.py `
 长视频全帧重放后本地 track ID 漂移；直接从视频目录打开的标注默认逐帧处理。
 `train_action_classifier.py` 按完整源视频
 留出验证集，拒绝 `unknown`、未匹配轨迹和单样本动作类别。当前动作模型只是路由
-门控，不是身份模型：只有质量足够的 `WALK` 才进入现有正式 GaitGraph2 图库；
+门控，不是身份模型：只有质量足够的 `WALK` 才进入现有正式 GPGait++ 图库；
 `RUNNING`、`CARRYING`、`SQUAT`、`SIT_STAND` 等动作各自拥有独立的动作分支标识；walking 的“视角 × 行进方向”分支也必须各自训练、校准和建立隔离图库，
 但在没有为该动作训练并校准独立 gait encoder 前，不会写入 WALK formal gallery。
 
@@ -150,6 +150,6 @@ python -m cross_event_verifier gui `
 
 - `identity_id` 是跨事件稳定伪名，不能由 tracker 临时 ID 生成。
 - `event_id`、`capture_session_id`、`camera_id` 是独立分组键；滑动窗口继承事件键，不能作为新的独立事件。
-- `poses/*.npz` 必须是项目当前 GaitGraph2 使用的 `[T,17,3]` 语义：原图像素坐标、RTMPose 置信度和真实框链路，详细字段见 `pose_protocol.md`。
+- `poses/*.npz` 必须是项目当前 GPGait++ 使用的 `[T,17,3]` 语义：原图像素坐标、RTMPose 置信度和真实框链路，详细字段见 `pose_protocol.md`。
 - 外部数据源的预提取 skeleton、silhouette 或 proxy COCO17 只能放在单独的 proxy 版本，不能与 `rtmpose` 版本混合训练。
 - unknown 必须与所有训练、图库和 calibration-known 身份不相交；正式 `FPIR ≤ 0.1%` 需要约 3,000 个独立 unknown search，不能把连续窗口当独立样本。

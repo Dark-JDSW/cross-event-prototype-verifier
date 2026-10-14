@@ -23,7 +23,6 @@ models/*.engine
 /research results/gait_registration_problem_analysis.md
 /research results/步态识别_跨视角ID分裂与短期步态误识别解决方案.md
 /research results/gait_open_set_p0_p1_p2_industry_solutions.md
-/research results/gaitgraph2_pg_low_score_analysis.md
 /val/
 /train/
 /MAN.mp4
@@ -35,3 +34,57 @@ models/*.engine
 # firmware project; keep it out of the Python repository.
 /firmware/esp32s3_ble/sdkconfig
 /firmware/esp32s3_ble/sdkconfig.old
+
+# 跨平台运行环境指引应随项目提交（其余本地 docs 仍保持忽略）。
+!/docs/
+/docs/*
+!/docs/DEVELOPMENT_ENVIRONMENTS.md
+
+# Local Python tooling, test reports, and generated caches.
+.conda/
+__pypackages__/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pip-wheel-metadata/
+
+# Local JavaScript dependencies and audit snapshots are reproducible or diagnostic.
+node_modules/
+/issue_audit/
+
+# Runtime logs, temporary files, and editor/OS residue.
+/logs/
+/tmp/
+/temp/
+*.log.*
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# SQLite journal/sidecar files are transient; the database itself is already ignored.
+data/*.sqlite3-*
+data/*.sqlite-*
+data/*.db-*
+
+# Local environment overrides can contain machine-specific values or secrets.
+.env
+.env.*
+!.env.example
+
+# Keep custom agent instructions versioned even when nearby documentation is ignored.
+!/AGENTS.md
+!/agent.md
+!/docs/AGENTS.md
+!/docs/agent.md

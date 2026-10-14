@@ -6,11 +6,13 @@
         <entry key="0">
           <value>
             <TabSessionState>
+              <option name="projectPath" value="C:\Users\wzige\PycharmProjects\cross-event-prototype-verifier" />
               <option name="provider" value="codex" />
-              <option name="sessionId" value="01a0b404-f0a1-79b2-9c48-897f520998e2" />
+              <option name="sessionId" value="01a0e654-dd50-7040-ad0c-2121db7cf23d" />
               <option name="cwd" value="C:\Users\wzige\PycharmProjects\cross-event-prototype-verifier" />
               <option name="model" value="gpt-6-astra" />
               <option name="permissionMode" value="bypassPermissions" />
+              <option name="reasoningEffort" value="max" />
             </TabSessionState>
           </value>
         </entry>

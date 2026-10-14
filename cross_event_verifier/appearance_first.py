@@ -1,4 +1,4 @@
-"""OSNet-first 视觉身份绑定与 GaitGraph2 步态学习控制器。"""
+"""OSNet-first 视觉身份绑定与 GPGait++ 步态学习控制器。"""
 
 from __future__ import annotations
 
@@ -386,7 +386,7 @@ class AppearanceFirstGaitEnrollmentController:
     def _visual_creation_wait_reason(self, observation: Observation) -> str | None:
         """在行为回连尚未有机会运行时暂缓创建新的视觉身份。
 
-        生产 GaitGraph2 是滑动窗口编码器，外观身份的默认八帧确认可能在
+        生产 GPGait++ 是滑动窗口编码器，外观身份的默认八帧确认可能在
         第一段完整步态窗口出现之前结束。若图库已有可回连的步态事件，先
         保留外观采样，但把“创建新 ID”推迟到一个真实长序列之后，给跨衣物
         回连一次机会。没有可回连身份时不增加新人的首个 ID 延迟。
@@ -634,7 +634,7 @@ class AppearanceFirstGaitEnrollmentController:
             strong_threshold=self.verifier.config.strong_gait_quality,
         )
         if not observation.features.has_gait:
-            return None, "等待 GaitGraph2 步态样本", band
+            return None, "等待 GPGait++ 步态样本", band
         if band == GaitQualityBand.INVALID:
             self._clear_gait_window(state)
             state.gait_window_start_timestamp = None
@@ -897,7 +897,7 @@ class AppearanceFirstGaitEnrollmentController:
         """输出当前 Track 的视觉身份确认结果。"""
 
         # 先让当前 OSNet 观察确认“没有明显反对这个已绑定身份”。
-        # GaitGraph2 只能在这个视觉身份范围内增强结果，不能跳过该检查。
+        # GPGait++ 只能在这个视觉身份范围内增强结果，不能跳过该检查。
         if observation.features.has_appearance:
             appearance_decision = self.verifier.match_appearance_identity(
                 observation,
@@ -1018,7 +1018,7 @@ class AppearanceFirstGaitEnrollmentController:
                 self._status(
                     None,
                     None,
-                    message="GaitGraph2 与 OSNet 指向不同视觉身份，已暂停该 Track",
+                    message="GPGait++ 与 OSNet 指向不同视觉身份，已暂停该 Track",
                 ),
             )
         if assigned_identity is not None:
@@ -1168,7 +1168,7 @@ class AppearanceFirstGaitEnrollmentController:
                     report,
                     message=(
                         f"{identity_id}：动作 {status_prediction.action_type.value} "
-                        "已隔离，不写入 WALK/GaitGraph2 步态图库"
+                        "已隔离，不写入 WALK/GPGait++ 步态图库"
                     ),
                     gait_quality_band=(
                         observation.quality.gait_quality_band(
@@ -1299,7 +1299,7 @@ class AppearanceFirstGaitEnrollmentController:
         if appearance_message:
             message = f"{identity_id}：{appearance_message}；{gait_message}"
         if report.state == GaitReadinessState.READY:
-            message = f"{identity_id}：步态就绪，可由 GaitGraph2 主检索"
+            message = f"{identity_id}：步态就绪，可由 GPGait++ 主检索"
         elif report.accepted_event_count:
             message = (
                 f"{identity_id}：独立步态事件 {report.accepted_event_count}/"
@@ -1342,7 +1342,7 @@ class AppearanceFirstGaitEnrollmentController:
         *,
         candidate_ids: Sequence[str],
     ) -> tuple[tuple[Decision, AutomationStatus], ...]:
-        """先完成 OSNet 全局绑定，再逐 Track 收集 GaitGraph2 事件。"""
+        """先完成 OSNet 全局绑定，再逐 Track 收集 GPGait++ 事件。"""
 
         if len(observations) != len(candidate_ids):
             raise ValueError("candidate_ids must align with observations")
@@ -1370,7 +1370,7 @@ class AppearanceFirstGaitEnrollmentController:
             if self._readiness(identity_id).state != GaitReadinessState.READY
         }
         # OSNet-first 的全局指派优先处理视觉身份；当轨迹因换装或短暂跟踪
-        # 重建而失去外观连续性时，已 READY 的 GaitGraph2 可以作为独立行为
+        # 重建而失去外观连续性时，已 READY 的 GPGait++ 可以作为独立行为
         # 证据回连到已有身份。Track 状态仍作为短期 must-link，避免跨身份串联。
         state_identities = {
             index: self._state(candidate_id).identity_id
